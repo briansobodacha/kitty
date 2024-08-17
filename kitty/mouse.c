@@ -6,19 +6,17 @@
  */
 
 #include "state.h"
-#include "screen.h"
 #include "charsets.h"
 #include <limits.h>
 #include <math.h>
 #include "glfw-wrapper.h"
 #include "control-codes.h"
-#include "monotonic.h"
 
 extern PyTypeObject Screen_Type;
 
 static MouseShape mouse_cursor_shape = TEXT_POINTER;
 typedef enum MouseActions { PRESS, RELEASE, DRAG, MOVE } MouseAction;
-#define debug(...) if (OPT(debug_keyboard)) printf(__VA_ARGS__);
+#define debug debug_input
 
 // Encoding of mouse events {{{
 #define SHIFT_INDICATOR  (1 << 2)
@@ -384,7 +382,7 @@ HANDLER(handle_move_event) {
     bool cell_half_changed = false;
     if (!set_mouse_position(w, &mouse_cell_changed, &cell_half_changed)) return;
     Screen *screen = w->render_data.screen;
-    if(OPT(detect_urls)) detect_url(screen, w->mouse_pos.cell_x, w->mouse_pos.cell_y);
+    if (OPT(detect_urls)) detect_url(screen, w->mouse_pos.cell_x, w->mouse_pos.cell_y);
     bool in_tracking_mode = (
         screen->modes.mouse_tracking_mode == ANY_MODE ||
         (screen->modes.mouse_tracking_mode == MOTION_MODE && button >= 0));
@@ -394,7 +392,7 @@ HANDLER(handle_move_event) {
     } else {
         if (!mouse_cell_changed && screen->modes.mouse_tracking_protocol != SGR_PIXEL_PROTOCOL) return;
         int sz = encode_mouse_button(w, button, button >=0 ? DRAG : MOVE, modifiers);
-        if (sz > 0) { mouse_event_buf[sz] = 0; write_escape_code_to_child(screen, CSI, mouse_event_buf); }
+        if (sz > 0) { mouse_event_buf[sz] = 0; write_escape_code_to_child(screen, ESC_CSI, mouse_event_buf); }
     }
 }
 
@@ -491,38 +489,34 @@ move_cursor_to_mouse_if_at_shell_prompt(Window *w) {
 }
 
 
-typedef struct PendingClick {
-    id_type window_id;
-    int button, count, modifiers;
-    bool grabbed;
-    monotonic_t at;
-    MousePosition mouse_pos;
-    unsigned long press_num;
-    double radius_for_multiclick;
-} PendingClick;
-
-static void
-free_pending_click(id_type timer_id UNUSED, void *pc) { free(pc); }
-
 void
-send_pending_click_to_window(Window *w, void *data) {
-    PendingClick *pc = (PendingClick*)data;
-    const ClickQueue *q = &w->click_queues[pc->button];
+send_pending_click_to_window(Window *w, int i) {
+    const id_type wid = w->id;
+    if (i < 0) {
+        while(true) {
+            w = window_for_id(wid);
+            if (!w || !w->pending_clicks.num) break;
+            send_pending_click_to_window(w, w->pending_clicks.num - 1);
+        }
+        return;
+    }
+    PendingClick pc = w->pending_clicks.clicks[i];
+    remove_i_from_array(w->pending_clicks.clicks, (unsigned)i, w->pending_clicks.num);
+    const ClickQueue *q = &w->click_queues[pc.button];
     // only send click if no presses have happened since the release that triggered
     // the click or if the subsequent press is too far or too late for a double click
     if (!q->length) return;
 #define press(n) q->clicks[q->length - n]
     if (
-            press(1).at <= pc->at || // latest press is before click release
-            (q->length > 1 && press(2).num == pc->press_num &&  (   // penultimate press is the press that belongs to this click
+            press(1).at <= pc.at || // latest press is before click release
+            (q->length > 1 && press(2).num == pc.press_num &&  (   // penultimate press is the press that belongs to this click
                 press(1).at - press(2).at > OPT(click_interval) ||  // too long between the presses for it to be a double click
-                distance(press(1).x, press(1).y, press(2).x, press(2).y) > pc->radius_for_multiclick  // presses are too far apart
+                distance(press(1).x, press(1).y, press(2).x, press(2).y) > pc.radius_for_multiclick  // presses are too far apart
             ))
     ) {
         MousePosition current_pos = w->mouse_pos;
-        w->mouse_pos = pc->mouse_pos;
-        id_type wid = w->id;
-        dispatch_mouse_event(w, pc->button, pc->count, pc->modifiers, pc->grabbed);
+        w->mouse_pos = pc.mouse_pos;
+        dispatch_mouse_event(w, pc.button, pc.count, pc.modifiers, pc.grabbed);
         w = window_for_id(wid);
         if (w) w->mouse_pos = current_pos;
     }
@@ -534,20 +528,20 @@ dispatch_possible_click(Window *w, int button, int modifiers) {
     Screen *screen = w->render_data.screen;
     int count = multi_click_count(w, button);
     if (release_is_click(w, button)) {
-        PendingClick *pc = calloc(1, sizeof(PendingClick));
-        if (pc) {
-            const ClickQueue *q = &w->click_queues[button];
-            pc->press_num = q->length ? q->clicks[q->length - 1].num : 0;
-            pc->window_id = w->id;
-            pc->mouse_pos = w->mouse_pos;
-            pc->at = monotonic();
-            pc->button = button;
-            pc->count = count == 2 ? -3 : -2;
-            pc->modifiers = modifiers;
-            pc->grabbed = screen->modes.mouse_tracking_mode != 0;
-            pc->radius_for_multiclick = radius_for_multiclick();
-            add_main_loop_timer(OPT(click_interval), false, send_pending_click_to_window_id, pc, free_pending_click);
-        }
+        ensure_space_for(&(w->pending_clicks), clicks, PendingClick, w->pending_clicks.num + 1, capacity, 4, true);
+        PendingClick *pc = w->pending_clicks.clicks + w->pending_clicks.num++;
+        zero_at_ptr(pc);
+        const ClickQueue *q = &w->click_queues[button];
+        pc->press_num = q->length ? q->clicks[q->length - 1].num : 0;
+        pc->window_id = w->id;
+        pc->mouse_pos = w->mouse_pos;
+        pc->at = monotonic();
+        pc->button = button;
+        pc->count = count == 2 ? -3 : -2;
+        pc->modifiers = modifiers;
+        pc->grabbed = screen->modes.mouse_tracking_mode != 0;
+        pc->radius_for_multiclick = radius_for_multiclick();
+        add_main_loop_timer(OPT(click_interval), false, dispatch_pending_clicks, NULL, NULL);
     }
 }
 
@@ -566,7 +560,7 @@ HANDLER(handle_button_event) {
     if (!dispatch_mouse_event(w, button, is_release ? -1 : 1, modifiers, screen->modes.mouse_tracking_mode != 0)) {
         if (screen->modes.mouse_tracking_mode != 0) {
             int sz = encode_mouse_button(w, button, is_release ? RELEASE : PRESS, modifiers);
-            if (sz > 0) { mouse_event_buf[sz] = 0; write_escape_code_to_child(screen, CSI, mouse_event_buf); }
+            if (sz > 0) { mouse_event_buf[sz] = 0; write_escape_code_to_child(screen, ESC_CSI, mouse_event_buf); }
         }
     }
     // the windows array might have been re-alloced in dispatch_mouse_event
@@ -821,7 +815,7 @@ mouse_event(const int button, int modifiers, int action) {
             }
         } else if (action == GLFW_RELEASE && button == GLFW_MOUSE_BUTTON_LEFT) {
             w = window_for_id(global_state.tracked_drag_in_window);
-            if (w && w->render_data.screen->modes.mouse_tracking_mode >= MOTION_MODE && w->render_data.screen->modes.mouse_tracking_protocol == SGR_PIXEL_PROTOCOL) {
+            if (w && w->render_data.screen->modes.mouse_tracking_mode >= BUTTON_MODE && w->render_data.screen->modes.mouse_tracking_protocol >= SGR_PROTOCOL) {
                 global_state.tracked_drag_in_window = 0;
                 clamp_to_window = true;
                 Tab *t = global_state.callback_os_window->tabs + global_state.callback_os_window->active_tab;
@@ -957,11 +951,14 @@ scroll_event(double xoffset, double yoffset, int flags, int modifiers) {
                 if (sz > 0) {
                     mouse_event_buf[sz] = 0;
                     for (s = abs(s); s > 0; s--) {
-                        write_escape_code_to_child(screen, CSI, mouse_event_buf);
+                        write_escape_code_to_child(screen, ESC_CSI, mouse_event_buf);
                     }
                 }
             } else {
-                if (screen->linebuf == screen->main_linebuf) screen_history_scroll(screen, abs(s), upwards);
+                if (screen->linebuf == screen->main_linebuf) {
+                    screen_history_scroll(screen, abs(s), upwards);
+                    if (screen->selections.in_progress) update_drag(w);
+                }
                 else fake_scroll(w, abs(s), upwards);
             }
         }
@@ -974,7 +971,7 @@ scroll_event(double xoffset, double yoffset, int flags, int modifiers) {
                 if (sz > 0) {
                     mouse_event_buf[sz] = 0;
                     for (s = abs(s); s > 0; s--) {
-                        write_escape_code_to_child(screen, CSI, mouse_event_buf);
+                        write_escape_code_to_child(screen, ESC_CSI, mouse_event_buf);
                     }
                 }
             }
@@ -999,7 +996,7 @@ send_mouse_event(PyObject *self UNUSED, PyObject *args, PyObject *kw) {
         int sz = encode_mouse_event_impl(&mpos, screen->modes.mouse_tracking_protocol, button, action, mods);
         if (sz > 0) {
             mouse_event_buf[sz] = 0;
-            write_escape_code_to_child(screen, CSI, mouse_event_buf);
+            write_escape_code_to_child(screen, ESC_CSI, mouse_event_buf);
             Py_RETURN_TRUE;
         }
     }

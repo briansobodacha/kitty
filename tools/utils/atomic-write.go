@@ -5,6 +5,7 @@ package utils
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -39,7 +40,7 @@ func AtomicCreateSymlink(oldname, newname string) (err error) {
 	}
 }
 
-func AtomicWriteFile(path string, data []byte, perm os.FileMode) (err error) {
+func AtomicWriteFile(path string, data io.Reader, perm os.FileMode) (err error) {
 	npath, err := filepath.EvalSymlinks(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		err = nil
@@ -60,13 +61,12 @@ func AtomicWriteFile(path string, data []byte, perm os.FileMode) (err error) {
 						removed = true
 					}
 				}()
-				_, err = f.Write(data)
-				if err == nil {
-					err = f.Chmod(perm)
-					if err == nil {
-						err = os.Rename(f.Name(), path)
-						if err == nil {
-							removed = true
+				if _, err = io.Copy(f, data); err == nil {
+					if err = f.Chmod(perm); err == nil {
+						if err = f.Sync(); err == nil { // Sync before rename to ensure we dont end up with a zero sized file
+							if err = os.Rename(f.Name(), path); err == nil {
+								removed = true
+							}
 						}
 					}
 				}
@@ -76,7 +76,7 @@ func AtomicWriteFile(path string, data []byte, perm os.FileMode) (err error) {
 	return
 }
 
-func AtomicUpdateFile(path string, data []byte, perms ...fs.FileMode) (err error) {
+func AtomicUpdateFile(path string, data io.Reader, perms ...fs.FileMode) (err error) {
 	perm := fs.FileMode(0o644)
 	if len(perms) > 0 {
 		perm = perms[0]

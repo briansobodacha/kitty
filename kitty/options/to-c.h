@@ -8,6 +8,7 @@
 
 #include "../state.h"
 #include "../colors.h"
+#include "../fonts.h"
 
 static inline float
 PyFloat_AsFloat(PyObject *o) {
@@ -44,7 +45,7 @@ parse_ms_long_to_monotonic_t(PyObject *val) {
     return ms_to_monotonic_t(PyLong_AsUnsignedLong(val));
 }
 
-static WindowTitleIn
+static inline WindowTitleIn
 window_title_in(PyObject *title_in) {
     const char *in = PyUnicode_AsUTF8(title_in);
     switch(in[0]) {
@@ -57,7 +58,7 @@ window_title_in(PyObject *title_in) {
     return ALL;
 }
 
-static UnderlineHyperlinks
+static inline UnderlineHyperlinks
 underline_hyperlinks(PyObject *x) {
     const char *in = PyUnicode_AsUTF8(x);
     switch(in[0]) {
@@ -67,7 +68,7 @@ underline_hyperlinks(PyObject *x) {
     }
 }
 
-static BackgroundImageLayout
+static inline BackgroundImageLayout
 bglayout(PyObject *layout_name) {
     const char *name = PyUnicode_AsUTF8(layout_name);
     switch(name[0]) {
@@ -82,7 +83,7 @@ bglayout(PyObject *layout_name) {
     return TILING;
 }
 
-static ImageAnchorPosition
+static inline ImageAnchorPosition
 bganchor(PyObject *anchor_name) {
     const char *name = PyUnicode_AsUTF8(anchor_name);
     ImageAnchorPosition anchor = {0.5f, 0.5f, 0.5f, 0.5f};
@@ -108,19 +109,77 @@ bganchor(PyObject *anchor_name) {
     if (opts->name) memcpy(opts->name, s, sz); \
 }
 
-static void
+static inline void
 background_image(PyObject *src, Options *opts) { STR_SETTER(background_image); }
 
-static void
+static inline void
 bell_path(PyObject *src, Options *opts) { STR_SETTER(bell_path); }
 
-static void
+static inline void
 bell_theme(PyObject *src, Options *opts) { STR_SETTER(bell_theme); }
 
-static void
+static inline void
 window_logo_path(PyObject *src, Options *opts) { STR_SETTER(default_window_logo); }
 
 #undef STR_SETTER
+
+static void
+add_easing_function(Animation *a, PyObject *e, double y_at_start, double y_at_end) {
+#define G(name) RAII_PyObject(name, PyObject_GetAttrString(e, #name))
+#define D(container, idx) PyFloat_AsDouble(PyTuple_GET_ITEM(container, idx))
+#define EQ(x, val) (PyUnicode_CompareWithASCIIString((x), val) == 0)
+    G(type);
+    if (EQ(type, "cubic-bezier")) {
+        G(cubic_bezier_points);
+        add_cubic_bezier_animation(a, y_at_start, y_at_end, D(cubic_bezier_points, 0), D(cubic_bezier_points, 1), D(cubic_bezier_points, 2), D(cubic_bezier_points, 3));
+    } else if (EQ(type, "linear")) {
+        G(linear_x); G(linear_y);
+        size_t count = PyTuple_GET_SIZE(linear_x);
+        RAII_ALLOC(double, x, malloc(2 * sizeof(double) * count));
+        if (x) {
+            double *y = x + count;
+            for (size_t i = 0; i < count; i++) {
+                x[i] = D(linear_x, i); y[i] = D(linear_y, i);
+            }
+            add_linear_animation(a, y_at_start, y_at_end, count, x, y);
+        }
+    } else if (EQ(type, "steps")) {
+        G(num_steps); G(jump_type);
+        EasingStep jt = EASING_STEP_END;
+        if (EQ(jump_type, "start")) jt = EASING_STEP_START;
+        else if (EQ(jump_type, "none")) jt = EASING_STEP_NONE;
+        else if (EQ(jump_type, "both")) jt = EASING_STEP_BOTH;
+        add_steps_animation(a, y_at_start, y_at_end, PyLong_AsSize_t(num_steps), jt);
+    }
+#undef EQ
+#undef D
+#undef G
+}
+
+#define parse_animation(duration, name, start, end) \
+    opts->duration = parse_s_double_to_monotonic_t(PyTuple_GET_ITEM(src, 0)); \
+    opts->animation.name = free_animation(opts->animation.name); \
+    if (PyObject_IsTrue(PyTuple_GET_ITEM(src, 1)) && (opts->animation.name = alloc_animation()) != NULL) { \
+        add_easing_function(opts->animation.name, PyTuple_GET_ITEM(src, 1), start, end); \
+        if (PyObject_IsTrue(PyTuple_GET_ITEM(src, 2))) { \
+            add_easing_function(opts->animation.name, PyTuple_GET_ITEM(src, 2), end, start); \
+        } else { \
+            add_easing_function(opts->animation.name, PyTuple_GET_ITEM(src, 1), end, start); \
+        } \
+    } \
+
+static inline void
+cursor_blink_interval(PyObject *src, Options *opts) {
+    parse_animation(cursor_blink_interval, cursor, 1, 0);
+}
+
+static inline void
+visual_bell_duration(PyObject *src, Options *opts) {
+    parse_animation(visual_bell_duration, visual_bell, 0, 1);
+}
+
+#undef parse_animation
+
 
 static void
 parse_font_mod_size(PyObject *val, float *sz, AdjustmentUnit *unit) {
@@ -132,7 +191,7 @@ parse_font_mod_size(PyObject *val, float *sz, AdjustmentUnit *unit) {
     }
 }
 
-static void
+static inline void
 modify_font(PyObject *mf, Options *opts) {
 #define S(which) { PyObject *v = PyDict_GetItemString(mf, #which); if (v) parse_font_mod_size(v, &opts->which.val, &opts->which.unit); }
     S(underline_position); S(underline_thickness); S(strikethrough_thickness); S(strikethrough_position);
@@ -140,7 +199,45 @@ modify_font(PyObject *mf, Options *opts) {
 #undef S
 }
 
-static MouseShape
+static inline void
+free_font_features(Options *opts) {
+    if (opts->font_features.entries) {
+        for (size_t i = 0; i < opts->font_features.num; i++) {
+            free((void*)opts->font_features.entries[i].psname);
+            free((void*)opts->font_features.entries[i].features);
+        }
+        free(opts->font_features.entries);
+    }
+    memset(&opts->font_features, 0, sizeof(opts->font_features));
+}
+
+static inline void
+font_features(PyObject *mf, Options *opts) {
+    free_font_features(opts);
+    opts->font_features.num = PyDict_GET_SIZE(mf);
+    if (!opts->font_features.num) return;
+    opts->font_features.entries = calloc(opts->font_features.num, sizeof(opts->font_features.entries[0]));
+    if (!opts->font_features.entries) { PyErr_NoMemory(); return; }
+    PyObject *key, *value;
+    Py_ssize_t pos = 0, i = 0;
+    while (PyDict_Next(mf, &pos, &key, &value)) {
+        __typeof__(opts->font_features.entries) e = opts->font_features.entries + i++;
+        Py_ssize_t psname_sz; const char *psname = PyUnicode_AsUTF8AndSize(key, &psname_sz);
+        e->psname = strndup(psname, psname_sz);
+        if (!e->psname) { PyErr_NoMemory(); return; }
+        e->num = PyTuple_GET_SIZE(value);
+        if (e->num) {
+            e->features = calloc(e->num, sizeof(e->features[0]));
+            if (!e->features) { PyErr_NoMemory(); return; }
+            for (size_t n = 0; n < e->num; n++) {
+                ParsedFontFeature *f = (ParsedFontFeature*)PyTuple_GET_ITEM(value, n);
+                e->features[n] = f->feature;
+            }
+        }
+    }
+}
+
+static inline MouseShape
 pointer_shape(PyObject *shape_name) {
     const char *name = PyUnicode_AsUTF8(shape_name);
     if (!name) return TEXT_POINTER;
@@ -181,7 +278,7 @@ pointer_shape(PyObject *shape_name) {
     return TEXT_POINTER;
 }
 
-static int
+static inline int
 macos_colorspace(PyObject *csname) {
     if (PyUnicode_CompareWithASCIIString(csname, "srgb") == 0) return 1;
     if (PyUnicode_CompareWithASCIIString(csname, "displayp3") == 0) return 2;
@@ -198,7 +295,7 @@ free_url_prefixes(Options *opts) {
     }
 }
 
-static void
+static inline void
 url_prefixes(PyObject *up, Options *opts) {
     if (!PyTuple_Check(up)) { PyErr_SetString(PyExc_TypeError, "url_prefixes must be a tuple"); return; }
     free_url_prefixes(opts);
@@ -233,7 +330,7 @@ free_menu_map(Options *opts) {
     opts->global_menu.count = 0;
 }
 
-static void
+static inline void
 menu_map(PyObject *entry_dict, Options *opts) {
     if (!PyDict_Check(entry_dict)) { PyErr_SetString(PyExc_TypeError, "menu_map entries must be a dict"); return; }
     free_menu_map(opts);
@@ -261,7 +358,7 @@ menu_map(PyObject *entry_dict, Options *opts) {
     }
 }
 
-static void
+static inline void
 text_composition_strategy(PyObject *val, Options *opts) {
     if (!PyUnicode_Check(val)) { PyErr_SetString(PyExc_TypeError, "text_rendering_strategy must be a string"); return; }
     opts->text_old_gamma = false;
@@ -305,30 +402,30 @@ list_of_chars(PyObject *chars) {
     return ans;
 }
 
-static void
+static inline void
 url_excluded_characters(PyObject *chars, Options *opts) {
     free(opts->url_excluded_characters);
     opts->url_excluded_characters = list_of_chars(chars);
 }
 
-static void
+static inline void
 select_by_word_characters(PyObject *chars, Options *opts) {
     free(opts->select_by_word_characters);
     opts->select_by_word_characters = list_of_chars(chars);
 }
 
-static void
+static inline void
 select_by_word_characters_forward(PyObject *chars, Options *opts) {
     free(opts->select_by_word_characters_forward);
     opts->select_by_word_characters_forward = list_of_chars(chars);
 }
 
-static void
+static inline void
 tab_bar_style(PyObject *val, Options *opts) {
     opts->tab_bar_hidden = PyUnicode_CompareWithASCIIString(val, "hidden") == 0 ? true: false;
 }
 
-static void
+static inline void
 tab_bar_margin_height(PyObject *val, Options *opts) {
     if (!PyTuple_Check(val) || PyTuple_GET_SIZE(val) != 2) {
         PyErr_SetString(PyExc_TypeError, "tab_bar_margin_height is not a 2-item tuple");
@@ -339,15 +436,22 @@ tab_bar_margin_height(PyObject *val, Options *opts) {
 }
 
 static void
+window_logo_scale(PyObject *src, Options *opts) {
+    opts->window_logo_scale.width = PyFloat_AsFloat(PyTuple_GET_ITEM(src, 0));
+    opts->window_logo_scale.height = PyFloat_AsFloat(PyTuple_GET_ITEM(src, 1));
+}
+
+static inline void
 resize_debounce_time(PyObject *src, Options *opts) {
     opts->resize_debounce_time.on_end = s_double_to_monotonic_t(PyFloat_AsDouble(PyTuple_GET_ITEM(src, 0)));
     opts->resize_debounce_time.on_pause = s_double_to_monotonic_t(PyFloat_AsDouble(PyTuple_GET_ITEM(src, 1)));
 }
 
-static void
+static inline void
 free_allocs_in_options(Options *opts) {
     free_menu_map(opts);
     free_url_prefixes(opts);
+    free_font_features(opts);
 #define F(x) free(opts->x); opts->x = NULL;
     F(select_by_word_characters); F(url_excluded_characters); F(select_by_word_characters_forward);
     F(background_image); F(bell_path); F(bell_theme); F(default_window_logo);

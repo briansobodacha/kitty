@@ -10,13 +10,14 @@
 #include "wayland-text-input-unstable-v3-client-protocol.h"
 #include <stdlib.h>
 #include <string.h>
-#define debug(...) if (_glfw.hints.init.debugKeyboard) printf(__VA_ARGS__);
+#define debug debug_input
 
 static struct zwp_text_input_v3*                  text_input;
 static struct zwp_text_input_manager_v3*          text_input_manager;
 static char *pending_pre_edit = NULL;
 static char *current_pre_edit = NULL;
 static char *pending_commit   = NULL;
+static bool ime_focused = false;
 static int last_cursor_left = 0, last_cursor_top = 0, last_cursor_width = 0, last_cursor_height = 0;
 uint32_t commit_serial = 0;
 
@@ -31,6 +32,7 @@ static void
 text_input_enter(void *data UNUSED, struct zwp_text_input_v3 *txt_input, struct wl_surface *surface UNUSED) {
     debug("text-input: enter event\n");
     if (txt_input) {
+        ime_focused = true;
         zwp_text_input_v3_enable(txt_input);
         zwp_text_input_v3_set_content_type(txt_input, ZWP_TEXT_INPUT_V3_CONTENT_HINT_NONE, ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_TERMINAL);
         commit();
@@ -41,6 +43,7 @@ static void
 text_input_leave(void *data UNUSED, struct zwp_text_input_v3 *txt_input, struct wl_surface *surface UNUSED) {
     debug("text-input: leave event\n");
     if (txt_input) {
+        ime_focused = false;
         zwp_text_input_v3_disable(txt_input);
         commit();
     }
@@ -89,11 +92,11 @@ text_input_delete_surrounding_text(
 static void
 text_input_done(void *data UNUSED, struct zwp_text_input_v3 *txt_input UNUSED, uint32_t serial) {
     debug("text-input: done event: serial: %u current_commit_serial: %u\n", serial, commit_serial);
-    if (serial != commit_serial) {
-        if (serial > commit_serial) _glfwInputError(GLFW_PLATFORM_ERROR, "Wayland: text_input_done serial mismatch, expected=%u got=%u\n", commit_serial, serial);
-        return;
-    }
-
+    const bool bad_event = serial != commit_serial;
+    // See https://wayland.app/protocols/text-input-unstable-v3#zwp_text_input_v3:event:done
+    // for handling of bad events. As best as I can tell spec says we perform all client side actions as usual
+    // but send nothing back to the compositor, aka no cursor position update.
+    // See https://github.com/kovidgoyal/kitty/pull/7283 for discussion
     if ((pending_pre_edit == NULL && current_pre_edit == NULL) ||
         (pending_pre_edit && current_pre_edit && strcmp(pending_pre_edit, current_pre_edit) == 0)) {
         free(pending_pre_edit); pending_pre_edit = NULL;
@@ -102,7 +105,7 @@ text_input_done(void *data UNUSED, struct zwp_text_input_v3 *txt_input UNUSED, u
         current_pre_edit = pending_pre_edit;
         pending_pre_edit = NULL;
         if (current_pre_edit) {
-            send_text(current_pre_edit, GLFW_IME_PREEDIT_CHANGED);
+            send_text(current_pre_edit, bad_event ? GLFW_IME_WAYLAND_DONE_EVENT : GLFW_IME_PREEDIT_CHANGED);
         } else {
             // Clear pre-edit text
             send_text(NULL, GLFW_IME_WAYLAND_DONE_EVENT);
@@ -116,7 +119,7 @@ text_input_done(void *data UNUSED, struct zwp_text_input_v3 *txt_input UNUSED, u
 
 void
 _glfwWaylandBindTextInput(struct wl_registry* registry, uint32_t name) {
-    if (!text_input_manager) text_input_manager = wl_registry_bind(registry, name, &zwp_text_input_manager_v3_interface, 1);
+    if (!text_input_manager && _glfw.hints.init.wl.ime) text_input_manager = wl_registry_bind(registry, name, &zwp_text_input_manager_v3_interface, 1);
 }
 
 void
@@ -129,12 +132,9 @@ _glfwWaylandInitTextInput(void) {
         .delete_surrounding_text = text_input_delete_surrounding_text,
         .done = text_input_done,
     };
-    if (!text_input) {
-        if (text_input_manager && _glfw.wl.seat) {
-            text_input = zwp_text_input_manager_v3_get_text_input(
-                    text_input_manager, _glfw.wl.seat);
-            if (text_input) zwp_text_input_v3_add_listener(text_input, &text_input_listener, NULL);
-        }
+    if (_glfw.hints.init.wl.ime && !text_input && text_input_manager && _glfw.wl.seat) {
+        text_input = zwp_text_input_manager_v3_get_text_input(text_input_manager, _glfw.wl.seat);
+        if (text_input) zwp_text_input_v3_add_listener(text_input, &text_input_listener, NULL);
     }
 }
 
@@ -153,8 +153,8 @@ _glfwPlatformUpdateIMEState(_GLFWwindow *w, const GLFWIMEUpdateEvent *ev) {
     if (!text_input) return;
     switch(ev->type) {
         case GLFW_IME_UPDATE_FOCUS:
-            debug("\ntext-input: updating IME focus state, focused: %d\n", ev->focused);
-            if (ev->focused) {
+            debug("\ntext-input: updating IME focus state, ime_focused: %d ev->focused: %d\n", ime_focused, ev->focused);
+            if (ime_focused) {
                 zwp_text_input_v3_enable(text_input);
                 zwp_text_input_v3_set_content_type(text_input, ZWP_TEXT_INPUT_V3_CONTENT_HINT_NONE, ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_TERMINAL);
             } else {
@@ -172,8 +172,10 @@ _glfwPlatformUpdateIMEState(_GLFWwindow *w, const GLFWIMEUpdateEvent *ev) {
             commit();
             break;
         case GLFW_IME_UPDATE_CURSOR_POSITION: {
-            const int scale = w->wl.scale;
-            const int left = ev->cursor.left / scale, top = ev->cursor.top / scale, width = ev->cursor.width / scale, height = ev->cursor.height / scale;
+            const double scale = _glfwWaylandWindowScale(w);
+#define s(x) (int)round((x) / scale)
+            const int left = s(ev->cursor.left), top = s(ev->cursor.top), width = s(ev->cursor.width), height = s(ev->cursor.height);
+#undef s
             if (left != last_cursor_left || top != last_cursor_top || width != last_cursor_width || height != last_cursor_height) {
                 last_cursor_left = left;
                 last_cursor_top = top;

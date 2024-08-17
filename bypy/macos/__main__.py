@@ -292,8 +292,8 @@ class Freeze(object):
                 'harfbuzz.0',
                 'png16.16',
                 'lcms2.2',
-                'crypto.1.1',
-                'ssl.1.1',
+                'crypto.3',
+                'ssl.3',
                 'xxhash.0',
         ):
             print('\nAdding', x)
@@ -441,7 +441,7 @@ class Freeze(object):
         py_compile(join(self.resources_dir, 'Python'))
 
     @flush
-    def makedmg(self, d, volname, format='ULFO'):
+    def makedmg(self, d, volname, format='ULMO'):
         ''' Copy a directory d into a dmg named volname '''
         print('\nMaking dmg...')
         sys.stdout.flush()

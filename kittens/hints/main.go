@@ -3,6 +3,7 @@
 package hints
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -167,7 +168,7 @@ func main(_ *cli.Command, o *Options, args []string) (rc int, err error) {
 	fctx := style.Context{AllowEscapeCodes: true}
 	faint := fctx.SprintFunc("dim")
 	hint_style := fctx.SprintFunc(fmt.Sprintf("fg=%s bg=%s bold", o.HintsForegroundColor, o.HintsBackgroundColor))
-	text_style := fctx.SprintFunc(fmt.Sprintf("fg=bright-%s bold", o.HintsTextColor))
+	text_style := fctx.SprintFunc(fmt.Sprintf("fg=%s bold", o.HintsTextColor))
 
 	highlight_mark := func(m *Mark, mark_text string) string {
 		hint := encode_hint(m.Index, alphabet)
@@ -178,8 +179,13 @@ func main(_ *cli.Command, o *Options, args []string) (rc int, err error) {
 		if hint == "" {
 			hint = " "
 		}
-		mark_text = mark_text[len(hint):]
-		return hint_style(hint) + text_style(mark_text)
+		if len(mark_text) <= len(hint) {
+			mark_text = ""
+		} else {
+			mark_text = mark_text[len(hint):]
+		}
+		ans := hint_style(hint) + text_style(mark_text)
+		return fmt.Sprintf("\x1b]8;;mark:%d\a%s\x1b]8;;\a", m.Index, ans)
 	}
 
 	render := func() string {
@@ -226,6 +232,30 @@ func main(_ *cli.Command, o *Options, args []string) (rc int, err error) {
 		draw_screen()
 		return nil
 	}
+	lp.OnRCResponse = func(data []byte) error {
+		var r struct {
+			Type string
+			Mark int
+		}
+		if err := json.Unmarshal(data, &r); err != nil {
+			return err
+		}
+		if r.Type == "mark_activated" {
+			if m, ok := index_map[r.Mark]; ok {
+				chosen = append(chosen, m)
+				if o.Multiple {
+					ignore_mark_indices.Add(m.Index)
+					reset()
+				} else {
+					lp.Quit(0)
+					return nil
+				}
+
+			}
+		}
+		return nil
+	}
+
 	lp.OnText = func(text string, _, _ bool) error {
 		changed := false
 		for _, ch := range text {

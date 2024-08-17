@@ -2,18 +2,19 @@
 
 #pragma once
 
-static inline void parse_graphics_code(Screen *screen,
-                                       PyObject UNUSED *dump_callback) {
+#include "base64.h"
+static inline void parse_graphics_code(PS *self, uint8_t *parser_buf,
+                                       const size_t parser_buf_pos) {
   unsigned int pos = 1;
   enum PARSER_STATES { KEY, EQUAL, UINT, INT, FLAG, AFTER_VALUE, PAYLOAD };
   enum PARSER_STATES state = KEY, value_state = FLAG;
   static GraphicsCommand g;
   unsigned int i, code;
   uint64_t lcode;
+  int64_t accumulator;
   bool is_negative;
   memset(&g, 0, sizeof(g));
   size_t sz;
-  static uint8_t payload[4096];
 
   enum KEYS {
     action = 'a',
@@ -48,13 +49,13 @@ static inline void parse_graphics_code(Screen *screen,
   };
 
   enum KEYS key = 'a';
-  if (screen->parser_buf[pos] == ';')
+  if (parser_buf[pos] == ';')
     state = AFTER_VALUE;
 
-  while (pos < screen->parser_buf_pos) {
+  while (pos < parser_buf_pos) {
     switch (state) {
     case KEY:
-      key = screen->parser_buf[pos++];
+      key = parser_buf[pos++];
       state = EQUAL;
       switch (key) {
       case action:
@@ -153,10 +154,10 @@ static inline void parse_graphics_code(Screen *screen,
       break;
 
     case EQUAL:
-      if (screen->parser_buf[pos++] != '=') {
+      if (parser_buf[pos++] != '=') {
         REPORT_ERROR("Malformed GraphicsCommand control block, no = after key, "
                      "found: 0x%x instead",
-                     screen->parser_buf[pos - 1]);
+                     parser_buf[pos - 1]);
         return;
       }
       state = value_state;
@@ -166,7 +167,7 @@ static inline void parse_graphics_code(Screen *screen,
       switch (key) {
 
       case action: {
-        g.action = screen->parser_buf[pos++] & 0xff;
+        g.action = parser_buf[pos++];
         if (g.action != 'T' && g.action != 'a' && g.action != 'c' &&
             g.action != 'd' && g.action != 'f' && g.action != 'p' &&
             g.action != 'q' && g.action != 't') {
@@ -178,16 +179,17 @@ static inline void parse_graphics_code(Screen *screen,
       } break;
 
       case delete_action: {
-        g.delete_action = screen->parser_buf[pos++] & 0xff;
+        g.delete_action = parser_buf[pos++];
         if (g.delete_action != 'A' && g.delete_action != 'C' &&
             g.delete_action != 'F' && g.delete_action != 'I' &&
             g.delete_action != 'N' && g.delete_action != 'P' &&
-            g.delete_action != 'Q' && g.delete_action != 'X' &&
-            g.delete_action != 'Y' && g.delete_action != 'Z' &&
-            g.delete_action != 'a' && g.delete_action != 'c' &&
-            g.delete_action != 'f' && g.delete_action != 'i' &&
-            g.delete_action != 'n' && g.delete_action != 'p' &&
-            g.delete_action != 'q' && g.delete_action != 'x' &&
+            g.delete_action != 'Q' && g.delete_action != 'R' &&
+            g.delete_action != 'X' && g.delete_action != 'Y' &&
+            g.delete_action != 'Z' && g.delete_action != 'a' &&
+            g.delete_action != 'c' && g.delete_action != 'f' &&
+            g.delete_action != 'i' && g.delete_action != 'n' &&
+            g.delete_action != 'p' && g.delete_action != 'q' &&
+            g.delete_action != 'r' && g.delete_action != 'x' &&
             g.delete_action != 'y' && g.delete_action != 'z') {
           REPORT_ERROR("Malformed GraphicsCommand control block, unknown flag "
                        "value for delete_action: 0x%x",
@@ -197,7 +199,7 @@ static inline void parse_graphics_code(Screen *screen,
       } break;
 
       case transmission_type: {
-        g.transmission_type = screen->parser_buf[pos++] & 0xff;
+        g.transmission_type = parser_buf[pos++];
         if (g.transmission_type != 'd' && g.transmission_type != 'f' &&
             g.transmission_type != 's' && g.transmission_type != 't') {
           REPORT_ERROR("Malformed GraphicsCommand control block, unknown flag "
@@ -208,7 +210,7 @@ static inline void parse_graphics_code(Screen *screen,
       } break;
 
       case compressed: {
-        g.compressed = screen->parser_buf[pos++] & 0xff;
+        g.compressed = parser_buf[pos++];
         if (g.compressed != 'z') {
           REPORT_ERROR("Malformed GraphicsCommand control block, unknown flag "
                        "value for compressed: 0x%x",
@@ -225,9 +227,11 @@ static inline void parse_graphics_code(Screen *screen,
 
     case INT:
 #define READ_UINT                                                              \
-  for (i = pos; i < MIN(screen->parser_buf_pos, pos + 10); i++) {              \
-    if (screen->parser_buf[i] < '0' || screen->parser_buf[i] > '9')            \
+  for (i = pos, accumulator = 0; i < MIN(parser_buf_pos, pos + 10); i++) {     \
+    int64_t n = parser_buf[i] - '0';                                           \
+    if (n < 0 || n > 9)                                                        \
       break;                                                                   \
+    accumulator += n * digit_multipliers[i - pos];                             \
   }                                                                            \
   if (i == pos) {                                                              \
     REPORT_ERROR("Malformed GraphicsCommand control block, expecting an "      \
@@ -235,7 +239,7 @@ static inline void parse_graphics_code(Screen *screen,
                  key & 0xFF);                                                  \
     return;                                                                    \
   }                                                                            \
-  lcode = utoi(screen->parser_buf + pos, i - pos);                             \
+  lcode = accumulator / digit_multipliers[i - pos - 1];                        \
   pos = i;                                                                     \
   if (lcode > UINT32_MAX) {                                                    \
     REPORT_ERROR(                                                              \
@@ -245,7 +249,7 @@ static inline void parse_graphics_code(Screen *screen,
   code = lcode;
 
       is_negative = false;
-      if (screen->parser_buf[pos] == '-') {
+      if (parser_buf[pos] == '-') {
         is_negative = true;
         pos++;
       }
@@ -302,11 +306,11 @@ static inline void parse_graphics_code(Screen *screen,
 #undef READ_UINT
 
     case AFTER_VALUE:
-      switch (screen->parser_buf[pos++]) {
+      switch (parser_buf[pos++]) {
       default:
         REPORT_ERROR("Malformed GraphicsCommand control block, expecting a "
                      "comma or semi-colon after a value, found: 0x%x",
-                     screen->parser_buf[pos - 1]);
+                     parser_buf[pos - 1]);
         return;
       case ',':
         state = KEY;
@@ -318,16 +322,17 @@ static inline void parse_graphics_code(Screen *screen,
       break;
 
     case PAYLOAD: {
-      sz = screen->parser_buf_pos - pos;
-      g.payload_sz = sizeof(payload);
-      if (!base64_decode32(screen->parser_buf + pos, sz, payload,
-                           &g.payload_sz)) {
+      sz = parser_buf_pos - pos;
+      g.payload_sz = MAX(BUF_EXTRA, sz);
+      if (!base64_decode8(parser_buf + pos, sz, parser_buf, &g.payload_sz)) {
+        g.payload_sz = MAX(BUF_EXTRA, sz);
         REPORT_ERROR("Failed to parse GraphicsCommand command payload with "
-                     "error: payload size (%zu) too large",
-                     sz);
+                     "error: invalid base64 data in chunk of size: %zu with "
+                     "output buffer size: %zu",
+                     sz, g.payload_sz);
         return;
       }
-      pos = screen->parser_buf_pos;
+      pos = parser_buf_pos;
     } break;
 
     } // end switch
@@ -351,27 +356,28 @@ static inline void parse_graphics_code(Screen *screen,
   }
 
   REPORT_VA_COMMAND(
-      "s {sc sc sc sc sI sI sI sI sI sI sI sI sI sI sI sI sI sI sI sI sI sI sI "
-      "sI sI sI si si si sI} y#",
-      "graphics_command", "action", g.action, "delete_action", g.delete_action,
-      "transmission_type", g.transmission_type, "compressed", g.compressed,
-      "format", (unsigned int)g.format, "more", (unsigned int)g.more, "id",
-      (unsigned int)g.id, "image_number", (unsigned int)g.image_number,
-      "placement_id", (unsigned int)g.placement_id, "quiet",
-      (unsigned int)g.quiet, "width", (unsigned int)g.width, "height",
-      (unsigned int)g.height, "x_offset", (unsigned int)g.x_offset, "y_offset",
-      (unsigned int)g.y_offset, "data_height", (unsigned int)g.data_height,
-      "data_width", (unsigned int)g.data_width, "data_sz",
-      (unsigned int)g.data_sz, "data_offset", (unsigned int)g.data_offset,
-      "num_cells", (unsigned int)g.num_cells, "num_lines",
-      (unsigned int)g.num_lines, "cell_x_offset", (unsigned int)g.cell_x_offset,
-      "cell_y_offset", (unsigned int)g.cell_y_offset, "cursor_movement",
+      "K s {sc sc sc sc sI sI sI sI sI sI sI sI sI sI sI sI sI sI sI sI sI sI "
+      "sI sI sI sI si si si sI} y#",
+      self->window_id, "graphics_command", "action", g.action, "delete_action",
+      g.delete_action, "transmission_type", g.transmission_type, "compressed",
+      g.compressed, "format", (unsigned int)g.format, "more",
+      (unsigned int)g.more, "id", (unsigned int)g.id, "image_number",
+      (unsigned int)g.image_number, "placement_id",
+      (unsigned int)g.placement_id, "quiet", (unsigned int)g.quiet, "width",
+      (unsigned int)g.width, "height", (unsigned int)g.height, "x_offset",
+      (unsigned int)g.x_offset, "y_offset", (unsigned int)g.y_offset,
+      "data_height", (unsigned int)g.data_height, "data_width",
+      (unsigned int)g.data_width, "data_sz", (unsigned int)g.data_sz,
+      "data_offset", (unsigned int)g.data_offset, "num_cells",
+      (unsigned int)g.num_cells, "num_lines", (unsigned int)g.num_lines,
+      "cell_x_offset", (unsigned int)g.cell_x_offset, "cell_y_offset",
+      (unsigned int)g.cell_y_offset, "cursor_movement",
       (unsigned int)g.cursor_movement, "unicode_placement",
       (unsigned int)g.unicode_placement, "parent_id", (unsigned int)g.parent_id,
       "parent_placement_id", (unsigned int)g.parent_placement_id, "z_index",
       (int)g.z_index, "offset_from_parent_x", (int)g.offset_from_parent_x,
       "offset_from_parent_y", (int)g.offset_from_parent_y, "payload_sz",
-      g.payload_sz, payload, g.payload_sz);
+      g.payload_sz, parser_buf, g.payload_sz);
 
-  screen_handle_graphics_command(screen, &g, payload);
+  screen_handle_graphics_command(self->screen, &g, parser_buf);
 }

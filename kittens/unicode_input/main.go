@@ -3,11 +3,13 @@
 package unicode_input
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
@@ -21,8 +23,6 @@ import (
 	"kitty/tools/utils"
 	"kitty/tools/utils/style"
 	"kitty/tools/wcswidth"
-
-	"golang.org/x/exp/slices"
 )
 
 var _ = fmt.Print
@@ -443,7 +443,7 @@ func (self *handler) handle_favorites_key_event(event *loop.KeyEvent) {
 				self.lp.Quit(1)
 				return
 			}
-			err = utils.AtomicUpdateFile(fp, utils.UnsafeStringToBytes(raw), 0o600)
+			err = utils.AtomicUpdateFile(fp, bytes.NewReader(utils.UnsafeStringToBytes(raw)), 0o600)
 			if err != nil {
 				self.err = fmt.Errorf("Failed to write to favorites file %s with error: %w", fp, err)
 				self.lp.Quit(1)

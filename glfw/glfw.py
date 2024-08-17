@@ -5,8 +5,10 @@
 import json
 import os
 import re
+import subprocess
 import sys
-from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
+from enum import Enum
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 _plat = sys.platform.lower()
 is_linux = 'linux' in _plat
@@ -32,6 +34,24 @@ class Command(NamedTuple):
     keyfile: Optional[str] = None
 
 
+class ISA(Enum):
+    X86 = 0x03
+    AMD64 = 0x3e
+    ARM64 = 0xb7
+    Other = 0x0
+
+
+class BinaryArch(NamedTuple):
+    bits: int = 64
+    isa: ISA = ISA.AMD64
+
+
+class CompilerType(Enum):
+    gcc = 'gcc'
+    clang = 'clang'
+    unknown = 'unknown'
+
+
 class Env:
 
     cc: List[str] = []
@@ -42,6 +62,12 @@ class Env:
     ldpaths: List[str] = []
     ccver: Tuple[int, int]
     vcs_rev: str = ''
+    binary_arch: BinaryArch = BinaryArch()
+    native_optimizations: bool = False
+    primary_version: int = 0
+    secondary_version: int = 0
+    xt_version: str = ''
+    has_copy_file_range: bool = False
 
     # glfw stuff
     all_headers: List[str] = []
@@ -54,22 +80,52 @@ class Env:
     def __init__(
         self, cc: List[str] = [], cppflags: List[str] = [], cflags: List[str] = [], ldflags: List[str] = [],
         library_paths: Dict[str, List[str]] = {}, ldpaths: Optional[List[str]] = None, ccver: Tuple[int, int] = (0, 0),
-        vcs_rev: str = ''
+        vcs_rev: str = '', binary_arch: BinaryArch = BinaryArch(),
+        native_optimizations: bool = False,
     ):
         self.cc, self.cppflags, self.cflags, self.ldflags, self.library_paths = cc, cppflags, cflags, ldflags, library_paths
         self.ldpaths = ldpaths or []
         self.ccver = ccver
         self.vcs_rev = vcs_rev
+        self.binary_arch = binary_arch
+        self.native_optimizations = native_optimizations
+        self._cc_version_string = ''
+        self._compiler_type: Optional[CompilerType] = None
+
+    @property
+    def cc_version_string(self) -> str:
+        if not self._cc_version_string:
+            self._cc_version_string = subprocess.check_output(self.cc + ['--version']).decode()
+        return self._cc_version_string
+
+    @property
+    def compiler_type(self) -> CompilerType:
+        if self._compiler_type is None:
+            raw = self.cc_version_string
+            if 'Free Software Foundation' in raw:
+                self._compiler_type = CompilerType.gcc
+            elif 'clang' in raw.lower().split():
+                self._compiler_type = CompilerType.clang
+            else:
+                self._compiler_type = CompilerType.unknown
+        return self._compiler_type
 
     def copy(self) -> 'Env':
         ans = Env(self.cc, list(self.cppflags), list(self.cflags), list(self.ldflags), dict(self.library_paths), list(self.ldpaths), self.ccver)
         ans.all_headers = list(self.all_headers)
+        ans._cc_version_string = self._cc_version_string
         ans.sources = list(self.sources)
         ans.wayland_packagedir = self.wayland_packagedir
         ans.wayland_scanner = self.wayland_scanner
         ans.wayland_scanner_code = self.wayland_scanner_code
         ans.wayland_protocols = self.wayland_protocols
         ans.vcs_rev = self.vcs_rev
+        ans.binary_arch = self.binary_arch
+        ans.native_optimizations = self.native_optimizations
+        ans.primary_version = self.primary_version
+        ans.secondary_version = self.secondary_version
+        ans.xt_version = self.xt_version
+        ans.has_copy_file_range = self.has_copy_file_range
         return ans
 
 
@@ -83,7 +139,7 @@ def init_env(
     pkg_config: Callable[..., List[str]],
     pkg_version: Callable[[str], Tuple[int, int]],
     at_least_version: Callable[..., None],
-    test_compile: Callable[..., bool],
+    test_compile: Callable[..., Any],
     module: str = 'x11'
 ) -> Env:
     ans = env.copy()
@@ -156,9 +212,14 @@ def build_wayland_protocols(
 ) -> None:
     items = []
     for protocol in env.wayland_protocols:
-        src = os.path.join(env.wayland_packagedir, protocol)
-        if not os.path.exists(src):
-            raise SystemExit(f'The wayland-protocols package on your system is missing the {protocol} protocol definition file')
+        if '/' in protocol:
+            src = os.path.join(env.wayland_packagedir, protocol)
+            if not os.path.exists(src):
+                raise SystemExit(f'The wayland-protocols package on your system is missing the {protocol} protocol definition file')
+        else:
+            src = os.path.join(os.path.dirname(os.path.abspath(__file__)), protocol)
+            if not os.path.exists(src):
+                raise SystemExit(f'The local Wayland protocol {protocol} is missing from kitty sources')
         for ext in 'hc':
             dest = wayland_protocol_file_name(src, ext)
             dest = os.path.join(dest_dir, dest)
@@ -249,10 +310,8 @@ def generate_wrappers(glfw_header: str) -> None:
     uint32_t glfwGetCocoaKeyEquivalent(uint32_t glfw_key, int glfw_mods, int* cocoa_mods)
     void glfwCocoaRequestRenderFrame(GLFWwindow *w, GLFWcocoarenderframefun callback)
     GLFWcocoarenderframefun glfwCocoaSetWindowResizeCallback(GLFWwindow *w, GLFWcocoarenderframefun callback)
-    int glfwCocoaSetBackgroundBlur(GLFWwindow *w, int blur_radius)
-    bool glfwSetX11WindowBlurred(GLFWwindow *w, bool enable_blur)
     void* glfwGetX11Display(void)
-    int32_t glfwGetX11Window(GLFWwindow* window)
+    unsigned long glfwGetX11Window(GLFWwindow* window)
     void glfwSetPrimarySelectionString(GLFWwindow* window, const char* string)
     void glfwCocoaSetWindowChrome(GLFWwindow* window, unsigned int color, bool use_system_color, unsigned int system_color,\
     int background_blur, unsigned int hide_window_decorations, bool show_text_in_titlebar, int color_space, float background_opacity, bool resizable)
@@ -260,11 +319,13 @@ def generate_wrappers(glfw_header: str) -> None:
     int glfwGetNativeKeyForName(const char* key_name, int case_sensitive)
     void glfwRequestWaylandFrameEvent(GLFWwindow *handle, unsigned long long id, GLFWwaylandframecallbackfunc callback)
     void glfwWaylandActivateWindow(GLFWwindow *handle, const char *activation_token)
+    const char* glfwWaylandMissingCapabilities(void)
     void glfwWaylandRunWithActivationToken(GLFWwindow *handle, GLFWactivationcallback cb, void *cb_data)
     bool glfwWaylandSetTitlebarColor(GLFWwindow *handle, uint32_t color, bool use_system_color)
     void glfwWaylandRedrawCSDWindowTitle(GLFWwindow *handle)
-    unsigned long long glfwDBusUserNotify(const char *app_name, const char* icon, const char *summary, const char *body, \
-const char *action_text, int32_t timeout, GLFWDBusnotificationcreatedfun callback, void *data)
+    void glfwWaylandSetupLayerShellForNextWindow(const GLFWLayerShellConfig *c)
+    pid_t glfwWaylandCompositorPID(void)
+    unsigned long long glfwDBusUserNotify(const GLFWDBUSNotificationData *n, GLFWDBusnotificationcreatedfun callback, void *data)
     void glfwDBusSetUserNotificationHandler(GLFWDBusnotificationactivatedfun handler)
     int glfwSetX11LaunchCommand(GLFWwindow *handle, char **argv, int argc)
     void glfwSetX11WindowAsDock(int32_t x11_window_id)
@@ -302,7 +363,7 @@ typedef bool (* GLFWcocoatogglefullscreenfun)(GLFWwindow*);
 typedef void (* GLFWcocoarenderframefun)(GLFWwindow*);
 typedef void (*GLFWwaylandframecallbackfunc)(unsigned long long id);
 typedef void (*GLFWDBusnotificationcreatedfun)(unsigned long long, uint32_t, void*);
-typedef void (*GLFWDBusnotificationactivatedfun)(uint32_t, const char*);
+typedef void (*GLFWDBusnotificationactivatedfun)(uint32_t, int, const char*);
 {}
 
 const char* load_glfw(const char* path);

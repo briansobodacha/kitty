@@ -151,7 +151,7 @@ I cannot use the key combination X in program Y?
 
 First, run::
 
-    kitten show_key -m kitty
+    kitten show-key -m kitty
 
 Press the key combination X. If the kitten reports the key press
 that means kitty is correctly sending the key press to terminal programs.
@@ -258,23 +258,27 @@ fonts to be freely resizable, so it does not support bitmapped fonts.
    If you are trying to use a font patched with `Nerd Fonts
    <https://nerdfonts.com/>`__ symbols, don't do that as patching destroys
    fonts. There is no need, simply install the standalone ``Symbols Nerd Font Mono``
-   (the file :file:`NerdFontsSymbolsOnly.zip` from the `Nerd Fonts releases page
+   (the file :file:`NerdFontsSymbolsOnly.tar.xz` from the `Nerd Fonts releases page
    <https://github.com/ryanoasis/nerd-fonts/releases>`__). kitty should pick up
    symbols from it automatically, and you can tell it to do so explicitly in
    case it doesn't with the :opt:`symbol_map` directive::
 
-        # Nerd Fonts v2.3.3
+        # Nerd Fonts v3.2.0
 
-        symbol_map U+23FB-U+23FE,U+2665,U+26A1,U+2B58,U+E000-U+E00A,U+E0A0-U+E0A3,U+E0B0-U+E0D4,U+E200-U+E2A9,U+E300-U+E3E3,U+E5FA-U+E6AA,U+E700-U+E7C5,U+EA60-U+EBEB,U+F000-U+F2E0,U+F300-U+F32F,U+F400-U+F4A9,U+F500-U+F8FF,U+F0001-U+F1AF0 Symbols Nerd Font Mono
+        symbol_map U+e000-U+e00a,U+ea60-U+ebeb,U+e0a0-U+e0c8,U+e0ca,U+e0cc-U+e0d7,U+e200-U+e2a9,U+e300-U+e3e3,U+e5fa-U+e6b1,U+e700-U+e7c5,U+ed00-U+efc1,U+f000-U+f2ff,U+f000-U+f2e0,U+f300-U+f372,U+f400-U+f533,U+f0001-U+f1af0 Symbols Nerd Font Mono
 
-   Those Unicode symbols beyond the ``E000-F8FF`` Unicode private use area are
+   Those Unicode symbols not in the `Unicode private use areas
+   <https://en.wikipedia.org/wiki/Private_Use_Areas>`__ are
    not included.
 
-If your font is not listed in ``kitty +list-fonts`` it means that it is not
+If your font is not listed in ``kitten choose-fonts`` it means that it is not
 monospace or is a bitmapped font. On Linux you can list all monospace fonts
 with::
 
     fc-list : family spacing outline scalable | grep -e spacing=100 -e spacing=90 | grep -e outline=True | grep -e scalable=True
+
+On macOS, you can open *Font Book* and look in the :guilabel:`Fixed width`
+collection to see all monospaced fonts on your system.
 
 Note that the spacing property is calculated by fontconfig based on actual glyph
 widths in the font. If for some reason fontconfig concludes your favorite
@@ -299,7 +303,7 @@ command to rebuild your fontconfig cache::
 
     fc-cache -r
 
-Then, the font will be available in ``kitty +list-fonts``.
+Then, the font will be available in ``kitten choose-fonts``.
 
 
 How can I assign a single global shortcut to bring up the kitty terminal?
@@ -314,8 +318,9 @@ see :iss:`here <45>`.
 I do not like the kitty icon!
 -------------------------------
 
-There are many alternate icons available, click on an icon to visit its
-homepage:
+The kitty icon was created as tribute to my cat of nine years who passed away,
+as such it is not going to change. However, if you do not like it, there are
+many alternate icons available, click on an icon to visit its homepage:
 
 .. image:: https://github.com/k0nserv/kitty-icon/raw/main/kitty.iconset/icon_256x256.png
    :target: https://github.com/k0nserv/kitty-icon
@@ -347,6 +352,10 @@ homepage:
 
 .. image:: https://github.com/eccentric-j/eccentric-icons/raw/main/icons/kitty-terminal/3d/kitty-preview.png
    :target: https://github.com/eccentric-j/eccentric-icons
+   :width: 256
+
+.. image:: https://github.com/sodapopcan/kitty-icon/raw/main/kitty.app.png
+   :target: https://github.com/sodapopcan/kitty-icon
    :width: 256
 
 On macOS and X11 you can put :file:`kitty.app.icns` (macOS only) or :file:`kitty.app.png` in the
@@ -386,7 +395,7 @@ You can also change the icon manually by following the steps:
 How do I map key presses in kitty to different keys in the terminal program?
 --------------------------------------------------------------------------------------
 
-This is accomplished by using ``map`` with :sc:`send_text <send_text>` in :file:`kitty.conf`.
+This is accomplished by using ``map`` with :ac:`send_key` in :file:`kitty.conf`.
 For example::
 
     map alt+s send_key ctrl+s
@@ -396,7 +405,8 @@ you press the :kbd:`alt+s` key. To see this in action, run::
 
     kitten show-key -m kitty
 
-Which will print out what key events it receives.
+Which will print out what key events it receives. To send arbitrary text rather
+than a key press, see :sc:`send_text <send_text>` instead.
 
 
 How do I open a new window or tab with the same working directory as the current window?
@@ -447,9 +457,6 @@ do not use them, if at all possible. kitty contains features that do all of what
 tmux does, but better, with the exception of remote persistence (:iss:`391`).
 If you still want to use tmux, read on.
 
-Image display will not work, see `tmux issue
-<https://github.com/tmux/tmux/issues/1391>`__.
-
 Using ancient versions of tmux such as 1.8 will cause gibberish on screen when
 pressing keys (:iss:`3541`).
 
@@ -458,11 +465,17 @@ and then switch to another and these terminals have different :envvar:`TERM`
 variables, tmux will break. You will need to restart it as tmux does not support
 multiple terminfo definitions.
 
+Displaying images while inside programs such as nvim or ranger may not work
+depending on whether those programs have adopted support for the :ref:`unicode
+placeholders <graphics_unicode_placeholders>` workaround that kitty created
+for tmux refusing to support images.
+
 If you use any of the advanced features that kitty has innovated, such as
 :doc:`styled underlines </underlines>`, :doc:`desktop notifications
 </desktop-notifications>`, :doc:`extended keyboard support
-</keyboard-protocol>`, etc. they may or may not work, depending on the whims of
-tmux's maintainer, your version of tmux, etc.
+</keyboard-protocol>`, :doc:`file transfer </kittens/transfer>`, :doc:`the ssh
+kitten </kittens/ssh>`, :doc:`shell integration </shell-integration>` etc. they may or may not work,
+depending on the whims of tmux's maintainer, your version of tmux, etc.
 
 
 I opened and closed a lot of windows/tabs and top shows kitty's memory usage is very high?

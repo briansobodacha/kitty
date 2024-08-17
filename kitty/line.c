@@ -14,7 +14,7 @@
 extern PyTypeObject Cursor_Type;
 
 static PyObject *
-new(PyTypeObject UNUSED *type, PyObject UNUSED *args, PyObject UNUSED *kwds) {
+new_line_object(PyTypeObject UNUSED *type, PyObject UNUSED *args, PyObject UNUSED *kwds) {
     PyErr_SetString(PyExc_TypeError, "Line objects cannot be instantiated directly, create them using LineBuf.line()");
     return NULL;
 }
@@ -50,6 +50,11 @@ cell_text(CPUCell *cell) {
 
 // URL detection {{{
 
+static bool
+is_hostname_char(char_type ch) {
+    return ch == '[' || ch == ']' || is_url_char(ch);
+}
+
 static index_type
 find_colon_slash(Line *self, index_type x, index_type limit) {
     // Find :// at or before x
@@ -60,7 +65,7 @@ find_colon_slash(Line *self, index_type x, index_type limit) {
     if (pos < limit) return 0;
     do {
         char_type ch = self->cpu_cells[pos].ch;
-        if (!is_url_char(ch)) return false;
+        if (!is_hostname_char(ch)) return false;
         if (pos == x) {
             if (ch == ':') {
                 if (pos + 2 < self->xnum && self->cpu_cells[pos+1].ch == '/' && self->cpu_cells[pos + 2].ch == '/') state = SECOND_SLASH;
@@ -108,9 +113,15 @@ has_url_prefix_at(Line *self, index_type at, index_type min_prefix_len, index_ty
 #define MIN_URL_LEN 5
 
 static bool
-has_url_beyond(Line *self, index_type x) {
+has_url_beyond_colon_slash(Line *self, index_type x) {
+    unsigned num_of_slashes = 0;
     for (index_type i = x; i < MIN(x + MIN_URL_LEN + 3, self->xnum); i++) {
-        if (!is_url_char(self->cpu_cells[i].ch)) return false;
+        const char_type ch = self->cpu_cells[i].ch;
+        if (num_of_slashes < 3) {
+            if (!is_hostname_char(ch)) return false;
+            if (ch == '/') num_of_slashes++;
+        }
+        else { if (!is_url_char(ch)) return false; }
     }
     return true;
 }
@@ -123,30 +134,40 @@ line_url_start_at(Line *self, index_type x) {
     index_type ds_pos = 0, t;
     // First look for :// ahead of x
     ds_pos = find_colon_slash(self, x + OPT(url_prefixes).max_prefix_len + 3, x < 2 ? 0 : x - 2);
-    if (ds_pos != 0 && has_url_beyond(self, ds_pos)) {
+    if (ds_pos != 0 && has_url_beyond_colon_slash(self, ds_pos)) {
         if (has_url_prefix_at(self, ds_pos, ds_pos > x ? ds_pos - x: 0, &t)) return t;
     }
     ds_pos = find_colon_slash(self, x, 0);
-    if (ds_pos == 0 || self->xnum < ds_pos + MIN_URL_LEN + 3 || !has_url_beyond(self, ds_pos)) return self->xnum;
+    if (ds_pos == 0 || self->xnum < ds_pos + MIN_URL_LEN + 3 || !has_url_beyond_colon_slash(self, ds_pos)) return self->xnum;
     if (has_url_prefix_at(self, ds_pos, 0, &t)) return t;
     return self->xnum;
 }
 
+static bool
+is_pos_ok_for_url(Line *self, index_type x, bool in_hostname, index_type last_hostname_char_pos) {
+    if (x >= self->xnum) return false;
+    if (in_hostname && x <= last_hostname_char_pos) return is_hostname_char(self->cpu_cells[x].ch);
+    return is_url_char(self->cpu_cells[x].ch);
+}
+
 index_type
-line_url_end_at(Line *self, index_type x, bool check_short, char_type sentinel, bool next_line_starts_with_url_chars) {
+line_url_end_at(Line *self, index_type x, bool check_short, char_type sentinel, bool next_line_starts_with_url_chars, bool in_hostname, index_type last_hostname_char_pos) {
     index_type ans = x;
     if (x >= self->xnum || (check_short && self->xnum <= MIN_URL_LEN + 3)) return 0;
-    if (sentinel) { while (ans < self->xnum && self->cpu_cells[ans].ch != sentinel && is_url_char(self->cpu_cells[ans].ch)) ans++; }
-    else { while (ans < self->xnum && is_url_char(self->cpu_cells[ans].ch)) ans++; }
+#define pos_ok(x) is_pos_ok_for_url(self, x, in_hostname, last_hostname_char_pos)
+    if (sentinel) { while (ans < self->xnum && self->cpu_cells[ans].ch != sentinel && pos_ok(ans)) ans++; }
+    else { while (ans < self->xnum && pos_ok(ans)) ans++; }
     if (ans) ans--;
     if (ans < self->xnum - 1 || !next_line_starts_with_url_chars) {
         while (ans > x && can_strip_from_end_of_url(self->cpu_cells[ans].ch)) ans--;
     }
+#undef pos_ok
     return ans;
 }
 
 bool
-line_startswith_url_chars(Line *self) {
+line_startswith_url_chars(Line *self, bool in_hostname) {
+    if (in_hostname) return is_hostname_char(self->cpu_cells[0].ch);
     return is_url_char(self->cpu_cells[0].ch);
 }
 
@@ -163,7 +184,7 @@ url_end_at(Line *self, PyObject *args) {
     unsigned int x, sentinel = 0;
     int next_line_starts_with_url_chars = 0;
     if (!PyArg_ParseTuple(args, "I|Ip", &x, &sentinel, &next_line_starts_with_url_chars)) return NULL;
-    return PyLong_FromUnsignedLong((unsigned long)line_url_end_at(self, x, true, sentinel, next_line_starts_with_url_chars));
+    return PyLong_FromUnsignedLong((unsigned long)line_url_end_at(self, x, true, sentinel, next_line_starts_with_url_chars, false, self->xnum));
 }
 
 // }}}
@@ -433,10 +454,10 @@ width(Line *self, PyObject *val) {
 }
 
 void
-line_add_combining_char(Line *self, uint32_t ch, unsigned int x) {
-    CPUCell *cell = self->cpu_cells + x;
+line_add_combining_char(CPUCell *cpu_cells, GPUCell *gpu_cells, uint32_t ch, unsigned int x) {
+    CPUCell *cell = cpu_cells + x;
     if (!cell->ch) {
-        if (x > 0 && (self->gpu_cells[x-1].attrs.width) == 2 && self->cpu_cells[x-1].ch) cell = self->cpu_cells + x - 1;
+        if (x > 0 && (gpu_cells[x-1].attrs.width) == 2 && cpu_cells[x-1].ch) cell = cpu_cells + x - 1;
         else return; // don't allow adding combining chars to a null cell
     }
     for (unsigned i = 0; i < arraysz(cell->cc_idx); i++) {
@@ -455,7 +476,7 @@ add_combining_char(Line* self, PyObject *args) {
         PyErr_SetString(PyExc_ValueError, "Column index out of bounds");
         return NULL;
     }
-    line_add_combining_char(self, new_char, x);
+    line_add_combining_char(self->cpu_cells, self->gpu_cells, new_char, x);
     Py_RETURN_NONE;
 }
 
@@ -521,11 +542,10 @@ cursor_from(Line* self, PyObject *args) {
 void
 line_clear_text(Line *self, unsigned int at, unsigned int num, char_type ch) {
     const uint16_t width = ch ? 1 : 0;
-    for (index_type i = at; i < MIN(self->xnum, at + num); i++) {
-        self->cpu_cells[i].ch = ch; memset(self->cpu_cells[i].cc_idx, 0, sizeof(self->cpu_cells[i].cc_idx));
-        self->cpu_cells[i].hyperlink_id = 0;
-        self->gpu_cells[i].attrs.width = width;
-    }
+    const CPUCell cc = {.ch=ch};
+    if (at + num > self->xnum) num = self->xnum > at ? self->xnum - at : 0;
+    memset_array(self->cpu_cells + at, cc, num);
+    for (index_type i = at; i < at + num; i++) self->gpu_cells[i].attrs.width = width;
 }
 
 static PyObject*
@@ -539,25 +559,22 @@ clear_text(Line* self, PyObject *args) {
 }
 
 void
-line_apply_cursor(Line *self, Cursor *cursor, unsigned int at, unsigned int num, bool clear_char) {
-    CellAttrs attrs = cursor_to_attrs(cursor, 0);
-    color_type fg = (cursor->fg & COL_MASK), bg = (cursor->bg & COL_MASK);
-    color_type dfg = cursor->decoration_fg & COL_MASK;
-
-    for (index_type i = at; i < self->xnum && i < at + num; i++) {
-        if (clear_char) {
-            self->cpu_cells[i].ch = BLANK_CHAR;
-            self->cpu_cells[i].hyperlink_id = 0;
-            memset(self->cpu_cells[i].cc_idx, 0, sizeof(self->cpu_cells[i].cc_idx));
-            self->gpu_cells[i].attrs = attrs;
-            clear_sprite_position(self->gpu_cells[i]);
-        } else {
-            attrs.width = self->gpu_cells[i].attrs.width;
-            attrs.mark = self->gpu_cells[i].attrs.mark;
-            self->gpu_cells[i].attrs = attrs;
+line_apply_cursor(Line *self, const Cursor *cursor, unsigned int at, unsigned int num, bool clear_char) {
+    GPUCell gc = cursor_as_gpu_cell(cursor);
+    if (clear_char) {
+#if BLANK_CHAR != 0
+#error This implementation is incorrect for BLANK_CHAR != 0
+#endif
+        if (at + num > self->xnum) { num = at < self->xnum ? self->xnum - at : 0; }
+        memset(self->cpu_cells + at, 0, num * sizeof(CPUCell));
+        memset_array(self->gpu_cells + at, gc, num);
+    } else {
+        for (index_type i = at; i < self->xnum && i < at + num; i++) {
+            gc.attrs.width = self->gpu_cells[i].attrs.width;
+            gc.attrs.mark = self->gpu_cells[i].attrs.mark;
+            gc.sprite_x = self->gpu_cells[i].sprite_x; gc.sprite_y = self->gpu_cells[i].sprite_y; gc.sprite_z = self->gpu_cells[i].sprite_z;
+            memcpy(self->gpu_cells + i, &gc, sizeof(gc));
         }
-        self->gpu_cells[i].fg = fg; self->gpu_cells[i].bg = bg;
-        self->gpu_cells[i].decoration_fg = dfg;
     }
 }
 
@@ -614,7 +631,7 @@ left_shift(Line *self, PyObject *args) {
 }
 
 static color_type
-resolve_color(ColorProfile *cp, color_type val, color_type defval) {
+resolve_color(const ColorProfile *cp, color_type val, color_type defval) {
     switch(val & 0xff) {
         case 1:
             return cp->color_table[(val >> 8) & 0xff];
@@ -626,7 +643,7 @@ resolve_color(ColorProfile *cp, color_type val, color_type defval) {
 }
 
 bool
-colors_for_cell(Line *self, ColorProfile *cp, index_type *x, color_type *fg, color_type *bg, bool *reversed) {
+colors_for_cell(Line *self, const ColorProfile *cp, index_type *x, color_type *fg, color_type *bg, bool *reversed) {
     if (*x >= self->xnum) return false;
     if (*x > 0 && !self->gpu_cells[*x].attrs.width && self->gpu_cells[*x-1].attrs.width == 2) (*x)--;
     *fg = resolve_color(cp, self->gpu_cells[*x].fg, *fg);
@@ -718,6 +735,8 @@ decoration_as_sgr(uint8_t decoration) {
         case 1: return "4;";
         case 2: return "4:2;";
         case 3: return "4:3;";
+        case 4: return "4:4";
+        case 5: return "4:5";
         default: return "24;";
     }
 }
@@ -901,7 +920,7 @@ as_text_generic(PyObject *args, void *container, get_line_func get_line, index_t
 // Boilerplate {{{
 static PyObject*
 copy_char(Line* self, PyObject *args);
-#define copy_char_doc "copy_char(src, to, dest) -> Copy the character at src to to the character dest in the line `to`"
+#define copy_char_doc "copy_char(src, to, dest) -> Copy the character at src to the character dest in the line `to`"
 
 #define hyperlink_ids_doc "hyperlink_ids() -> Tuple of hyper link ids at every cell"
 static PyObject*
@@ -957,7 +976,7 @@ PyTypeObject Line_Type = {
     .tp_richcompare = richcmp,
     .tp_doc = "Lines",
     .tp_methods = methods,
-    .tp_new = new
+    .tp_new = new_line_object
 };
 
 Line *alloc_line(void) {

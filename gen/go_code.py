@@ -12,26 +12,22 @@ import struct
 import subprocess
 import sys
 import tarfile
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, suppress
 from functools import lru_cache
 from itertools import chain
 from typing import (
     Any,
     BinaryIO,
-    Dict,
-    Iterator,
-    List,
     Optional,
-    Sequence,
-    Set,
     TextIO,
-    Tuple,
     Union,
 )
 
 import kitty.constants as kc
 from kittens.tui.operations import Mode
 from kittens.tui.spinners import spinners
+from kitty.actions import get_all_actions
 from kitty.cli import (
     CompletionSpec,
     GoOption,
@@ -55,7 +51,7 @@ if __name__ == '__main__' and not __package__:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-changed: List[str] = []
+changed: list[str] = []
 
 
 def newer(dest: str, *sources: str) -> bool:
@@ -73,7 +69,7 @@ def newer(dest: str, *sources: str) -> bool:
 
 # Utils {{{
 
-def serialize_go_dict(x: Union[Dict[str, int], Dict[int, str], Dict[int, int], Dict[str, str]]) -> str:
+def serialize_go_dict(x: Union[dict[str, int], dict[int, str], dict[int, int], dict[str, str]]) -> str:
     ans = []
 
     def s(x: Union[int, str]) -> str:
@@ -191,7 +187,7 @@ def kitten_cli_docs(kitten: str) -> Any:
 
 
 @lru_cache
-def go_options_for_kitten(kitten: str) -> Tuple[Sequence[GoOption], Optional[CompletionSpec]]:
+def go_options_for_kitten(kitten: str) -> tuple[Sequence[GoOption], Optional[CompletionSpec]]:
     kcd = kitten_cli_docs(kitten)
     if kcd:
         ospec = kcd['options']
@@ -237,13 +233,10 @@ def completion_for_launch_wrappers(*names: str) -> None:
 
 
 def generate_completions_for_kitty() -> None:
-    from kitty.config import option_names_for_completion
     print('package completion\n')
     print('import "kitty/tools/cli"')
     print('import "kitty/tools/cmd/tool"')
     print('import "kitty/tools/cmd/at"')
-    conf_names = ', '.join((f'"{serialize_as_go_string(x)}"' for x in option_names_for_completion()))
-    print('var kitty_option_names_for_completion = []string{' + conf_names + '}')
 
     print('func kitty(root *cli.Command) {')
 
@@ -299,7 +292,7 @@ def generate_completions_for_kitty() -> None:
 
 
 # rc command wrappers {{{
-json_field_types: Dict[str, str] = {
+json_field_types: dict[str, str] = {
     'bool': 'bool', 'str': 'escaped_string', 'list.str': '[]escaped_string', 'dict.str': 'map[escaped_string]escaped_string', 'float': 'float64', 'int': 'int',
     'scroll_amount': 'any', 'spacing': 'any', 'colors': 'any',
 }
@@ -321,10 +314,16 @@ def go_field_type(json_field_type: str) -> str:
 
 class JSONField:
 
-    def __init__(self, line: str) -> None:
+    def __init__(self, line: str, field_to_option_map: dict[str, str], option_map: dict[str, GoOption]) -> None:
         field_def = line.split(':', 1)[0]
         self.required = False
         self.field, self.field_type = field_def.split('/', 1)
+        self.go_option_name = field_to_option_map.get(self.field, self.field)
+        self.go_option_name = ''.join(x.capitalize() for x in self.go_option_name.split('_'))
+        self.omitempty = True
+        if fo := option_map.get(self.go_option_name):
+            if fo.type in ('int', 'float') and float(fo.default or 0) != 0:
+                self.omitempty = False
         self.field_type, self.special_parser = self.field_type.partition('=')[::2]
         if self.field.endswith('+'):
             self.required = True
@@ -332,46 +331,44 @@ class JSONField:
         self.struct_field_name = self.field[0].upper() + self.field[1:]
 
     def go_declaration(self) -> str:
-        return self.struct_field_name + ' ' + go_field_type(self.field_type) + f'`json:"{self.field},omitempty"`'
+        omitempty = ',omitempty' if self.omitempty else ''
+        return self.struct_field_name + ' ' + go_field_type(self.field_type) + f'`json:"{self.field}{omitempty}"`'
 
 
 def go_code_for_remote_command(name: str, cmd: RemoteCommand, template: str) -> str:
     template = '\n' + template[len('//go:build exclude'):]
-    NO_RESPONSE_BASE = 'false'
-    af: List[str] = []
+    af: list[str] = []
     a = af.append
     af.extend(cmd.args.as_go_completion_code('ans'))
-    od: List[str] = []
-    option_map: Dict[str, GoOption] = {}
+    od: list[str] = []
+    option_map: dict[str, GoOption] = {}
     for o in rc_command_options(name):
         option_map[o.go_var_name] = o
         a(o.as_option('ans'))
         if o.go_var_name in ('NoResponse', 'ResponseTimeout'):
             continue
         od.append(o.struct_declaration())
-    jd: List[str] = []
+    jd: list[str] = []
     json_fields = []
-    field_types: Dict[str, str] = {}
+    field_types: dict[str, str] = {}
     for line in cmd.protocol_spec.splitlines():
         line = line.strip()
         if ':' not in line:
             continue
-        f = JSONField(line)
+        f = JSONField(line, cmd.field_to_option_map or {}, option_map)
         json_fields.append(f)
         field_types[f.field] = f.field_type
         jd.append(f.go_declaration())
-    jc: List[str] = []
-    handled_fields: Set[str] = set()
+    jc: list[str] = []
+    handled_fields: set[str] = set()
     jc.extend(cmd.args.as_go_code(name, field_types, handled_fields))
 
     unhandled = {}
     used_options = set()
     for field in json_fields:
-        oq = (cmd.field_to_option_map or {}).get(field.field, field.field)
-        oq = ''.join(x.capitalize() for x in oq.split('_'))
-        if oq in option_map:
-            o = option_map[oq]
-            used_options.add(oq)
+        if field.go_option_name in option_map:
+            o = option_map[field.go_option_name]
+            used_options.add(field.go_option_name)
             optstring = f'options_{name}.{o.go_var_name}'
             if field.special_parser:
                 optstring = f'{field.special_parser}({optstring})'
@@ -407,13 +404,14 @@ def go_code_for_remote_command(name: str, cmd: RemoteCommand, template: str) -> 
     argspec = cmd.args.spec
     if argspec:
         argspec = ' ' + argspec
+    NO_RESPONSE = 'true' if cmd.disallow_responses else 'false'
     ans = replace(
         template,
         CMD_NAME=name, __FILE__=__file__, CLI_NAME=name.replace('_', '-'),
         SHORT_DESC=serialize_as_go_string(cmd.short_desc),
         LONG_DESC=serialize_as_go_string(cmd.desc.strip()),
         IS_ASYNC='true' if cmd.is_asynchronous else 'false',
-        NO_RESPONSE_BASE=NO_RESPONSE_BASE, ADD_FLAGS_CODE='\n'.join(af),
+        NO_RESPONSE_BASE=NO_RESPONSE, ADD_FLAGS_CODE='\n'.join(af),
         WAIT_TIMEOUT=str(cmd.response_timeout),
         OPTIONS_DECLARATION_CODE='\n'.join(od),
         JSON_DECLARATION_CODE='\n'.join(jd),
@@ -428,7 +426,7 @@ def go_code_for_remote_command(name: str, cmd: RemoteCommand, template: str) -> 
 # kittens {{{
 
 @lru_cache
-def wrapped_kittens() -> Tuple[str, ...]:
+def wrapped_kittens() -> tuple[str, ...]:
     with open('shell-integration/ssh/kitty') as f:
         for line in f:
             if line.startswith('    wrapped_kittens="'):
@@ -463,9 +461,20 @@ def generate_extra_cli_parser(name: str, spec: str) -> None:
     print('}')
 
 
+def kittens_needing_cli_parsers() -> Iterator[str]:
+    for d in os.scandir('kittens'):
+        if not d.is_dir(follow_symlinks=False):
+            continue
+        if os.path.exists(os.path.join(d.path, 'main.py')) and os.path.exists(os.path.join(d.path, 'main.go')):
+            with open(os.path.join(d.path, 'main.py')) as f:
+                raw = f.read()
+            if 'options' in raw:
+                yield d.name
+
+
 def kitten_clis() -> None:
     from kittens.runner import get_kitten_conf_docs, get_kitten_extra_cli_parsers
-    for kitten in wrapped_kittens() + ('pager',):
+    for kitten in kittens_needing_cli_parsers():
         defn = get_kitten_conf_docs(kitten)
         if defn is not None:
             generate_conf_parser(kitten, defn)
@@ -562,7 +571,7 @@ SelectionBg: "{selbg}",
 '''
 
 
-def load_ref_map() -> Dict[str, Dict[str, str]]:
+def load_ref_map() -> dict[str, dict[str, str]]:
     with open('kitty/docs_ref_map_generated.h') as f:
         raw = f.read()
     raw = raw.split('{', 1)[1].split('}', 1)[0]
@@ -572,9 +581,12 @@ def load_ref_map() -> Dict[str, Dict[str, str]]:
 
 def generate_constants() -> str:
     from kittens.hints.main import DEFAULT_REGEX
+    from kittens.query_terminal.main import all_queries
+    from kitty.config import option_names_for_completion
     from kitty.fast_data_types import FILE_TRANSFER_CODE
-    from kitty.options.utils import allowed_shell_integration_values
+    from kitty.options.utils import allowed_shell_integration_values, url_style_map
     del sys.modules['kittens.hints.main']
+    del sys.modules['kittens.query_terminal.main']
     ref_map = load_ref_map()
     with open('kitty/data-types.h') as dt:
         m = re.search(r'^#define IMAGE_PLACEHOLDER_CHAR (\S+)', dt.read(), flags=re.M)
@@ -582,6 +594,9 @@ def generate_constants() -> str:
         placeholder_char = int(m.group(1), 16)
     dp = ", ".join(map(lambda x: f'"{serialize_as_go_string(x)}"', kc.default_pager_for_help))
     url_prefixes = ','.join(f'"{x}"' for x in Options.url_prefixes)
+    option_names = '`' + '\n'.join(option_names_for_completion()) + '`'
+    url_style = {v:k for k, v in url_style_map.items()}[Options.url_style]
+    query_names = ', '.join(f'"{name}"' for name in all_queries)
     return f'''\
 package kitty
 
@@ -600,6 +615,8 @@ var IsStandaloneBuild string = ""
 const HandleTermiosSignals = {Mode.HANDLE_TERMIOS_SIGNALS.value[0]}
 const HintsDefaultRegex = `{DEFAULT_REGEX}`
 const DefaultTermName = `{Options.term}`
+const DefaultUrlStyle = `{url_style}`
+const DefaultUrlColor = `{Options.url_color.as_sharp}`
 var Version VersionType = VersionType{{Major: {kc.version.major}, Minor: {kc.version.minor}, Patch: {kc.version.patch},}}
 var DefaultPager []string = []string{{ {dp} }}
 var FunctionalKeyNameAliases = map[string]string{serialize_go_dict(functional_key_name_aliases)}
@@ -608,15 +625,17 @@ var ConfigModMap = map[string]uint16{serialize_go_dict(config_mod_map)}
 var RefMap = map[string]string{serialize_go_dict(ref_map['ref'])}
 var DocTitleMap = map[string]string{serialize_go_dict(ref_map['doc'])}
 var AllowedShellIntegrationValues = []string{{ {str(sorted(allowed_shell_integration_values))[1:-1].replace("'", '"')} }}
+var QueryNames = []string{{ {query_names} }}
 var KittyConfigDefaults = struct {{
-Term, Shell_integration, Select_by_word_characters, Shell string
+Term, Shell_integration, Select_by_word_characters, Url_excluded_characters, Shell string
 Wheel_scroll_multiplier int
 Url_prefixes []string
 }}{{
 Term: "{Options.term}", Shell_integration: "{' '.join(Options.shell_integration)}", Url_prefixes: []string{{ {url_prefixes} }},
 Select_by_word_characters: `{Options.select_by_word_characters}`, Wheel_scroll_multiplier: {Options.wheel_scroll_multiplier},
-Shell: "{Options.shell}",
+Shell: "{Options.shell}", Url_excluded_characters: "{Options.url_excluded_characters}",
 }}
+const OptionNames = {option_names}
 '''  # }}}
 
 
@@ -632,7 +651,7 @@ def replace_if_needed(path: str, show_diff: bool = False) -> Iterator[io.StringI
     finally:
         sys.stdout = origb
     orig = ''
-    with suppress(FileNotFoundError), open(path, 'r') as f:
+    with suppress(FileNotFoundError), open(path) as f:
         orig = f.read()
     new = buf.getvalue()
     new = f'// Code generated by {os.path.basename(__file__)}; DO NOT EDIT.\n\n' + new
@@ -648,7 +667,7 @@ def replace_if_needed(path: str, show_diff: bool = False) -> Iterator[io.StringI
 
 
 @lru_cache(maxsize=256)
-def rc_command_options(name: str) -> Tuple[GoOption, ...]:
+def rc_command_options(name: str) -> tuple[GoOption, ...]:
     cmd = command_for_name(name)
     return tuple(go_options_for_seq(parse_option_spec(cmd.options_spec or '\n\n')[0]))
 
@@ -688,6 +707,15 @@ func add_rc_global_opts(cmd *cli.Command) {{
 def update_completion() -> None:
     with replace_if_needed('tools/cmd/completion/kitty_generated.go'):
         generate_completions_for_kitty()
+
+    with replace_if_needed('tools/cmd/at/kitty_actions_generated.go'):
+        print("package at")
+        print("const KittyActionNames = `", end='')
+        for grp, actions in get_all_actions().items():
+            for ac in actions:
+                print(ac.name)
+        print('`')
+
     with replace_if_needed('tools/cmd/edit_in_kitty/launch_generated.go'):
         print('package edit_in_kitty')
         print('import "kitty/tools/cli"')
@@ -845,7 +873,12 @@ def generate_ssh_kitten_data() -> None:
             write_compressed_data(buf.getvalue(), d)
 
 
-def main(args: List[str]=sys.argv) -> None:
+def start_simdgen() -> 'subprocess.Popen[bytes]':
+    return subprocess.Popen(['go', 'run', 'generate.go'], cwd='tools/simdstring', stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def main(args: list[str]=sys.argv) -> None:
+    simdgen_process = start_simdgen()
     with replace_if_needed('constants_generated.go') as f:
         f.write(generate_constants())
     with replace_if_needed('tools/utils/style/color-names_generated.go') as f:
@@ -868,6 +901,12 @@ def main(args: List[str]=sys.argv) -> None:
     kitten_clis()
     stringify()
     print(json.dumps(changed, indent=2))
+    stdout, stderr = simdgen_process.communicate()
+    if simdgen_process.wait() != 0:
+        print('Failed to generate SIMD ASM', file=sys.stderr)
+        sys.stdout.buffer.write(stdout)
+        sys.stderr.buffer.write(stderr)
+        raise SystemExit(simdgen_process.returncode)
 
 
 if __name__ == '__main__':

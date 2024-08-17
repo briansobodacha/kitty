@@ -11,6 +11,10 @@
 #include "glfw-wrapper.h"
 #include <structmember.h>
 
+#ifndef __APPLE__
+#include <xkbcommon/xkbcommon.h>
+#endif
+
 // python KeyEvent object {{{
 typedef struct {
     PyObject_HEAD
@@ -22,7 +26,7 @@ typedef struct {
 static PyObject* convert_glfw_key_event_to_python(const GLFWkeyevent *ev);
 
 static PyObject*
-new(PyTypeObject *type UNUSED, PyObject *args, PyObject *kw) {
+new_keyevent_object(PyTypeObject *type UNUSED, PyObject *args, PyObject *kw) {
     static char *kwds[] = {"key", "shifted_key", "alternate_key", "mods", "action", "native_key", "ime_state", "text", NULL};
     GLFWkeyevent ev = {.action=GLFW_PRESS};
     if (!PyArg_ParseTupleAndKeywords(args, kw, "I|IIiiiiz", kwds, &ev.key, &ev.shifted_key, &ev.alternate_key, &ev.mods, &ev.action, &ev.native_key, &ev.ime_state, &ev.text)) return NULL;
@@ -42,6 +46,19 @@ is_modifier_key(const uint32_t key) {
             return false;
     }
     END_ALLOW_CASE_RANGE
+}
+
+static bool
+is_no_action_key(const uint32_t key, const uint32_t native_key) {
+    switch (native_key) {
+#ifndef __APPLE__
+        case XKB_KEY_XF86Fn:
+        case XKB_KEY_XF86WakeUp:
+            return true;
+#endif
+        default:
+            return is_modifier_key(key);
+    }
 }
 
 static void
@@ -69,7 +86,7 @@ PyTypeObject PyKeyEvent_Type = {
     .tp_flags = Py_TPFLAGS_DEFAULT,
     .tp_doc = "A key event",
     .tp_members = members,
-    .tp_new = new,
+    .tp_new = new_keyevent_object,
 };
 
 static PyObject*
@@ -152,12 +169,19 @@ on_key_input(GLFWkeyevent *ev) {
     const uint32_t key = ev->key, native_key = ev->native_key;
     const char *text = ev->text ? ev->text : "";
 
-    debug("\x1b[33mon_key_input\x1b[m: glfw key: 0x%x native_code: 0x%x action: %s %stext: '%s' state: %d ",
-            key, native_key,
-            (action == GLFW_RELEASE ? "RELEASE" : (action == GLFW_PRESS ? "PRESS" : "REPEAT")),
-            format_mods(mods), text, ev->ime_state);
+    if (OPT(debug_keyboard)) {
+        if (!key && !native_key && text[0]) {
+            debug("\x1b[33mon_IME_input\x1b[m: text: %s ", text);
+        } else {
+            debug("\x1b[33mon_key_input\x1b[m: glfw key: 0x%x native_code: 0x%x action: %s %stext: '%s' state: %d ",
+                    key, native_key,
+                    (action == GLFW_RELEASE ? "RELEASE" : (action == GLFW_PRESS ? "PRESS" : "REPEAT")),
+                    format_mods(mods), text, ev->ime_state);
+        }
+    }
     if (!w) { debug("no active window, ignoring\n"); return; }
-    if (OPT(mouse_hide_wait) < 0 && !is_modifier_key(key)) hide_mouse(global_state.callback_os_window);
+    send_pending_click_to_window(w, -1);
+    if (OPT(mouse_hide_wait) < 0 && !is_no_action_key(key, native_key)) hide_mouse(global_state.callback_os_window);
     Screen *screen = w->render_data.screen;
     id_type active_window_id = w->id;
 
@@ -165,7 +189,8 @@ on_key_input(GLFWkeyevent *ev) {
         case GLFW_IME_WAYLAND_DONE_EVENT:
             // If we update IME position here it sends GNOME's text input system into
             // an infinite loop. See https://github.com/kovidgoyal/kitty/issues/5105
-            screen_update_overlay_text(screen, NULL);
+            // and also: https://github.com/kovidgoyal/kitty/pull/7283
+            screen_update_overlay_text(screen, text);
             debug("handled wayland IME done event\n");
             return;
         case GLFW_IME_PREEDIT_CHANGED:
@@ -176,7 +201,7 @@ on_key_input(GLFWkeyevent *ev) {
         case GLFW_IME_COMMIT_TEXT:
             if (*text) {
                 schedule_write_to_child(w->id, 1, text, strlen(text));
-                debug("committed pre-edit text: %s\n", text);
+                debug("committed pre-edit text: %s sent to child as text.\n", text);
             } else debug("committed pre-edit text: (null)\n");
             screen_update_overlay_text(screen, NULL);
             return;
@@ -220,7 +245,7 @@ on_key_input(GLFWkeyevent *ev) {
         debug("discarding repeat key event as DECARM is off\n");
         return;
     }
-    if (screen->scrolled_by && action == GLFW_PRESS && !is_modifier_key(key)) {
+    if (screen->scrolled_by && action == GLFW_PRESS && !is_no_action_key(key, native_key)) {
         screen_history_scroll(screen, SCROLL_FULL, false);  // scroll back to bottom
     }
     char encoded_key[KEY_BUFFER_SIZE] = {0};

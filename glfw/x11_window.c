@@ -41,7 +41,6 @@
 #include <stdlib.h>
 #include <limits.h>
 #include <errno.h>
-#include <assert.h>
 
 // Action for EWMH client messages
 #define _NET_WM_STATE_REMOVE        0
@@ -64,7 +63,6 @@
 // covers GLX functions
 //
 static unsigned _glfwDispatchX11Events(void);
-GLFWAPI bool glfwSetX11WindowBlurred(GLFWwindow *w, bool enable_blur);
 
 static void
 handleEvents(monotonic_t timeout) {
@@ -714,9 +712,7 @@ static bool createNativeWindow(_GLFWwindow* window,
     _glfwPlatformGetWindowPos(window, &window->x11.xpos, &window->x11.ypos);
     _glfwPlatformGetWindowSize(window, &window->x11.width, &window->x11.height);
 
-    if (_glfw.hints.window.x11.enable_blur) {
-        glfwSetX11WindowBlurred((GLFWwindow*)window, 1);
-    }
+    if (_glfw.hints.window.blur_radius > 0) _glfwPlatformSetWindowBlur(window, _glfw.hints.window.blur_radius);
 
     return true;
 }
@@ -3217,6 +3213,25 @@ _glfwPlatformUpdateIMEState(_GLFWwindow *w, const GLFWIMEUpdateEvent *ev) {
     glfw_xkb_update_ime_state(w, &_glfw.x11.xkb, ev);
 }
 
+int
+_glfwPlatformSetWindowBlur(_GLFWwindow *window, int blur_radius) {
+    if (_glfw.x11._KDE_NET_WM_BLUR_BEHIND_REGION == None) {
+        _glfw.x11._KDE_NET_WM_BLUR_BEHIND_REGION = XInternAtom(_glfw.x11.display, "_KDE_NET_WM_BLUR_BEHIND_REGION", False);
+    }
+    if (_glfw.x11._KDE_NET_WM_BLUR_BEHIND_REGION != None) {
+        uint32_t data = 0;
+        if (blur_radius > 0) {
+            XChangeProperty(_glfw.x11.display, window->x11.handle, _glfw.x11._KDE_NET_WM_BLUR_BEHIND_REGION,
+                    XA_CARDINAL, 32, PropModeReplace, (unsigned char*) &data, 1);
+        } else {
+            XDeleteProperty(_glfw.x11.display, window->x11.handle, _glfw.x11._KDE_NET_WM_BLUR_BEHIND_REGION);
+        }
+        return 1;
+    }
+    return 0;
+}
+
+
 //////////////////////////////////////////////////////////////////////////
 //////                        GLFW native API                       //////
 //////////////////////////////////////////////////////////////////////////
@@ -3227,7 +3242,7 @@ GLFWAPI Display* glfwGetX11Display(void)
     return _glfw.x11.display;
 }
 
-GLFWAPI Window glfwGetX11Window(GLFWwindow* handle)
+GLFWAPI unsigned long glfwGetX11Window(GLFWwindow* handle)
 {
     _GLFWwindow* window = (_GLFWwindow*) handle;
     _GLFW_REQUIRE_INIT_OR_RETURN(None);
@@ -3238,8 +3253,8 @@ GLFWAPI int glfwGetNativeKeyForName(const char* keyName, bool caseSensitive) {
     return glfw_xkb_keysym_from_name(keyName, caseSensitive);
 }
 
-GLFWAPI unsigned long long glfwDBusUserNotify(const char *app_name, const char* icon, const char *summary, const char *body, const char *action_name, int32_t timeout, GLFWDBusnotificationcreatedfun callback, void *data) {
-    return glfw_dbus_send_user_notification(app_name, icon, summary, body, action_name, timeout, callback, data);
+GLFWAPI unsigned long long glfwDBusUserNotify(const GLFWDBUSNotificationData *n, GLFWDBusnotificationcreatedfun callback, void *data) {
+    return glfw_dbus_send_user_notification(n, callback, data);
 }
 
 GLFWAPI void glfwDBusSetUserNotificationHandler(GLFWDBusnotificationactivatedfun handler) {
@@ -3259,25 +3274,6 @@ GLFWAPI void glfwSetX11WindowAsDock(int32_t x11_window_id) {
     XChangeProperty(_glfw.x11.display, x11_window_id,
                     _glfw.x11.NET_WM_WINDOW_TYPE, XA_ATOM, 32,
                     PropModeReplace, (unsigned char*) &type, 1);
-}
-
-GLFWAPI bool glfwSetX11WindowBlurred(GLFWwindow *w, bool enable_blur) {
-    _GLFW_REQUIRE_INIT_OR_RETURN(0);
-    _GLFWwindow *window = (_GLFWwindow*)w;
-    if (_glfw.x11._KDE_NET_WM_BLUR_BEHIND_REGION == None) {
-        _glfw.x11._KDE_NET_WM_BLUR_BEHIND_REGION = XInternAtom(_glfw.x11.display, "_KDE_NET_WM_BLUR_BEHIND_REGION", False);
-    }
-    if (_glfw.x11._KDE_NET_WM_BLUR_BEHIND_REGION != None) {
-        uint32_t data = 0;
-        if (enable_blur) {
-            XChangeProperty(_glfw.x11.display, window->x11.handle, _glfw.x11._KDE_NET_WM_BLUR_BEHIND_REGION,
-                    XA_CARDINAL, 32, PropModeReplace, (unsigned char*) &data, 1);
-        } else {
-            XDeleteProperty(_glfw.x11.display, window->x11.handle, _glfw.x11._KDE_NET_WM_BLUR_BEHIND_REGION);
-        }
-        return true;
-    }
-    return false;
 }
 
 

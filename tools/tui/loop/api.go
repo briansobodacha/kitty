@@ -4,6 +4,7 @@ package loop
 
 import (
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"runtime"
@@ -40,6 +41,7 @@ type Loop struct {
 	controlling_term                       *tty.Term
 	terminal_options                       TerminalStateOptions
 	screen_size                            ScreenSize
+	seen_inband_resize                     bool
 	escape_code_parser                     wcswidth.EscapeCodeParser
 	keep_going                             bool
 	death_signal                           unix.Signal
@@ -89,6 +91,9 @@ type Loop struct {
 	// Called when a response to an rc command is received
 	OnRCResponse func(data []byte) error
 
+	// Called when a response to a query command is received
+	OnQueryResponse func(key, val string, valid bool) error
+
 	// Called when any input from tty is received
 	OnReceivedData func(data []byte) error
 
@@ -129,12 +134,12 @@ func (self *Loop) RemoveTimer(id IdType) bool {
 }
 
 func (self *Loop) NoAlternateScreen() *Loop {
-	self.terminal_options.alternate_screen = false
+	self.terminal_options.Alternate_screen = false
 	return self
 }
 
 func NoAlternateScreen(self *Loop) {
-	self.terminal_options.alternate_screen = false
+	self.terminal_options.Alternate_screen = false
 }
 
 func (self *Loop) OnlyDisambiguateKeys() *Loop {
@@ -144,6 +149,15 @@ func (self *Loop) OnlyDisambiguateKeys() *Loop {
 
 func OnlyDisambiguateKeys(self *Loop) {
 	self.terminal_options.kitty_keyboard_mode = DISAMBIGUATE_KEYS
+}
+
+func (self *Loop) NoKeyboardStateChange() *Loop {
+	self.terminal_options.kitty_keyboard_mode = NO_KEYBOARD_STATE_CHANGE
+	return self
+}
+
+func NoKeyboardStateChange(self *Loop) {
+	self.terminal_options.kitty_keyboard_mode = NO_KEYBOARD_STATE_CHANGE
 }
 
 func (self *Loop) FullKeyboardProtocol() *Loop {
@@ -208,6 +222,27 @@ func (self *Loop) Println(args ...any) {
 	self.QueueWriteString("\r")
 }
 
+func (self *Loop) style_region(style string, start_x, start_y, end_x, end_y int) string {
+	sgr := self.SprintStyled(style, "|")
+	if len(sgr) > 2 {
+		sgr = sgr[2:strings.IndexByte(sgr, 'm')]
+		return fmt.Sprintf("\x1b[%d;%d;%d;%d;%s$r", start_y+1, start_x+1, end_y+1, end_x+1, sgr)
+	}
+	return ""
+}
+
+// Apply the specified style to the specified region of the screen (0-based
+// indexing). The region is all cells from the start cell to the end cell. See
+// StyleRectangle to apply style to a rectangular area.
+func (self *Loop) StyleRegion(style string, start_x, start_y, end_x, end_y int) IdType {
+	return self.QueueWriteString(self.style_region(style, start_x, start_y, end_x, end_y))
+}
+
+// Apply the specified style to the specified rectangle of the screen (0-based indexing).
+func (self *Loop) StyleRectangle(style string, start_x, start_y, end_x, end_y int) IdType {
+	return self.QueueWriteString("\x1b[2*x" + self.style_region(style, start_x, start_y, end_x, end_y) + "\x1b[*x")
+}
+
 func (self *Loop) SprintStyled(style string, args ...any) string {
 	f := self.style_cache[style]
 	if f == nil {
@@ -268,7 +303,7 @@ func (self *Loop) Run() (err error) {
 				}
 				fmt.Fprintf(os.Stderr, "%s\r\n\t%s:%d\r\n", frame.Function, frame.File, frame.Line)
 			}
-			if self.terminal_options.alternate_screen {
+			if self.terminal_options.Alternate_screen {
 				term, err := tty.OpenControllingTerm(tty.SetRaw)
 				if err == nil {
 					defer term.RestoreAndClose()
@@ -417,6 +452,10 @@ func (self *Loop) ClearScreen() {
 	self.QueueWriteString("\x1b[H\x1b[2J")
 }
 
+func (self *Loop) ClearScreenButNotGraphics() {
+	self.QueueWriteString("\x1b[H\x1b[J")
+}
+
 func (self *Loop) SendOverlayReady() {
 	self.QueueWriteString("\x1bP@kitty-overlay-ready|\x1b\\")
 }
@@ -454,6 +493,17 @@ func (self *Loop) CopyTextToClipboard(text string) {
 	self.copy_text_to(text, "c")
 }
 
+func (self *Loop) QueryTerminal(fields ...string) IdType {
+	if len(fields) == 0 {
+		return 0
+	}
+	q := make([]string, len(fields))
+	for i, x := range fields {
+		q[i] = hex.EncodeToString(utils.UnsafeStringToBytes("kitty-query-" + x))
+	}
+	return self.QueueWriteString(fmt.Sprintf("\x1bP+q%s\a", strings.Join(q, ";")))
+}
+
 func (self *Loop) PushPointerShape(s PointerShape) {
 	self.pointer_shapes = append(self.pointer_shapes, s)
 	self.QueueWriteString("\x1b]22;" + s.String() + "\x1b\\")
@@ -466,6 +516,8 @@ func (self *Loop) PopPointerShape() {
 	}
 }
 
+// Remove all pointer shapes from the shape stack resetting to default pointer
+// shape. This is called automatically on loop termination.
 func (self *Loop) ClearPointerShapes() (ans []PointerShape) {
 	ans = self.pointer_shapes
 	for i := len(self.pointer_shapes) - 1; i >= 0; i-- {

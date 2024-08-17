@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 class SetBackgroundOpacity(RemoteCommand):
 
     protocol_spec = __doc__ = '''
-    opacity+/float: A number between 0.1 and 1
+    opacity+/float: A number between 0 and 1
     match_window/str: Window to change opacity in
     match_tab/str: Tab to change opacity in
     all/bool: Boolean indicating operate on all windows
@@ -54,7 +54,7 @@ equal to the specified value, otherwise it will be set to the specified value.
     args = RemoteCommand.Args(spec='OPACITY', count=1, json_field='opacity', special_parse='parse_opacity(args[0])')
 
     def message_to_kitty(self, global_opts: RCOptions, opts: 'CLIOptions', args: ArgsType) -> PayloadType:
-        opacity = max(0.1, min(float(args[0]), 1.0))
+        opacity = max(0, min(float(args[0]), 1))
         return {
             'opacity': opacity, 'match_window': opts.match,
             'all': opts.all, 'match_tab': opts.match_tab, 'toggle': opts.toggle,
@@ -67,7 +67,7 @@ equal to the specified value, otherwise it will be set to the specified value.
             raise OpacityError('You must turn on the dynamic_background_opacity option in kitty.conf to be able to set background opacity')
         windows = self.windows_for_payload(boss, window, payload_get)
         for os_window_id in {w.os_window_id for w in windows if w}:
-            val: float = payload_get('opacity')
+            val: float = payload_get('opacity') or 0.
             if payload_get('toggle'):
                 current = background_opacity_of(os_window_id)
                 if current == val:

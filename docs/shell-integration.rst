@@ -85,6 +85,8 @@ no-cwd
 no-prompt-mark
     Turn off marking of prompts. This disables jumping to prompt, browsing
     output of last command and click to move cursor functionality.
+    Note that for the fish shell this does not take effect, since fish always
+    marks prompts.
 
 no-complete
     Turn off completion for the kitty command.
@@ -313,6 +315,10 @@ window, etc. Not all arguments are supported, see the discussion in the
 In order to avoid remote code execution, kitty will only execute the configured
 editor and pass the file path to edit to it.
 
+.. note:: To edit files using sudo the best method is to set the
+   :code:`SUDO_EDITOR` environment variable to ``kitten edit-in-kitty`` and
+   then edit the file using the ``sudoedit`` or ``sudo -e`` commands.
+
 
 .. _run_shell:
 
@@ -406,7 +412,7 @@ shells:
 
 * Jupyter console and IPython via a patch (:iss:`4475`)
 * `xonsh <https://github.com/xonsh/xonsh/issues/4623>`__
-
+* `Nushell <https://github.com/nushell/nushell/discussions/12065>`__: Set ``$env.config.shell_integration = true`` in your ``config.nu`` to enable it.
 
 Notes for shell developers
 -----------------------------
@@ -427,7 +433,38 @@ Just before running a command/program, send the escape code::
 
     <OSC>133;C<ST>
 
+Optionally, when a command is finished its "exit status" can be reported as::
+
+    <OSC>133;D;exit status as base 10 integer<ST>
+
 Here ``<OSC>`` is the bytes ``0x1b 0x5d`` and ``<ST>`` is the bytes ``0x1b
 0x5c``. This is exactly what is needed for shell integration in kitty. For the
 full protocol, that also marks the command region, see `the iTerm2 docs
 <https://iterm2.com/documentation-escape-codes.html>`_.
+
+kitty additionally supports several extra fields for the ``<OSC>133;A`` command
+to control its behavior, separated by semi-colons. They are::
+
+    redraw=0 - this tells kitty that the shell will not redraw the prompt on
+    resize so it should not erase it
+
+    special_key=1 - this tells kitty to use a special key instead of arrow keys
+    to move the cursor on mouse click. Useful if arrow keys have side-effects
+    like triggering auto complete. The shell integration script then binds the
+    special key, as needed.
+
+    k=s - this tells kitty that the secondary (PS2) prompt is starting at the
+    current line.
+
+kitty also optionally supports sending the cmdline going to be executed with ``<OSC>133;C`` as::
+
+    <OSC>133;C;cmdline=cmdline encoded by %q<ST>
+    or
+    <OSC>133;C;cmdline_url=cmdline as UTF-8 URL %-escaped text<ST>
+
+
+Here, *encoded by %q* means the encoding produced by the %q format to printf in
+bash and similar shells. Which is basically shell escaping with the addition of
+using `ANSI C quoting
+<https://www.gnu.org/software/bash/manual/html_node/ANSI_002dC-Quoting.html#ANSI_002dC-Quoting>`__
+for control characters (``$''`` quoting).

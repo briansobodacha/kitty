@@ -19,14 +19,25 @@
 
 #include FT_BITMAP_H
 #include FT_TRUETYPE_TABLES_H
+#include FT_MULTIPLE_MASTERS_H
+#include FT_SFNT_NAMES_H
+
+typedef union FaceIndex {
+    struct {
+        FT_Long ttc_index : 16;
+        FT_Long variation_index : 16;
+    };
+    FT_Long val;
+} FaceIndex;
+
 typedef struct {
     PyObject_HEAD
 
     FT_Face face;
     unsigned int units_per_EM;
     int ascender, descender, height, max_advance_width, max_advance_height, underline_position, underline_thickness, strikethrough_position, strikethrough_thickness;
-    int hinting, hintstyle, index;
-    bool is_scalable, has_color;
+    int hinting, hintstyle;
+    bool is_scalable, has_color, is_variable, has_svg;
     float size_in_pts;
     FT_F26Dot6 char_width, char_height;
     FT_UInt xdpi, ydpi;
@@ -36,6 +47,8 @@ typedef struct {
     void *extra_data;
     free_extra_data_func free_extra_data;
     float apple_leading;
+    PyObject *name_lookup_table;
+    FontFeatures font_features;
 } Face;
 PyTypeObject Face_Type;
 
@@ -184,6 +197,18 @@ set_size_for_face(PyObject *s, unsigned int desired_height, bool force, FONTS_DA
     return set_font_size(self, w, w, xdpi, ydpi, desired_height, fg->cell_height);
 }
 
+static PyObject*
+set_size(Face *self, PyObject *args) {
+    double font_sz_in_pts, dpi_x, dpi_y;
+    if (!PyArg_ParseTuple(args, "ddd", &font_sz_in_pts, &dpi_x, &dpi_y)) return NULL;
+    FT_F26Dot6 w = (FT_F26Dot6)(ceil(font_sz_in_pts * 64.0));
+    FT_UInt xdpi = (FT_UInt)dpi_x, ydpi = (FT_UInt)dpi_y;
+    if (self->char_width == w && self->char_height == w && self->xdpi == xdpi && self->ydpi == ydpi) { Py_RETURN_NONE; }
+    self->size_in_pts = (float)font_sz_in_pts;
+    if (!set_font_size(self, w, w, xdpi, ydpi, 0, 0)) return NULL;
+    Py_RETURN_NONE;
+}
+
 static bool
 init_ft_face(Face *self, PyObject *path, int hinting, int hintstyle, FONTS_DATA_HANDLE fg) {
 #define CPY(n) self->n = self->face->n;
@@ -191,8 +216,14 @@ init_ft_face(Face *self, PyObject *path, int hinting, int hintstyle, FONTS_DATA_
 #undef CPY
     self->is_scalable = FT_IS_SCALABLE(self->face);
     self->has_color = FT_HAS_COLOR(self->face);
+    self->is_variable = FT_HAS_MULTIPLE_MASTERS(self->face);
+#ifdef FT_HAS_SVG
+    self->has_svg = FT_HAS_SVG(self->face);
+#else
+    self->has_svg = false;
+#endif
     self->hinting = hinting; self->hintstyle = hintstyle;
-    if (!set_size_for_face((PyObject*)self, 0, false, fg)) return false;
+    if (fg && !set_size_for_face((PyObject*)self, 0, false, fg)) return false;
     self->harfbuzz_font = hb_ft_font_create(self->face, NULL);
     if (self->harfbuzz_font == NULL) { PyErr_NoMemory(); return false; }
     hb_ft_font_set_load_flags(self->harfbuzz_font, get_load_flags(self->hinting, self->hintstyle, FT_LOAD_DEFAULT));
@@ -203,9 +234,7 @@ init_ft_face(Face *self, PyObject *path, int hinting, int hintstyle, FONTS_DATA_
       self->strikethrough_thickness = os2->yStrikeoutSize;
     }
 
-    self->path = path;
-    Py_INCREF(self->path);
-    self->index = self->face->face_index & 0xFFFF;
+    self->path = path; Py_INCREF(self->path);
     self->space_glyph_id = glyph_id_for_codepoint((PyObject*)self, ' ');
     return true;
 }
@@ -225,7 +254,7 @@ face_equals_descriptor(PyObject *face_, PyObject *descriptor) {
     if (!t) return false;
     if (PyObject_RichCompareBool(face->path, t, Py_EQ) != 1) return false;
     t = PyDict_GetItemString(descriptor, "index");
-    if (t && PyLong_AsLong(t) != face->index) return false;
+    if (t && PyLong_AsLong(t) != face->face->face_index) return false;
     return true;
 }
 
@@ -246,13 +275,53 @@ face_from_descriptor(PyObject *descriptor, FONTS_DATA_HANDLE fg) {
     D(hinting, PyObject_IsTrue, true);
     D(hint_style, PyLong_AsLong, true);
 #undef D
-    Face *self = (Face *)Face_Type.tp_alloc(&Face_Type, 0);
-    if (self != NULL) {
-        int error = FT_New_Face(library, path, index, &(self->face));
-        if(error) { Py_CLEAR(self); return set_load_error(path, error); }
-        if (!init_ft_face(self, PyDict_GetItemString(descriptor, "path"), hinting, hint_style, fg)) { Py_CLEAR(self); return NULL; }
+    RAII_PyObject(retval, Face_Type.tp_alloc(&Face_Type, 0));
+    if (retval != NULL) {
+        Face *self = (Face *)retval;
+        int error;
+        if ((error = FT_New_Face(library, path, index, &(self->face)))) { self->face = NULL; set_load_error(path, error); }
+        if (!init_ft_face(self, PyDict_GetItemString(descriptor, "path"), hinting, hint_style, fg)) return NULL;
+        PyObject *ns = PyDict_GetItemString(descriptor, "named_style");
+        if (ns) {
+            unsigned long index = PyLong_AsUnsignedLong(ns);
+            if (PyErr_Occurred()) return NULL;
+            if ((error = FT_Set_Named_Instance(self->face, index + 1))) return set_load_error(path, error);
+        }
+        PyObject *axes = PyDict_GetItemString(descriptor, "axes");
+        Py_ssize_t sz;
+        if (axes && (sz = PyTuple_GET_SIZE(axes))) {
+            RAII_ALLOC(FT_Fixed, coords, malloc(sizeof(FT_Fixed) * sz));
+            for (Py_ssize_t i = 0; i < sz; i++) {
+                PyObject *t = PyTuple_GET_ITEM(axes, i);
+                double val = PyFloat_AsDouble(t);
+                if (PyErr_Occurred()) return NULL;
+                coords[i] = (FT_Fixed)(val * 65536.0);
+            }
+            if ((error = FT_Set_Var_Design_Coordinates(self->face, sz, coords))) return set_load_error(path, error);
+        }
+        if (!create_features_for_face(postscript_name_for_face((PyObject*)self), PyDict_GetItemString(descriptor, "features"), &self->font_features)) return NULL;
     }
-    return (PyObject*)self;
+    Py_XINCREF(retval);
+    return retval;
+}
+
+FontFeatures*
+features_for_face(PyObject *s) { return &((Face*)s)->font_features; }
+
+static PyObject*
+new(PyTypeObject *type UNUSED, PyObject *args, PyObject *kw) {
+    const char *path = NULL;
+    long index = 0;
+    PyObject *descriptor = NULL;
+
+    static char *kwds[] = {"descriptor", "path", "index", NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kw, "|Osi", kwds, &descriptor, &path, &index)) return NULL;
+    if (descriptor) {
+        return face_from_descriptor(descriptor, NULL);
+    }
+    if (path) return face_from_path(path, index, NULL);
+    PyErr_SetString(PyExc_TypeError, "Must specify either path or descriptor");
+    return NULL;
 }
 
 FT_Face
@@ -280,20 +349,25 @@ dealloc(Face* self) {
     if (self->harfbuzz_font) hb_font_destroy(self->harfbuzz_font);
     if (self->face) FT_Done_Face(self->face);
     if (self->extra_data && self->free_extra_data) self->free_extra_data(self->extra_data);
+    free(self->font_features.features);
     Py_CLEAR(self->path);
+    Py_CLEAR(self->name_lookup_table);
     Py_TYPE(self)->tp_free((PyObject*)self);
 }
 
 static PyObject *
 repr(Face *self) {
     const char *ps_name = FT_Get_Postscript_Name(self->face);
+#define B(x) ((x) ? Py_True : Py_False)
+    FaceIndex instance;
+    instance.val = self->face->face_index;
     return PyUnicode_FromFormat(
-        "Face(family=%s, style=%s, ps_name=%s, path=%S, index=%d, is_scalable=%S, has_color=%S, ascender=%i, descender=%i, height=%i, underline_position=%i, underline_thickness=%i, strikethrough_position=%i, strikethrough_thickness=%i)",
+        "Face(family=%s style=%s ps_name=%s path=%S ttc_index=%d variant=%S named_instance=%S scalable=%S color=%S)",
         self->face->family_name ? self->face->family_name : "", self->face->style_name ? self->face->style_name : "",
-        ps_name ? ps_name: "",
-        self->path, self->index, self->is_scalable ? Py_True : Py_False, self->has_color ? Py_True : Py_False,
-        self->ascender, self->descender, self->height, self->underline_position, self->underline_thickness, self->strikethrough_position, self->strikethrough_thickness
+        ps_name ? ps_name: "", self->path, instance.ttc_index,
+        B(FT_IS_VARIATION(self->face)), B(FT_IS_NAMED_INSTANCE(self->face)), B(self->is_scalable), B(self->has_color)
     );
+#undef B
 }
 
 const char*
@@ -338,7 +412,7 @@ cell_metrics(PyObject *s, unsigned int* cell_width, unsigned int* cell_height, u
 }
 
 unsigned int
-glyph_id_for_codepoint(PyObject *s, char_type cp) {
+glyph_id_for_codepoint(const PyObject *s, char_type cp) {
     return FT_Get_Char_Index(((Face*)s)->face, cp);
 }
 
@@ -568,7 +642,7 @@ copy_color_bitmap(uint8_t *src, pixel* dest, Region *src_rect, Region *dest_rect
 static const bool debug_placement = false;
 
 static void
-place_bitmap_in_canvas(pixel *cell, ProcessedBitmap *bm, size_t cell_width, size_t cell_height, float x_offset, float y_offset, size_t baseline, unsigned int glyph_num) {
+place_bitmap_in_canvas(pixel *cell, ProcessedBitmap *bm, size_t cell_width, size_t cell_height, float x_offset, float y_offset, size_t baseline, unsigned int glyph_num, pixel fg_rgb, size_t x_in_canvas, size_t y_in_canvas) {
     // We want the glyph to be positioned inside the cell based on the bearingX
     // and bearingY values, making sure that it does not overflow the cell.
 
@@ -584,6 +658,7 @@ place_bitmap_in_canvas(pixel *cell, ProcessedBitmap *bm, size_t cell_width, size
         uint32_t extra = dest.left + bm->width - cell_width;
         dest.left = extra > dest.left ? 0 : dest.left - extra;
     }
+    dest.left += x_in_canvas;
 
     // Calculate row bounds
     int32_t yoff = (ssize_t)(y_offset + bm->bitmap_top);
@@ -592,12 +667,13 @@ place_bitmap_in_canvas(pixel *cell, ProcessedBitmap *bm, size_t cell_width, size
     } else {
         dest.top = baseline - yoff;
     }
+    dest.top += y_in_canvas;
 
-    /* printf("x_offset: %d y_offset: %d src_start_row: %u src_start_column: %u dest_start_row: %u dest_start_column: %u bm_width: %lu bitmap_rows: %lu\n", xoff, yoff, src.top, src.left, dest.top, dest.left, bm->width, bm->rows); */
+    // printf("x_offset: %d y_offset: %d src_start_row: %u src_start_column: %u dest_start_row: %u dest_start_column: %u bm_width: %lu bitmap_rows: %lu\n", xoff, yoff, src.top, src.left, dest.top, dest.left, bm->width, bm->rows);
 
     if (bm->pixel_mode == FT_PIXEL_MODE_BGRA) {
         copy_color_bitmap(bm->buf, cell, &src, &dest, bm->stride, cell_width);
-    } else render_alpha_mask(bm->buf, cell, &src, &dest, bm->stride, cell_width);
+    } else render_alpha_mask(bm->buf, cell, &src, &dest, bm->stride, cell_width, fg_rgb);
 }
 
 static const ProcessedBitmap EMPTY_PBM = {.factor = 1};
@@ -633,7 +709,7 @@ render_glyphs_in_cells(PyObject *f, bool bold, bool italic, hb_glyph_info_t *inf
         y = (float)positions[i].y_offset / 64.0f;
         if (debug_placement) printf("%d: x=%f canvas: %u", i, x_offset, canvas_width);
         if ((*was_colored || self->face->glyph->metrics.width > 0) && bm.width > 0) {
-            place_bitmap_in_canvas(canvas, &bm, canvas_width, cell_height, x_offset, y, baseline, i);
+            place_bitmap_in_canvas(canvas, &bm, canvas_width, cell_height, x_offset, y, baseline, i, 0xffffff, 0, 0);
         }
         if (debug_placement) printf(" adv: %f\n", (float)positions[i].x_advance / 64.0f);
         // the roundf() below is needed for infinite length ligatures, for a test case
@@ -657,7 +733,7 @@ render_glyphs_in_cells(PyObject *f, bool bold, bool italic, hb_glyph_info_t *inf
 }
 
 static PyObject*
-display_name(PyObject *s, PyObject *a UNUSED) {
+postscript_name(PyObject *s, PyObject *a UNUSED) {
     Face *self = (Face*)s;
     const char *psname = FT_Get_Postscript_Name(self->face);
     if (psname) return Py_BuildValue("s", psname);
@@ -666,10 +742,186 @@ display_name(PyObject *s, PyObject *a UNUSED) {
 }
 
 static PyObject*
+identify_for_debug(PyObject *s, PyObject *a UNUSED) {
+    Face *self = (Face*)s;
+    FaceIndex instance;
+    instance.val = self->face->face_index;
+    return PyUnicode_FromFormat("%s: %V:%d", FT_Get_Postscript_Name(self->face), self->path, "[path]", instance.val);
+}
+
+static PyObject*
 extra_data(PyObject *self, PyObject *a UNUSED) {
     return PyLong_FromVoidPtr(((Face*)self)->extra_data);
 }
 
+// NAME table {{{
+static bool
+ensure_name_table(Face *self) {
+    if (self->name_lookup_table) return true;
+    RAII_PyObject(ans, PyDict_New());
+    if (!ans) return false;
+    FT_SfntName temp;
+    for (FT_UInt i = 0; i < FT_Get_Sfnt_Name_Count(self->face); i++) {
+        FT_Error err = FT_Get_Sfnt_Name(self->face, i, &temp);
+        if (err != 0) continue;
+        if (!add_font_name_record(ans, temp.platform_id, temp.encoding_id, temp.language_id, temp.name_id, (const char*)temp.string, temp.string_len)) return NULL;
+    }
+    self->name_lookup_table = ans; Py_INCREF(ans);
+    return true;
+}
+
+static PyObject*
+get_best_name(Face *self, PyObject *nameid) {
+    if (!ensure_name_table(self)) return NULL;
+    return get_best_name_from_name_table(self->name_lookup_table, nameid);
+}
+
+static PyObject*
+_get_best_name(Face *self, unsigned long nameid) {
+    RAII_PyObject(key, PyLong_FromUnsignedLong(nameid));
+    return key ? get_best_name(self, key) : NULL;
+}
+// }}}
+
+static inline void cleanup_ftmm(FT_MM_Var **p) { if (*p) FT_Done_MM_Var(library, *p); *p = NULL; }
+
+#define RAII_FTMMVar(name) __attribute__((cleanup(cleanup_ftmm))) FT_MM_Var *name = NULL
+
+static const char*
+tag_to_string(uint32_t tag, uint8_t bytes[5]) {
+    bytes[0] = (tag >> 24) & 0xff;
+    bytes[1] = (tag >> 16) & 0xff;
+    bytes[2] = (tag >> 8) & 0xff;
+    bytes[3] = (tag) & 0xff;
+    bytes[4] = 0;
+    return (const char*)bytes;
+}
+
+static PyObject*
+convert_named_style_to_python(Face *face, const FT_Var_Named_Style *src, FT_Var_Axis *axes, unsigned num_of_axes) {
+    RAII_PyObject(axis_values, PyDict_New());
+    if (!axis_values) return NULL;
+    uint8_t tag_buf[5] = {0};
+    for (FT_UInt i = 0; i < num_of_axes; i++) {
+        double val = src->coords[i] / 65536.0;
+        RAII_PyObject(pval, PyFloat_FromDouble(val));
+        if (!pval) return NULL;
+        if (PyDict_SetItemString(axis_values, tag_to_string(axes[i].tag, tag_buf), pval) != 0) return NULL;
+    }
+    RAII_PyObject(name, _get_best_name(face, src->strid));
+    if (!name) PyErr_Clear();
+    RAII_PyObject(psname, src->psid == 0xffff ? NULL : _get_best_name(face, src->psid));
+    if (!psname) PyErr_Clear();
+    return Py_BuildValue("{sO sO sO}", "axis_values", axis_values, "name", name ? name : PyUnicode_FromString(""), "psname", psname ? psname : PyUnicode_FromString(""));
+}
+
+static PyObject*
+convert_axis_to_python(Face *face, const FT_Var_Axis *src, FT_UInt flags) {
+    PyObject *strid = _get_best_name(face, src->strid);
+    if (!strid) { PyErr_Clear(); strid = PyUnicode_FromString(""); }
+    uint8_t tag_buf[5] = {0};
+    return Py_BuildValue("{sd sd sd sO ss ss sN}",
+        "minimum", src->minimum / 65536.0, "maximum", src->maximum / 65536.0, "default", src->def / 65536.0,
+        "hidden", flags & FT_VAR_AXIS_FLAG_HIDDEN ? Py_True : Py_False, "name", src->name, "tag", tag_to_string(src->tag, tag_buf),
+        "strid", strid
+    );
+}
+
+static PyObject*
+get_variation(Face *self, PyObject *a UNUSED) {
+    RAII_FTMMVar(mm);
+    FT_Error err;
+    if ((err = FT_Get_MM_Var(self->face, &mm))) { Py_RETURN_NONE; }
+    RAII_ALLOC(FT_Fixed, coords, malloc(mm->num_axis * sizeof(FT_Fixed)));
+    if (!coords) return PyErr_NoMemory();
+    if ((err = FT_Get_Var_Design_Coordinates(self->face, mm->num_axis, coords))) {
+        set_freetype_error("Failed to load the variation data from font with error:", err); return NULL;
+    }
+    RAII_PyObject(ans, PyDict_New()); if (!ans) return NULL;
+    uint8_t tag[5];
+    for (FT_UInt i = 0; i < mm->num_axis; i++) {
+        double val = coords[i] / 65536.0;
+        tag_to_string(mm->axis[i].tag, tag);
+        RAII_PyObject(pval, PyFloat_FromDouble(val));
+        if (!pval) return NULL;
+        if (PyDict_SetItemString(ans, (const char*)tag, pval) != 0) return NULL;
+    }
+    Py_INCREF(ans); return ans;
+}
+
+static PyObject*
+applied_features(Face *self, PyObject *a UNUSED) {
+    return font_features_as_dict(&self->font_features);
+}
+
+static PyObject*
+get_features(Face *self, PyObject *a UNUSED) {
+    FT_Error err;
+    FT_ULong length = 0;
+    if (!ensure_name_table(self)) return NULL;
+    RAII_PyObject(output, PyDict_New()); if (!output) return NULL;
+    if ((err = FT_Load_Sfnt_Table(self->face, FT_MAKE_TAG('G', 'S', 'U', 'B'), 0, NULL, &length)) == 0) {
+        RAII_ALLOC(uint8_t, table, malloc(length));
+        if (!table) return PyErr_NoMemory();
+        if ((err = FT_Load_Sfnt_Table(self->face, FT_MAKE_TAG('G', 'S', 'U', 'B'), 0, table, &length))) {
+            set_freetype_error("Failed to load the GSUB table from font with error:", err); return NULL;
+        }
+        if (!read_features_from_font_table(table, length, self->name_lookup_table, output)) return NULL;
+    }
+    length = 0;
+    if ((err = FT_Load_Sfnt_Table(self->face, FT_MAKE_TAG('G', 'P', 'O', 'S'), 0, NULL, &length)) == 0) {
+        RAII_ALLOC(uint8_t, table, malloc(length));
+        if (!table) return PyErr_NoMemory();
+        if ((err = FT_Load_Sfnt_Table(self->face, FT_MAKE_TAG('G', 'P', 'O', 'S'), 0, table, &length))) {
+            set_freetype_error("Failed to load the GSUB table from font with error:", err); return NULL;
+        }
+        if (!read_features_from_font_table(table, length, self->name_lookup_table, output)) return NULL;
+    }
+    Py_INCREF(output); return output;
+}
+
+static PyObject*
+get_variable_data(Face *self, PyObject *a UNUSED) {
+    if (!ensure_name_table(self)) return NULL;
+    RAII_PyObject(output, PyDict_New()); if (!output) return NULL;
+    RAII_PyObject(axes, PyTuple_New(0));
+    RAII_PyObject(named_styles, PyTuple_New(0));
+    if (!axes || !named_styles) return NULL;
+    FT_Error err;
+    FT_ULong length = 0;
+    if ((err = FT_Load_Sfnt_Table(self->face, FT_MAKE_TAG('S', 'T', 'A', 'T'), 0, NULL, &length)) == 0) {
+        RAII_ALLOC(uint8_t, table, malloc(length));
+        if (!table) return PyErr_NoMemory();
+        if ((err = FT_Load_Sfnt_Table(self->face, FT_MAKE_TAG('S', 'T', 'A', 'T'), 0, table, &length))) {
+            set_freetype_error("Failed to load the STAT table from font with error:", err); return NULL;
+        }
+        if (!read_STAT_font_table(table, length, self->name_lookup_table, output)) return NULL;
+    } else if (!read_STAT_font_table(NULL, 0, self->name_lookup_table, output)) return NULL;
+    if (self->is_variable) {
+        RAII_FTMMVar(mm);
+        if ((err = FT_Get_MM_Var(self->face, &mm))) { set_freetype_error("Failed to get variable axis data from font with error:", err); return NULL; }
+        if (_PyTuple_Resize(&axes, mm->num_axis) == -1) return NULL;
+        if (_PyTuple_Resize(&named_styles, mm->num_namedstyles) == -1) return NULL;
+        for (FT_UInt i = 0; i < mm->num_namedstyles; i++) {
+            PyObject *s = convert_named_style_to_python(self, mm->namedstyle + i, mm->axis, mm->num_axis);
+            if (!s) return NULL;
+            PyTuple_SET_ITEM(named_styles, i, s);
+        }
+
+        for (FT_UInt i = 0; i < mm->num_axis; i++) {
+            FT_UInt flags;
+            FT_Get_Var_Axis_Flags(mm, i, &flags);
+            PyObject *s = convert_axis_to_python(self, mm->axis + i, flags);
+
+            if (!s) return NULL;
+            PyTuple_SET_ITEM(axes, i, s);
+        }
+    }
+    if (PyDict_SetItemString(output, "variations_postscript_name_prefix", _get_best_name(self, 25)) != 0) return NULL;
+    if (PyDict_SetItemString(output, "axes", axes) != 0) return NULL;
+    if (PyDict_SetItemString(output, "named_styles", named_styles) != 0) return NULL;
+    Py_INCREF(output); return output;
+}
 
 StringCanvas
 render_simple_text_impl(PyObject *s, const char *text, unsigned int baseline) {
@@ -692,7 +944,7 @@ render_simple_text_impl(PyObject *s, const char *text, unsigned int baseline) {
         FT_Bitmap *bitmap = &self->face->glyph->bitmap;
         pbm = EMPTY_PBM;
         populate_processed_bitmap(self->face->glyph, bitmap, &pbm, false);
-        place_bitmap_in_canvas(canvas, &pbm, canvas_width, canvas_height, pen_x, 0, baseline, n);
+        place_bitmap_in_canvas(canvas, &pbm, canvas_width, canvas_height, 0, 0, baseline, n, 0xffffff, pen_x, 0);
         pen_x += self->face->glyph->advance.x >> 6;
     }
     ans.width = pen_x; ans.height = canvas_height;
@@ -707,6 +959,68 @@ render_simple_text_impl(PyObject *s, const char *text, unsigned int baseline) {
     free(canvas);
     return ans;
 }
+
+static void destroy_hb_buffer(hb_buffer_t **x) { if (*x) hb_buffer_destroy(*x); }
+
+static PyObject*
+render_sample_text(Face *self, PyObject *args) {
+    unsigned long canvas_width, canvas_height;
+    unsigned long fg = 0xffffff;
+    PyObject *ptext;
+    if (!PyArg_ParseTuple(args, "Ukk|k", &ptext, &canvas_width, &canvas_height, &fg)) return NULL;
+    unsigned int cell_width, cell_height, baseline, underline_position, underline_thickness, strikethrough_position, strikethrough_thickness;
+    cell_metrics((PyObject*)self, &cell_width, &cell_height, &baseline, &underline_position, &underline_thickness, &strikethrough_position, &strikethrough_thickness);
+    int num_chars_per_line = canvas_width / cell_width, num_of_lines = (int)ceil((float)PyUnicode_GET_LENGTH(ptext) / (float)num_chars_per_line);
+    canvas_height = MIN(canvas_height, num_of_lines * cell_height);
+    RAII_PyObject(pbuf, PyBytes_FromStringAndSize(NULL, sizeof(pixel) * canvas_width * canvas_height));
+    if (!pbuf) return NULL;
+    memset(PyBytes_AS_STRING(pbuf), 0, PyBytes_GET_SIZE(pbuf));
+
+    __attribute__((cleanup(destroy_hb_buffer))) hb_buffer_t *hb_buffer = hb_buffer_create();
+    if (!hb_buffer_pre_allocate(hb_buffer, 4*PyUnicode_GET_LENGTH(ptext))) { PyErr_NoMemory(); return NULL; }
+    for (ssize_t n = 0; n < PyUnicode_GET_LENGTH(ptext); n++) {
+        Py_UCS4 codep = PyUnicode_READ_CHAR(ptext, n);
+        hb_buffer_add_utf32(hb_buffer, &codep, 1, 0, 1);
+    }
+    hb_buffer_guess_segment_properties(hb_buffer);
+    if (!HB_DIRECTION_IS_HORIZONTAL(hb_buffer_get_direction(hb_buffer))) goto end;
+    hb_shape(harfbuzz_font_for_face((PyObject*)self), hb_buffer, self->font_features.features, self->font_features.count);
+    unsigned int len = hb_buffer_get_length(hb_buffer);
+    hb_glyph_info_t *info = hb_buffer_get_glyph_infos(hb_buffer, NULL);
+    hb_glyph_position_t *positions = hb_buffer_get_glyph_positions(hb_buffer, NULL);
+
+    if (cell_width > canvas_width) goto end;
+    pixel *canvas = (pixel*)PyBytes_AS_STRING(pbuf);
+    int load_flags = get_load_flags(self->hinting, self->hintstyle, FT_LOAD_RENDER);
+    int error;
+
+    float pen_x = 0, pen_y = 0;
+    for (unsigned int i = 0; i < len; i++) {
+        float advance = (float)positions[i].x_advance / 64.0f;
+        if (pen_x + advance > canvas_width) {
+            pen_y += cell_height;
+            pen_x = 0;
+            if (pen_y >= canvas_height) break;
+        }
+        size_t x = (size_t)round(pen_x + (float)positions[i].x_offset / 64.0f);
+        size_t y = (size_t)round(pen_y + (float)positions[i].y_offset / 64.0f);
+        pen_x += advance;
+        if ((error = FT_Load_Glyph(self->face, info[i].codepoint, load_flags))) continue;
+        if ((error = FT_Render_Glyph(self->face->glyph, FT_RENDER_MODE_NORMAL))) continue;
+        FT_Bitmap *bitmap = &self->face->glyph->bitmap;
+        ProcessedBitmap pbm = EMPTY_PBM;
+        populate_processed_bitmap(self->face->glyph, bitmap, &pbm, false);
+        place_bitmap_in_canvas(canvas, &pbm, canvas_width, canvas_height, x, 0, baseline, 99999, fg, 0, y);
+    }
+
+    for (uint8_t *p = (uint8_t*)PyBytes_AS_STRING(pbuf); p < (uint8_t*)PyBytes_AS_STRING(pbuf) + sizeof(pixel) * canvas_width * canvas_height; p += 4) {
+        uint8_t a = p[0], b = p[1], g = p[2], r = p[3];
+        p[0] = r; p[1] = g; p[2] = b; p[3] = a;
+    }
+end:
+    return Py_BuildValue("OII", pbuf, cell_width, cell_height);
+}
+
 
 // Boilerplate {{{
 
@@ -723,19 +1037,31 @@ static PyMemberDef members[] = {
     MEM(strikethrough_position, T_INT),
     MEM(strikethrough_thickness, T_INT),
     MEM(is_scalable, T_BOOL),
+    MEM(is_variable, T_BOOL),
+    MEM(has_svg, T_BOOL),
+    MEM(has_color, T_BOOL),
     MEM(path, T_OBJECT_EX),
     {NULL}  /* Sentinel */
 };
 
 static PyMethodDef methods[] = {
-    METHODB(display_name, METH_NOARGS),
+    METHODB(postscript_name, METH_NOARGS),
+    METHODB(identify_for_debug, METH_NOARGS),
     METHODB(extra_data, METH_NOARGS),
+    METHODB(get_variable_data, METH_NOARGS),
+    METHODB(applied_features, METH_NOARGS),
+    METHODB(get_features, METH_NOARGS),
+    METHODB(get_variation, METH_NOARGS),
+    METHODB(get_best_name, METH_O),
+    METHODB(set_size, METH_VARARGS),
+    METHODB(render_sample_text, METH_VARARGS),
     {NULL}  /* Sentinel */
 };
 
 PyTypeObject Face_Type = {
     PyVarObject_HEAD_INIT(NULL, 0)
     .tp_name = "fast_data_types.Face",
+    .tp_new = new,
     .tp_basicsize = sizeof(Face),
     .tp_dealloc = (destructor)dealloc,
     .tp_flags = Py_TPFLAGS_DEFAULT,

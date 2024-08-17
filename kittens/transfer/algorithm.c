@@ -8,7 +8,6 @@
 
 #include "data-types.h"
 #include "binary.h"
-#include "kitty-uthash.h"
 #include <math.h>
 #include <xxhash.h>
 
@@ -225,7 +224,7 @@ Patcher_dealloc(PyObject *self) {
 static PyObject*
 signature_header(Patcher *self, PyObject *a2) {
     RAII_PY_BUFFER(dest);
-    if (PyObject_GetBuffer(a2, &dest, PyBUF_WRITE) == -1) return NULL;
+    if (PyObject_GetBuffer(a2, &dest, PyBUF_WRITEABLE) == -1) return NULL;
     static const ssize_t header_size = 12;
     if (dest.len < header_size) {
         PyErr_SetString(RsyncError, "Output buffer is too small");
@@ -245,7 +244,7 @@ sign_block(Patcher *self, PyObject *args) {
     if (!PyArg_ParseTuple(args, "OO", &a1, &a2)) return NULL;
     RAII_PY_BUFFER(src); RAII_PY_BUFFER(dest);
     if (PyObject_GetBuffer(a1, &src, PyBUF_SIMPLE) == -1) return NULL;
-    if (PyObject_GetBuffer(a2, &dest, PyBUF_WRITE) == -1) return NULL;
+    if (PyObject_GetBuffer(a2, &dest, PyBUF_WRITEABLE) == -1) return NULL;
     if (dest.len < (ssize_t)signature_block_size) {
         PyErr_SetString(RsyncError, "Output buffer is too small");
     }
@@ -433,12 +432,16 @@ PyTypeObject Patcher_Type = {
 // Differ {{{
 typedef struct Signature { uint64_t index, strong_hash; } Signature;
 
-typedef struct SignatureMap {
-    int weak_hash;
+typedef struct SignatureVal {
     Signature sig, *weak_hash_collisions;
     size_t len, cap;
-    UT_hash_handle hh;
-} SignatureMap;
+} SignatureVal;
+#define NAME SignatureMap
+#define KEY_TY int
+#define VAL_TY SignatureVal
+static void free_signature_val(SignatureVal x) { free(x.weak_hash_collisions); }
+#define VAL_DTOR_FN free_signature_val
+#include "kitty-verstable.h"
 
 typedef struct Differ {
     PyObject_HEAD
@@ -447,7 +450,7 @@ typedef struct Differ {
     Rsync rsync;
     bool signature_header_parsed;
     buffer buf;
-    SignatureMap *signature_map;
+    SignatureMap signature_map;
 
     PyObject *read, *write;
     bool written, finished;
@@ -458,22 +461,13 @@ typedef struct Differ {
 
 static int
 Differ_init(PyObject *s, PyObject *args, PyObject *kwds) {
-    Patcher *self = (Patcher*)s;
+    Differ *self = (Differ*)s;
     static char *kwlist[] = {NULL};
     if (!PyArg_ParseTupleAndKeywords(args, kwds, "", kwlist)) return -1;
     const char *err = init_rsync(&self->rsync, default_block_size, 0, 0);
     if (err != NULL) { PyErr_SetString(RsyncError, err); return -1; }
+    vt_init(&self->signature_map);
     return 0;
-}
-
-static void
-free_sigmap(SignatureMap *map) {
-    SignatureMap *current, *tmp;
-    HASH_ITER(hh, map, current, tmp) {
-        HASH_DEL(map, current);
-        free(current->weak_hash_collisions);
-        free(current);
-    }
 }
 
 static void
@@ -481,7 +475,7 @@ Differ_dealloc(PyObject *self) {
     Differ *p = (Differ*)self;
     if (p->buf.data) free(p->buf.data);
     free_rsync(&p->rsync);
-    if (p->signature_map) free_sigmap(p->signature_map);
+    vt_cleanup(&p->signature_map);
     Py_TYPE(self)->tp_free(self);
 }
 
@@ -510,7 +504,7 @@ parse_signature_header(Differ *self) {
 }
 
 static bool
-add_collision(SignatureMap *sm, Signature s) {
+add_collision(SignatureVal *sm, Signature s) {
     if (sm->cap < sm->len + 1) {
         size_t new_cap = MAX(sm->cap * 2, 8u);
         sm->weak_hash_collisions = realloc(sm->weak_hash_collisions, new_cap * sizeof(sm->weak_hash_collisions[0]));
@@ -525,17 +519,14 @@ static size_t
 parse_signature_block(Differ *self, uint8_t *data, size_t len) {
     if (len < 20) return 0;
     int weak_hash = le32dec(data + 8);
-    SignatureMap *sm = NULL;
-    HASH_FIND_INT(self->signature_map, &weak_hash, sm);
-    if (sm == NULL) {
-        sm = calloc(1, sizeof(SignatureMap));
-        if (sm == NULL) { PyErr_NoMemory(); return 0; }
-        sm->weak_hash = weak_hash;
-        sm->sig.index = le64dec(data);
-        sm->sig.strong_hash = le64dec(data+12);
-        HASH_ADD_INT(self->signature_map, weak_hash, sm);
+    SignatureMap_itr i = vt_get(&self->signature_map, weak_hash);
+    if (vt_is_end(i)) {
+        SignatureVal s = {0};
+        s.sig.index = le64dec(data);
+        s.sig.strong_hash = le64dec(data+12);
+        vt_insert(&self->signature_map, weak_hash, s);
     } else {
-        if (!add_collision(sm, (Signature){.index=le64dec(data), .strong_hash=le64dec(data+12)})) return 0;
+        if (!add_collision(&i.data->val, (Signature){.index=le64dec(data), .strong_hash=le64dec(data+12)})) return 0;
     }
     return 20;
 }
@@ -659,7 +650,7 @@ ensure_idx_valid(Differ *self, size_t idx) {
 }
 
 static bool
-find_strong_hash(SignatureMap *sm, uint64_t q, uint64_t *block_index) {
+find_strong_hash(const SignatureVal *sm, uint64_t q, uint64_t *block_index) {
     if (sm->sig.strong_hash == q) { *block_index = sm->sig.index; return true; }
     for (size_t i = 0; i < sm->len; i++) {
         if (sm->weak_hash_collisions[i].strong_hash == q) { *block_index = sm->weak_hash_collisions[i].index; return true; }
@@ -734,11 +725,10 @@ read_next(Differ *self) {
 		self->window.sz = self->rsync.block_size;
         rolling_checksum_full(&self->rc, self->buf.data + self->window.pos, self->window.sz);
     }
-    SignatureMap *sm = NULL;
     int weak_hash = self->rc.val;
     uint64_t block_index = 0;
-    HASH_FIND_INT(self->signature_map, &weak_hash, sm);
-    if (sm != NULL && find_strong_hash(sm, self->rsync.hasher.oneshot64(self->buf.data + self->window.pos, self->window.sz), &block_index)) {
+    SignatureMap_itr i = vt_get(&self->signature_map, weak_hash);
+    if (!vt_is_end(i) && find_strong_hash(&i.data->val, self->rsync.hasher.oneshot64(self->buf.data + self->window.pos, self->window.sz), &block_index)) {
         if (!send_data(self)) return false;
         if (!enqueue(self, (Operation){.type=OpBlock, .block_index=block_index})) return false;
 		self->window.pos += self->window.sz;
@@ -901,13 +891,6 @@ PyTypeObject Hasher_Type = {
 };
 // }}} end Hasher
 
-static PyObject*
-decode_utf8_buffer(PyObject *self UNUSED, PyObject *args) {
-    RAII_PY_BUFFER(buf);
-    if (!PyArg_ParseTuple(args, "s*", &buf)) return NULL;
-    return PyUnicode_FromStringAndSize(buf.buf, buf.len);
-}
-
 static bool
 call_ftc_callback(PyObject *callback, char *src, Py_ssize_t key_start, Py_ssize_t key_length, Py_ssize_t val_start, Py_ssize_t val_length) {
     while(src[key_start] == ';' && key_length > 0 ) { key_start++; key_length--; }
@@ -950,9 +933,30 @@ parse_ftc(PyObject *self UNUSED, PyObject *args) {
     Py_RETURN_NONE;
 }
 
+static PyObject*
+pyxxh128_hash(PyObject *self UNUSED, PyObject *b) {
+    RAII_PY_BUFFER(data);
+    if (PyObject_GetBuffer(b, &data, PyBUF_SIMPLE) == -1) return NULL;
+    XXH128_canonical_t c;
+    XXH128_canonicalFromHash(&c, XXH3_128bits(data.buf, data.len));
+    return PyBytes_FromStringAndSize((char*)c.digest, sizeof(c.digest));
+}
+
+static PyObject*
+pyxxh128_hash_with_seed(PyObject *self UNUSED, PyObject *args) {
+    RAII_PY_BUFFER(data);
+    unsigned long long seed;
+    if (!PyArg_ParseTuple(args, "y*K", &data, &seed)) return NULL;
+    XXH128_canonical_t c;
+    XXH128_canonicalFromHash(&c, XXH3_128bits_withSeed(data.buf, data.len, seed));
+    return PyBytes_FromStringAndSize((char*)c.digest, sizeof(c.digest));
+}
+
+
 static PyMethodDef module_methods[] = {
     {"parse_ftc", parse_ftc, METH_VARARGS, ""},
-    {"decode_utf8_buffer", decode_utf8_buffer, METH_VARARGS, ""},
+    {"xxh128_hash", pyxxh128_hash, METH_O, ""},
+    {"xxh128_hash_with_seed", pyxxh128_hash_with_seed, METH_VARARGS, ""},
     {NULL, NULL, 0, NULL}        /* Sentinel */
 };
 

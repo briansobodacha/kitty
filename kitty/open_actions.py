@@ -5,8 +5,9 @@
 import os
 import posixpath
 import shlex
+from collections.abc import Iterable, Iterator
 from contextlib import suppress
-from typing import Any, Dict, Iterable, Iterator, List, NamedTuple, Optional, Tuple, cast
+from typing import Any, NamedTuple, Optional, cast
 from urllib.parse import ParseResult, unquote, urlparse
 
 from .conf.utils import KeyAction, to_cmdline_implementation
@@ -25,14 +26,14 @@ class MatchCriteria(NamedTuple):
 
 
 class OpenAction(NamedTuple):
-    match_criteria: Tuple[MatchCriteria, ...]
-    actions: Tuple[KeyAction, ...]
+    match_criteria: tuple[MatchCriteria, ...]
+    actions: tuple[KeyAction, ...]
 
 
 def parse(lines: Iterable[str]) -> Iterator[OpenAction]:
-    match_criteria: List[MatchCriteria] = []
-    raw_actions: List[str] = []
-    alias_map: Dict[str, List[ActionAlias]] = {}
+    match_criteria: list[MatchCriteria] = []
+    raw_actions: list[str] = []
+    alias_map: dict[str, list[ActionAlias]] = {}
     entries = []
 
     for line in lines:
@@ -69,12 +70,12 @@ def parse(lines: Iterable[str]) -> Iterator[OpenAction]:
         entries.append((tuple(match_criteria), tuple(raw_actions)))
 
     with to_cmdline_implementation.filter_env_vars(
-        'URL', 'FILE_PATH', 'FILE', 'FRAGMENT', 'URL_PATH',
+        'URL', 'FILE_PATH', 'FILE', 'FRAGMENT', 'URL_PATH', 'NETLOC',
         EDITOR=shlex.join(get_editor()),
         SHELL=resolved_shell(get_options())[0]
     ):
         for (mc, action_defns) in entries:
-            actions: List[KeyAction] = []
+            actions: list[KeyAction] = []
             for defn in action_defns:
                 actions.extend(resolve_aliases_and_parse_actions(defn, alias_map, MapType.OPEN_ACTION))
             yield OpenAction(mc, tuple(actions))
@@ -164,9 +165,11 @@ def actions_for_url_from_list(url: str, actions: Iterable[OpenAction]) -> Iterat
         return
     path = unquote(purl.path)
     up = purl.path
+    netloc = unquote(purl.netloc) if purl.netloc else ''
     if purl.query:
         up += f'?{purl.query}'
-    if purl.fragment:
+    frag = unquote(purl.fragment) if purl.fragment else ''
+    if frag:
         up += f'#{purl.fragment}'
 
     env = {
@@ -174,7 +177,8 @@ def actions_for_url_from_list(url: str, actions: Iterable[OpenAction]) -> Iterat
         'FILE_PATH': path,
         'URL_PATH': up,
         'FILE': posixpath.basename(path),
-        'FRAGMENT': unquote(purl.fragment)
+        'FRAGMENT': frag,
+        'NETLOC': netloc,
     }
 
     def expand(x: Any) -> Any:
@@ -195,10 +199,10 @@ def actions_for_url_from_list(url: str, actions: Iterable[OpenAction]) -> Iterat
             return
 
 
-actions_cache: Dict[str, Tuple[os.stat_result, Tuple[OpenAction, ...]]] = {}
+actions_cache: dict[str, tuple[os.stat_result, tuple[OpenAction, ...]]] = {}
 
 
-def load_actions_from_path(path: str) -> Tuple[OpenAction, ...]:
+def load_actions_from_path(path: str) -> tuple[OpenAction, ...]:
     try:
         st = os.stat(path)
     except OSError:
@@ -212,11 +216,11 @@ def load_actions_from_path(path: str) -> Tuple[OpenAction, ...]:
     return actions_cache[path][1]
 
 
-def load_open_actions() -> Tuple[OpenAction, ...]:
+def load_open_actions() -> tuple[OpenAction, ...]:
     return load_actions_from_path(os.path.join(config_dir, 'open-actions.conf'))
 
 
-def load_launch_actions() -> Tuple[OpenAction, ...]:
+def load_launch_actions() -> tuple[OpenAction, ...]:
     return load_actions_from_path(os.path.join(config_dir, 'launch-actions.conf'))
 
 
@@ -225,16 +229,16 @@ def clear_caches() -> None:
 
 
 @run_once
-def default_open_actions() -> Tuple[OpenAction, ...]:
+def default_open_actions() -> tuple[OpenAction, ...]:
     return tuple(parse('''\
 # Open kitty HTML docs links
 protocol kitty+doc
 action show_kitty_doc $URL_PATH
-    '''.splitlines()))
+'''.splitlines()))
 
 
 @run_once
-def default_launch_actions() -> Tuple[OpenAction, ...]:
+def default_launch_actions() -> tuple[OpenAction, ...]:
     return tuple(parse('''\
 # Open script files
 protocol file
@@ -249,26 +253,26 @@ action launch --hold --type=os-window kitty +shebang $FILE_PATH __ext__
 # Open directories
 protocol file
 mime inode/directory
-action launch --type=os-window --cwd $FILE_PATH
+action launch --type=os-window --cwd -- $FILE_PATH
 
 # Open executable file
 protocol file
 mime inode/executable,application/vnd.microsoft.portable-executable
-action launch --hold --type=os-window $FILE_PATH
+action launch --hold --type=os-window -- $FILE_PATH
 
 # Open text files without fragments in the editor
 protocol file
 mime text/*
-action launch --type=os-window $EDITOR $FILE_PATH
+action launch --type=os-window -- $EDITOR -- $FILE_PATH
 
 # Open image files with icat
 protocol file
 mime image/*
-action launch --type=os-window kitten icat --hold $FILE_PATH
+action launch --type=os-window kitten icat --hold -- $FILE_PATH
 
 # Open ssh URLs with ssh command
 protocol ssh
-action launch --type=os-window ssh $URL
+action launch --type=os-window ssh -- $URL
 '''.splitlines()))
 
 

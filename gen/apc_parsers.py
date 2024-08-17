@@ -5,18 +5,18 @@ import os
 import subprocess
 import sys
 from collections import defaultdict
-from typing import Any, DefaultDict, Dict, FrozenSet, List, Tuple, Union
+from typing import Any, DefaultDict, Union
 
 if __name__ == '__main__' and not __package__:
     import __main__
     __main__.__package__ = 'gen'
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-KeymapType = Dict[str, Tuple[str, Union[FrozenSet[str], str]]]
+KeymapType = dict[str, tuple[str, Union[frozenset[str], str]]]
 
 
-def resolve_keys(keymap: KeymapType) -> DefaultDict[str, List[str]]:
-    ans: DefaultDict[str, List[str]] = defaultdict(list)
+def resolve_keys(keymap: KeymapType) -> DefaultDict[str, list[str]]:
+    ans: DefaultDict[str, list[str]] = defaultdict(list)
     for ch, (attr, atype) in keymap.items():
         if isinstance(atype, str) and atype in ('int', 'uint'):
             q = atype
@@ -45,14 +45,14 @@ def parse_key(keymap: KeymapType) -> str:
     return '        \n'.join(lines)
 
 
-def parse_flag(keymap: KeymapType, type_map: Dict[str, Any], command_class: str) -> str:
+def parse_flag(keymap: KeymapType, type_map: dict[str, Any], command_class: str) -> str:
     lines = []
     for ch in type_map['flag']:
         attr, allowed_values = keymap[ch]
         q = ' && '.join(f"g.{attr} != '{x}'" for x in sorted(allowed_values))
         lines.append(f'''
             case {attr}: {{
-                g.{attr} = screen->parser_buf[pos++] & 0xff;
+                g.{attr} = parser_buf[pos++];
                 if ({q}) {{
                     REPORT_ERROR("Malformed {command_class} control block, unknown flag value for {attr}: 0x%x", g.{attr});
                     return;
@@ -63,14 +63,14 @@ def parse_flag(keymap: KeymapType, type_map: Dict[str, Any], command_class: str)
     return '        \n'.join(lines)
 
 
-def parse_number(keymap: KeymapType) -> Tuple[str, str]:
+def parse_number(keymap: KeymapType) -> tuple[str, str]:
     int_keys = [f'I({attr})' for attr, atype in keymap.values() if atype == 'int']
     uint_keys = [f'U({attr})' for attr, atype in keymap.values() if atype == 'uint']
     return '; '.join(int_keys), '; '.join(uint_keys)
 
 
-def cmd_for_report(report_name: str, keymap: KeymapType, type_map: Dict[str, Any], payload_allowed: bool) -> str:
-    def group(atype: str, conv: str) -> Tuple[str, str]:
+def cmd_for_report(report_name: str, keymap: KeymapType, type_map: dict[str, Any], payload_allowed: bool) -> str:
+    def group(atype: str, conv: str) -> tuple[str, str]:
         flag_fmt, flag_attrs = [], []
         cv = {'flag': 'c', 'int': 'i', 'uint': 'I'}[atype]
         for ch in type_map[atype]:
@@ -85,12 +85,12 @@ def cmd_for_report(report_name: str, keymap: KeymapType, type_map: Dict[str, Any
 
     fmt = f'{flag_fmt} {uint_fmt} {int_fmt}'
     if payload_allowed:
-        ans = [f'REPORT_VA_COMMAND("s {{{fmt} sI}} y#", "{report_name}",']
+        ans = [f'REPORT_VA_COMMAND("K s {{{fmt} sI}} y#", self->window_id, "{report_name}", ']
     else:
-        ans = [f'REPORT_VA_COMMAND("s {{{fmt}}}", "{report_name}",']
+        ans = [f'REPORT_VA_COMMAND("K s {{{fmt}}}", self->window_id, "{report_name}", ']
     ans.append(',\n     '.join((flag_attrs, uint_attrs, int_attrs)))
     if payload_allowed:
-        ans.append(', "payload_sz", g.payload_sz, payload, g.payload_sz')
+        ans.append(', "payload_sz", g.payload_sz, parser_buf, g.payload_sz')
     ans.append(');')
     return '\n'.join(ans)
 
@@ -113,43 +113,44 @@ def generate(
     if payload_allowed:
         payload_after_value = "case ';': state = PAYLOAD; break;"
         payload = ', PAYLOAD'
-        parr = 'static uint8_t payload[4096];'
         payload_case = f'''
             case PAYLOAD: {{
-                sz = screen->parser_buf_pos - pos;
-                g.payload_sz = sizeof(payload);
-                if (!base64_decode32(screen->parser_buf + pos, sz, payload, &g.payload_sz)) {{
-                    REPORT_ERROR("Failed to parse {command_class} command payload with error: payload size (%zu) too large", sz); return; }}
-                pos = screen->parser_buf_pos;
+                sz = parser_buf_pos - pos;
+                g.payload_sz = MAX(BUF_EXTRA, sz);
+                if (!base64_decode8(parser_buf + pos, sz, parser_buf, &g.payload_sz)) {{
+                    g.payload_sz = MAX(BUF_EXTRA, sz);
+                    REPORT_ERROR("Failed to parse {command_class} command payload with error: \
+invalid base64 data in chunk of size: %zu with output buffer size: %zu", sz, g.payload_sz); return; }}
+                pos = parser_buf_pos;
                 }}
                 break;
         '''
-        callback = f'{callback_name}(screen, &g, payload)'
+        callback = f'{callback_name}(self->screen, &g, parser_buf)'
     else:
-        payload_after_value = payload = parr = payload_case = ''
-        callback = f'{callback_name}(screen, &g)'
+        payload_after_value = payload = payload_case = ''
+        callback = f'{callback_name}(self->screen, &g)'
 
     return f'''
+    #include "base64.h"
 static inline void
-{function_name}(Screen *screen, PyObject UNUSED *dump_callback) {{
+{function_name}(PS *self, uint8_t *parser_buf, const size_t parser_buf_pos) {{
     unsigned int pos = 1;
     enum PARSER_STATES {{ KEY, EQUAL, UINT, INT, FLAG, AFTER_VALUE {payload} }};
     enum PARSER_STATES state = KEY, value_state = FLAG;
     static {command_class} g;
     unsigned int i, code;
-    uint64_t lcode;
+    uint64_t lcode; int64_t accumulator;
     bool is_negative;
     memset(&g, 0, sizeof(g));
     size_t sz;
-    {parr}
     {keys_enum}
     enum KEYS key = '{initial_key}';
-    if (screen->parser_buf[pos] == ';') state = AFTER_VALUE;
+    if (parser_buf[pos] == ';') state = AFTER_VALUE;
 
-    while (pos < screen->parser_buf_pos) {{
+    while (pos < parser_buf_pos) {{
         switch(state) {{
             case KEY:
-                key = screen->parser_buf[pos++];
+                key = parser_buf[pos++];
                 state = EQUAL;
                 switch(key) {{
                     {handle_key}
@@ -160,8 +161,8 @@ static inline void
                 break;
 
             case EQUAL:
-                if (screen->parser_buf[pos++] != '=') {{
-                    REPORT_ERROR("Malformed {command_class} control block, no = after key, found: 0x%x instead", screen->parser_buf[pos-1]);
+                if (parser_buf[pos++] != '=') {{
+                    REPORT_ERROR("Malformed {command_class} control block, no = after key, found: 0x%x instead", parser_buf[pos-1]);
                     return;
                 }}
                 state = value_state;
@@ -178,16 +179,17 @@ static inline void
 
             case INT:
 #define READ_UINT \\
-                for (i = pos; i < MIN(screen->parser_buf_pos, pos + 10); i++) {{ \\
-                    if (screen->parser_buf[i] < '0' || screen->parser_buf[i] > '9') break; \\
+                for (i = pos, accumulator=0; i < MIN(parser_buf_pos, pos + 10); i++) {{ \\
+                    int64_t n = parser_buf[i] - '0'; if (n < 0 || n > 9) break; \\
+                    accumulator += n * digit_multipliers[i - pos]; \\
                 }} \\
                 if (i == pos) {{ REPORT_ERROR("Malformed {command_class} control block, expecting an integer value for key: %c", key & 0xFF); return; }} \\
-                lcode = utoi(screen->parser_buf + pos, i - pos); pos = i; \\
+                lcode = accumulator / digit_multipliers[i - pos - 1]; pos = i; \\
                 if (lcode > UINT32_MAX) {{ REPORT_ERROR("Malformed {command_class} control block, number is too large"); return; }} \\
                 code = lcode;
 
                 is_negative = false;
-                if(screen->parser_buf[pos] == '-') {{ is_negative = true; pos++; }}
+                if(parser_buf[pos] == '-') {{ is_negative = true; pos++; }}
 #define I(x) case x: g.x = is_negative ? 0 - (int32_t)code : (int32_t)code; break
                 READ_UINT;
                 switch(key) {{
@@ -210,10 +212,10 @@ static inline void
 #undef READ_UINT
 
             case AFTER_VALUE:
-                switch (screen->parser_buf[pos++]) {{
+                switch (parser_buf[pos++]) {{
                     default:
                         REPORT_ERROR("Malformed {command_class} control block, expecting a comma or semi-colon after a value, found: 0x%x",
-                                     screen->parser_buf[pos - 1]);
+                                     parser_buf[pos - 1]);
                         return;
                     case ',':
                         state = KEY;
@@ -258,7 +260,7 @@ def graphics_parser() -> None:
     flag = frozenset
     keymap: KeymapType = {
         'a': ('action', flag('tTqpdfac')),
-        'd': ('delete_action', flag('aAiIcCfFnNpPqQxXyYzZ')),
+        'd': ('delete_action', flag('aAiIcCfFnNpPqQrRxXyYzZ')),
         't': ('transmission_type', flag('dfts')),
         'o': ('compressed', flag('z')),
         'f': ('format', 'uint'),
@@ -291,7 +293,7 @@ def graphics_parser() -> None:
     write_header(text, 'kitty/parse-graphics-command.h')
 
 
-def main(args: List[str]=sys.argv) -> None:
+def main(args: list[str]=sys.argv) -> None:
     graphics_parser()
 
 

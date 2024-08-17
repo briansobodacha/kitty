@@ -8,17 +8,20 @@
 
 #include "state.h"
 #include "cleanup.h"
-#include "monotonic.h"
+#include "cocoa_window.h"
+#include <Availability.h>
 #include <Carbon/Carbon.h>
 #include <Cocoa/Cocoa.h>
-#ifndef KITTY_USE_DEPRECATED_MACOS_NOTIFICATION_API
 #include <UserNotifications/UserNotifications.h>
-#endif
+#import <AudioToolbox/AudioServices.h>
 
 #include <AvailabilityMacros.h>
 // Needed for _NSGetProgname
 #include <crt_externs.h>
 #include <objc/runtime.h>
+
+static inline void cleanup_cfrelease(void *__p) { CFTypeRef *tp = (CFTypeRef *)__p; CFTypeRef cf = *tp; if (cf) { CFRelease(cf); } }
+#define RAII_CoreFoundation(type, name, initializer) __attribute__((cleanup(cleanup_cfrelease))) type name = initializer
 
 #if (MAC_OS_X_VERSION_MAX_ALLOWED < 101300)
 #define NSControlStateValueOn NSOnState
@@ -353,61 +356,20 @@ static PyObject *notification_activated_callback = NULL;
 static PyObject*
 set_notification_activated_callback(PyObject *self UNUSED, PyObject *callback) {
     Py_CLEAR(notification_activated_callback);
-    if (callback != Py_None) {
-        notification_activated_callback = callback;
-        Py_INCREF(callback);
-    }
+    if (callback != Py_None) notification_activated_callback = Py_NewRef(callback);
     Py_RETURN_NONE;
 }
 
-#ifdef KITTY_USE_DEPRECATED_MACOS_NOTIFICATION_API
-
-@interface NotificationDelegate : NSObject <NSUserNotificationCenterDelegate>
-@end
-
-@implementation NotificationDelegate
-    - (void)userNotificationCenter:(NSUserNotificationCenter *)center
-            didDeliverNotification:(NSUserNotification *)notification {
-        (void)(center); (void)(notification);
+static void
+do_notification_callback(const char *identifier, const char *event, const char *action_identifer) {
+    if (notification_activated_callback) {
+        PyObject *ret = PyObject_CallFunction(notification_activated_callback, "sss", event,
+                identifier ? identifier : "", action_identifer ? action_identifer : "");
+        if (ret) Py_DECREF(ret);
+        else PyErr_Print();
     }
-
-    - (BOOL) userNotificationCenter:(NSUserNotificationCenter *)center
-            shouldPresentNotification:(NSUserNotification *)notification {
-        (void)(center); (void)(notification);
-        return YES;
-    }
-
-    - (void) userNotificationCenter:(NSUserNotificationCenter *)center
-            didActivateNotification:(NSUserNotification *)notification {
-        (void)(center); (void)(notification);
-        if (notification_activated_callback) {
-            PyObject *ret = PyObject_CallFunction(notification_activated_callback, "z",
-                    notification.userInfo[@"user_id"] ? [notification.userInfo[@"user_id"] UTF8String] : NULL);
-            if (ret == NULL) PyErr_Print();
-            else Py_DECREF(ret);
-        }
-    }
-@end
-
-static PyObject*
-cocoa_send_notification(PyObject *self UNUSED, PyObject *args) {
-    char *identifier = NULL, *title = NULL, *informativeText = NULL, *subtitle = NULL;
-    if (!PyArg_ParseTuple(args, "zsz|z", &identifier, &title, &informativeText, &subtitle)) return NULL;
-    NSUserNotificationCenter *center = [NSUserNotificationCenter defaultUserNotificationCenter];
-    if (!center) {PyErr_SetString(PyExc_RuntimeError, "Failed to get the user notification center"); return NULL; }
-    if (!center.delegate) center.delegate = [[NotificationDelegate alloc] init];
-    NSUserNotification *n = [NSUserNotification new];
-    if (title) n.title = @(title);
-    if (subtitle) n.subtitle = @(subtitle);
-    if (informativeText) n.informativeText = @(informativeText);
-    if (identifier) {
-        n.userInfo = @{@"user_id": @(identifier)};
-    }
-    [center deliverNotification:n];
-    Py_RETURN_NONE;
 }
 
-#else
 
 @interface NotificationDelegate : NSObject <UNUserNotificationCenterDelegate>
 @end
@@ -427,44 +389,140 @@ cocoa_send_notification(PyObject *self UNUSED, PyObject *args) {
             didReceiveNotificationResponse:(UNNotificationResponse *)response
             withCompletionHandler:(void (^)(void))completionHandler {
         (void)(center);
-        if (notification_activated_callback) {
-            NSString *identifier = [[[response notification] request] identifier];
-            PyObject *ret = PyObject_CallFunction(notification_activated_callback, "z",
-                    identifier ? [identifier UTF8String] : NULL);
-            if (ret == NULL) PyErr_Print();
-            else Py_DECREF(ret);
+        char *identifier = strdup(response.notification.request.identifier.UTF8String);
+        char *action_identifier = strdup(response.actionIdentifier.UTF8String);
+        const char *event = "button";
+        if ([response.actionIdentifier isEqualToString:UNNotificationDefaultActionIdentifier]) {
+            event = "activated";
+        } else if ([response.actionIdentifier isEqualToString:UNNotificationDismissActionIdentifier]) {
+            // Crapple never actually sends this event on macOS
+            event = "closed";
         }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            do_notification_callback(identifier, event, action_identifier);
+            free(identifier); free(action_identifier);
+        });
         completionHandler();
     }
 @end
 
+static UNUserNotificationCenter*
+get_notification_center_safely(void) {
+    NSBundle *b = [NSBundle mainBundle];
+    // when bundleIdentifier is nil currentNotificationCenter crashes instead
+    // of returning nil. Apple...purveyor of shiny TOYS
+    if (!b || !b.bundleIdentifier) return nil;
+    UNUserNotificationCenter *center = nil;
+    @try {
+        center = [UNUserNotificationCenter currentNotificationCenter];
+    } @catch (NSException *e) {
+        log_error("Failed to get current UNUserNotificationCenter object with error: %s (%s)",
+                            [[e name] UTF8String], [[e reason] UTF8String]);
+    }
+    return center;
+}
+
+static bool
+ident_in_list_of_notifications(NSString *ident, NSArray<UNNotification*> *list) {
+    for (UNNotification *n in list) {
+        if ([[[n request] identifier] isEqualToString:ident]) return true;
+    }
+    return false;
+}
+
+void
+cocoa_report_live_notifications(const char* ident) {
+    do_notification_callback(ident, "live", "");
+}
+
+static bool
+remove_delivered_notification(const char *identifier) {
+    UNUserNotificationCenter *center = get_notification_center_safely();
+    if (!center) return false;
+    char *ident = strdup(identifier);
+    [center getDeliveredNotificationsWithCompletionHandler:^(NSArray<UNNotification *> * notifications) {
+        if (ident_in_list_of_notifications(@(ident), notifications)) {
+            [center removeDeliveredNotificationsWithIdentifiers:@[ @(ident) ]];
+        }
+        free(ident);
+    }];
+    return true;
+}
+
+static bool
+live_delivered_notifications(void) {
+    UNUserNotificationCenter *center = get_notification_center_safely();
+    if (!center) return false;
+    [center getDeliveredNotificationsWithCompletionHandler:^(NSArray<UNNotification *> * notifications) {
+        @autoreleasepool {
+            NSMutableString *buffer = [NSMutableString stringWithCapacity:1024];  // autoreleased
+            for (UNNotification *n in notifications) [buffer appendFormat:@"%@,", [[n request] identifier]];
+            const char *val = [buffer UTF8String];
+            set_cocoa_pending_action(COCOA_NOTIFICATION_UNTRACKED, val ? val : "");
+        }
+    }];
+    return true;
+}
 
 static void
-schedule_notification(const char *identifier, const char *title, const char *body, const char *subtitle) {
-    UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+schedule_notification(const char *appname, const char *identifier, const char *title, const char *body, const char *image_path, int urgency, const char *category_id, bool muted) {@autoreleasepool {
+    UNUserNotificationCenter *center = get_notification_center_safely();
     if (!center) return;
     // Configure the notification's payload.
-    UNMutableNotificationContent* content = [[UNMutableNotificationContent alloc] init];
+    UNMutableNotificationContent *content = [[[UNMutableNotificationContent alloc] init] autorelease];
     if (title) content.title = @(title);
     if (body) content.body = @(body);
-    if (subtitle) content.subtitle = @(subtitle);
-    content.sound = [UNNotificationSound defaultSound];
+    if (appname) content.threadIdentifier = @(appname);
+    if (category_id) content.categoryIdentifier = @(category_id);
+    if (!muted) content.sound = [UNNotificationSound defaultSound];
+#if __MAC_OS_X_VERSION_MIN_REQUIRED >= 120000
+    switch (urgency) {
+        case 0:
+            content.interruptionLevel = UNNotificationInterruptionLevelPassive;
+        case 2:
+            content.interruptionLevel = UNNotificationInterruptionLevelCritical;
+        default:
+            content.interruptionLevel = UNNotificationInterruptionLevelActive;
+    }
+#else
+    if ([content respondsToSelector:@selector(interruptionLevel)]) {
+        NSUInteger level = 1;
+        if (urgency == 0) level = 0; else if (urgency == 2) level = 3;
+        [content setValue:@(level) forKey:@"interruptionLevel"];
+    }
+#endif
+    if (image_path) {
+        @try {
+            NSError *error;
+            NSURL *image_url = [NSURL fileURLWithFileSystemRepresentation:image_path isDirectory:NO relativeToURL:nil];  // autoreleased
+            UNNotificationAttachment *attachment = [UNNotificationAttachment attachmentWithIdentifier:@"image" URL:image_url options:nil error:&error];  // autoreleased
+            if (attachment) { content.attachments = @[ attachment ]; }
+            else NSLog(@"Error attaching image %@ to notification: %@", @(image_path), error.localizedDescription);
+        } @catch(NSException *exc) {
+            NSLog(@"Creating image attachment %@ for notification failed with error: %@", @(image_path), exc.reason);
+        }
+    }
+
     // Deliver the notification
     static unsigned long counter = 1;
     UNNotificationRequest* request = [
         UNNotificationRequest requestWithIdentifier:(identifier ? @(identifier) : [NSString stringWithFormat:@"Id_%lu", counter++])
         content:content trigger:nil];
+    char *duped_ident = strdup(identifier ? identifier : "");
     [center addNotificationRequest:request withCompletionHandler:^(NSError * _Nullable error) {
-        if (error != nil) {
-            log_error("Failed to show notification: %s", [[error localizedDescription] UTF8String]);
-        }
+        if (error != nil) log_error("Failed to show notification: %s", [[error localizedDescription] UTF8String]);
+        bool ok = error == nil;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            do_notification_callback(duped_ident, ok ? "created" : "creation_failed", "");
+            free(duped_ident);
+        });
     }];
-    [content release];
-}
+}}
 
 
 typedef struct {
-    char *identifier, *title, *body, *subtitle;
+    char *identifier, *title, *body, *appname, *image_path, *category_id;
+    int urgency; bool muted;
 } QueuedNotification;
 
 typedef struct {
@@ -474,13 +532,13 @@ typedef struct {
 static NotificationQueue notification_queue = {0};
 
 static void
-queue_notification(const char *identifier, const char *title, const char* body, const char* subtitle) {
+queue_notification(const char *appname, const char *identifier, const char *title, const char* body, const char *image_path, int urgency, const char *category_id, bool muted) {
     ensure_space_for((&notification_queue), notifications, QueuedNotification, notification_queue.count + 16, capacity, 16, true);
     QueuedNotification *n = notification_queue.notifications + notification_queue.count++;
-    n->identifier = identifier ? strdup(identifier) : NULL;
-    n->title = title ? strdup(title) : NULL;
-    n->body = body ? strdup(body) : NULL;
-    n->subtitle = subtitle ? strdup(subtitle) : NULL;
+#define d(x) n->x = (x && x[0]) ? strdup(x) : NULL;
+    d(appname); d(identifier); d(title); d(body); d(image_path); d(category_id);
+#undef d
+    n->urgency = urgency; n->muted = muted;
 }
 
 static void
@@ -488,31 +546,76 @@ drain_pending_notifications(BOOL granted) {
     if (granted) {
         for (size_t i = 0; i < notification_queue.count; i++) {
             QueuedNotification *n = notification_queue.notifications + i;
-            schedule_notification(n->identifier, n->title, n->body, n->subtitle);
+            schedule_notification(n->appname, n->identifier, n->title, n->body, n->image_path, n->urgency, n->category_id, n->muted);
         }
     }
     while(notification_queue.count) {
         QueuedNotification *n = notification_queue.notifications + --notification_queue.count;
-        free(n->identifier); free(n->title); free(n->body); free(n->subtitle);
-        n->identifier = NULL; n->title = NULL; n->body = NULL; n->subtitle = NULL;
+        if (!granted) do_notification_callback(n->identifier, "creation_failed", "");
+        free(n->identifier); free(n->title); free(n->body); free(n->appname); free(n->image_path); free(n->category_id);
+        memset(n, 0, sizeof(QueuedNotification));
     }
 }
 
 static PyObject*
-cocoa_send_notification(PyObject *self UNUSED, PyObject *args) {
-    char *identifier = NULL, *title = NULL, *body = NULL, *subtitle = NULL;
-    if (!PyArg_ParseTuple(args, "zsz|z", &identifier, &title, &body, &subtitle)) return NULL;
+cocoa_remove_delivered_notification(PyObject *self UNUSED, PyObject *x) {
+    if (!PyUnicode_Check(x)) { PyErr_SetString(PyExc_TypeError, "identifier must be a string"); return NULL; }
+    if (remove_delivered_notification(PyUnicode_AsUTF8(x))) { Py_RETURN_TRUE; }
+    Py_RETURN_FALSE;
+}
 
-    UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+static PyObject*
+cocoa_live_delivered_notifications(PyObject *self UNUSED, PyObject *x UNUSED) {
+    if (live_delivered_notifications()) { Py_RETURN_TRUE; }
+    Py_RETURN_FALSE;
+}
+
+static UNNotificationCategory*
+category_from_python(PyObject *p) {
+    RAII_PyObject(button_ids, PyObject_GetAttrString(p, "button_ids"));
+    RAII_PyObject(buttons, PyObject_GetAttrString(p, "buttons"));
+    RAII_PyObject(id, PyObject_GetAttrString(p, "id"));
+    NSMutableArray<UNNotificationAction *> *actions = [NSMutableArray arrayWithCapacity:PyTuple_GET_SIZE(buttons)];
+    for (int i = 0; i < PyTuple_GET_SIZE(buttons); i++) [actions addObject:
+        [UNNotificationAction actionWithIdentifier:@(PyUnicode_AsUTF8(PyTuple_GET_ITEM(button_ids, i)))
+            title:@(PyUnicode_AsUTF8(PyTuple_GET_ITEM(buttons, i))) options:UNNotificationActionOptionNone]];
+
+    return [UNNotificationCategory categoryWithIdentifier:@(PyUnicode_AsUTF8(id))
+        actions:actions intentIdentifiers:@[] options:0];
+}
+
+static bool
+set_notification_categories(UNUserNotificationCenter *center, PyObject *categories) {
+    NSMutableArray<UNNotificationCategory *> *ans = [NSMutableArray arrayWithCapacity:PyTuple_GET_SIZE(categories)];
+    for (int i = 0; i < PyTuple_GET_SIZE(categories); i++) {
+        UNNotificationCategory *c = category_from_python(PyTuple_GET_ITEM(categories, i));
+        if (!c) return false;
+        [ans addObject:c];
+    }
+    [center setNotificationCategories:[NSSet setWithArray:ans]];
+    return true;
+}
+
+static PyObject*
+cocoa_send_notification(PyObject *self UNUSED, PyObject *args, PyObject *kw) {
+    const char *identifier = "", *title = "", *body = "", *appname = "", *image_path = ""; int urgency = 1;
+    PyObject *category, *categories; int muted = 0;
+    static const char* kwlist[] = {"appname", "identifier", "title", "body", "category", "categories", "image_path", "urgency", "muted", NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kw, "ssssOO!|sip", (char**)kwlist,
+        &appname, &identifier, &title, &body, &category, &PyTuple_Type, &categories, &image_path, &urgency, &muted)) return NULL;
+
+    UNUserNotificationCenter *center = get_notification_center_safely();
     if (!center) Py_RETURN_NONE;
     if (!center.delegate) center.delegate = [[NotificationDelegate alloc] init];
-    queue_notification(identifier, title, body, subtitle);
+    if (PyObject_IsTrue(categories)) if (!set_notification_categories(center, categories)) return NULL;
+    RAII_PyObject(category_id, PyObject_GetAttrString(category, "id"));
+    queue_notification(appname, identifier, title, body, image_path, urgency, PyUnicode_AsUTF8(category_id), muted);
 
     // The badge permission needs to be requested as well, even though it is not used,
     // otherwise macOS refuses to show the preference checkbox for enable/disable notification sound.
     [center requestAuthorizationWithOptions:(UNAuthorizationOptionAlert | UNAuthorizationOptionSound | UNAuthorizationOptionBadge)
         completionHandler:^(BOOL granted, NSError * _Nullable error) {
-            if (error != nil) {
+            if (!granted && error != nil) {
                 log_error("Failed to request permission for showing notification: %s", [[error localizedDescription] UTF8String]);
             }
             dispatch_async(dispatch_get_main_queue(), ^{
@@ -522,8 +625,6 @@ cocoa_send_notification(PyObject *self UNUSED, PyObject *args) {
     ];
     Py_RETURN_NONE;
 }
-
-#endif
 
 @interface ServiceProvider : NSObject
 @end
@@ -736,12 +837,14 @@ cocoa_create_global_menu(void) {
 
 void
 cocoa_update_menu_bar_title(PyObject *pytitle) {
+    if (!pytitle) return;
     NSString *title = nil;
     if (OPT(macos_menubar_title_max_length) > 0 && PyUnicode_GetLength(pytitle) > OPT(macos_menubar_title_max_length)) {
         static char fmt[64];
         snprintf(fmt, sizeof(fmt), "%%%ld.%ldU%%s", OPT(macos_menubar_title_max_length), OPT(macos_menubar_title_max_length));
         RAII_PyObject(st, PyUnicode_FromFormat(fmt, pytitle, "…"));
         if (st) title = @(PyUnicode_AsUTF8(st));
+        else PyErr_Print();
     } else {
         title = @(PyUnicode_AsUTF8(pytitle));
     }
@@ -975,12 +1078,10 @@ cleanup(void) {
     if (beep_sound) [beep_sound release];
     beep_sound = nil;
 
-#ifndef KITTY_USE_DEPRECATED_MACOS_NOTIFICATION_API
     drain_pending_notifications(NO);
     free(notification_queue.notifications);
     notification_queue.notifications = NULL;
     notification_queue.capacity = 0;
-#endif
 
     } // autoreleasepool
 }
@@ -1008,14 +1109,102 @@ cocoa_set_uncaught_exception_handler(void) {
     NSSetUncaughtExceptionHandler(&uncaughtExceptionHandler);
 }
 
+static PyObject*
+convert_imagerep_to_png(NSBitmapImageRep *rep, const char *output_path) {
+    NSData *png = [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{NSImageCompressionFactor: @1.0}]; // autoreleased
+
+    if (output_path) {
+        if (![png writeToFile:@(output_path) atomically:YES]) {
+            PyErr_Format(PyExc_OSError, "Failed to write PNG data to %s", output_path);
+            return NULL;
+        }
+        return PyBytes_FromStringAndSize(NULL, 0);
+    }
+    return PyBytes_FromStringAndSize(png.bytes, png.length);
+}
+
+static PyObject*
+convert_image_to_png(NSImage *icon, unsigned image_size, const char *output_path) {
+    NSRect r = NSMakeRect(0, 0, image_size, image_size);
+    RAII_CoreFoundation(CGColorSpaceRef, colorSpace, CGColorSpaceCreateWithName(kCGColorSpaceGenericRGB));
+    RAII_CoreFoundation(CGContextRef, cgContext, CGBitmapContextCreate(NULL, image_size, image_size, 8, 4*image_size, colorSpace, kCGBitmapByteOrderDefault|kCGImageAlphaPremultipliedLast));
+    NSGraphicsContext *context = [NSGraphicsContext graphicsContextWithCGContext:cgContext flipped:NO];  // autoreleased
+    CGImageRef cg = [icon CGImageForProposedRect:&r context:context hints:nil];
+    NSBitmapImageRep *rep = [[[NSBitmapImageRep alloc] initWithCGImage:cg] autorelease];
+    return convert_imagerep_to_png(rep, output_path);
+}
+
+static PyObject*
+render_emoji(NSString *text, unsigned image_size, const char *output_path) {
+    NSFont *font = [NSFont fontWithName:@"AppleColorEmoji" size:12];
+    CTFontRef ctfont = (__bridge CTFontRef)(font);
+    CGFloat line_height = MAX(1, floor(CTFontGetAscent(ctfont) + CTFontGetDescent(ctfont) + MAX(0, CTFontGetLeading(ctfont)) + 0.5));
+    CGFloat pts_per_px = CTFontGetSize(ctfont) / line_height;
+    CGFloat desired_size = image_size * pts_per_px;
+    NSFont *final_font = [NSFont fontWithName:@"AppleColorEmoji" size:desired_size];
+    NSAttributedString *attr_string = [[[NSAttributedString alloc] initWithString:text attributes:@{NSFontAttributeName: final_font}] autorelease];
+    NSBitmapImageRep *bmp = [[[NSBitmapImageRep alloc] initWithBitmapDataPlanes:nil pixelsWide:image_size pixelsHigh:image_size bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES isPlanar:NO colorSpaceName:NSDeviceRGBColorSpace bytesPerRow:0 bitsPerPixel:0] autorelease];
+    [NSGraphicsContext saveGraphicsState];
+    NSGraphicsContext *context = [NSGraphicsContext graphicsContextWithBitmapImageRep:bmp];
+    [NSGraphicsContext setCurrentContext:context];
+    [attr_string drawInRect:NSMakeRect(0, 0, image_size, image_size)];
+    [NSGraphicsContext restoreGraphicsState];
+    return convert_imagerep_to_png(bmp, output_path);
+}
+
+
+static PyObject*
+bundle_image_as_png(PyObject *self UNUSED, PyObject *args, PyObject *kw) {@autoreleasepool {
+    const char *b, *output_path = NULL; int image_type = 1; unsigned image_size = 256;
+    static const char* kwlist[] = {"path_or_identifier", "output_path", "image_size", "image_type", NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kw, "s|sIi", (char**)kwlist, &b, &output_path, &image_size, &image_type)) return NULL;
+    NSImage *icon = nil;
+    switch (image_type) {
+        case 0: case 1: {
+            NSWorkspace *workspace = [NSWorkspace sharedWorkspace]; // autoreleased
+            if (image_type == 1) {
+                NSURL *url = [workspace URLForApplicationWithBundleIdentifier:@(b)]; // autoreleased
+                if (!url) {
+                    PyErr_Format(PyExc_KeyError, "Failed to find bundle path for identifier: %s", b); return NULL;
+                }
+                icon = [workspace iconForFile:@(url.fileSystemRepresentation)];
+            } else icon = [workspace iconForFile:@(b)];
+        } break;
+        case 2:
+            return render_emoji(@(b), image_size, output_path);
+        default:
+            if (@available(macOS 11.0, *)) {
+                icon = [NSImage imageWithSystemSymbolName:@(b) accessibilityDescription:@""];  // autoreleased
+            } else {
+                PyErr_SetString(PyExc_ValueError, "Your version of macOS is too old to use symbol images, need >= 11.0"); return NULL;
+            }
+            break;
+    }
+    if (!icon) {
+        PyErr_Format(PyExc_ValueError, "Failed to load icon for bundle: %s", b); return NULL;
+    }
+    return convert_image_to_png(icon, image_size, output_path);
+}}
+
+static PyObject*
+play_system_sound_by_id_async(PyObject *self UNUSED, PyObject *which) {
+    if (!PyLong_Check(which)) { PyErr_SetString(PyExc_TypeError, "system sound id must be an integer"); return NULL; }
+    AudioServicesPlaySystemSound(PyLong_AsUnsignedLong(which));
+    Py_RETURN_NONE;
+}
+
 static PyMethodDef module_methods[] = {
+    {"cocoa_play_system_sound_by_id_async", play_system_sound_by_id_async, METH_O, ""},
     {"cocoa_get_lang", (PyCFunction)cocoa_get_lang, METH_NOARGS, ""},
     {"cocoa_set_global_shortcut", (PyCFunction)cocoa_set_global_shortcut, METH_VARARGS, ""},
-    {"cocoa_send_notification", (PyCFunction)cocoa_send_notification, METH_VARARGS, ""},
+    {"cocoa_send_notification", (PyCFunction)(void(*)(void))cocoa_send_notification, METH_VARARGS | METH_KEYWORDS, ""},
+    {"cocoa_remove_delivered_notification", (PyCFunction)cocoa_remove_delivered_notification, METH_O, ""},
+    {"cocoa_live_delivered_notifications", (PyCFunction)cocoa_live_delivered_notifications, METH_NOARGS, ""},
     {"cocoa_set_notification_activated_callback", (PyCFunction)set_notification_activated_callback, METH_O, ""},
     {"cocoa_set_url_handler", (PyCFunction)cocoa_set_url_handler, METH_VARARGS, ""},
     {"cocoa_set_app_icon", (PyCFunction)cocoa_set_app_icon, METH_VARARGS, ""},
     {"cocoa_set_dock_icon", (PyCFunction)cocoa_set_dock_icon, METH_VARARGS, ""},
+    {"cocoa_bundle_image_as_png", (PyCFunction)(void(*)(void))bundle_image_as_png, METH_VARARGS | METH_KEYWORDS, ""},
     {NULL, NULL, 0, NULL}        /* Sentinel */
 };
 

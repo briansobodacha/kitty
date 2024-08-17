@@ -12,14 +12,14 @@ from contextlib import contextmanager
 from functools import lru_cache, partial
 
 from kitty.bash import decode_ansi_c_quoted_string
-from kitty.constants import kitten_exe, kitty_base_dir, shell_integration_dir, terminfo_dir
+from kitty.constants import is_macos, kitten_exe, kitty_base_dir, shell_integration_dir, terminfo_dir
 from kitty.fast_data_types import CURSOR_BEAM, CURSOR_BLOCK, CURSOR_UNDERLINE
 from kitty.shell_integration import setup_bash_env, setup_fish_env, setup_zsh_env
 
 from . import BaseTest
 
 
-@lru_cache()
+@lru_cache
 def bash_ok():
     v = shutil.which('bash')
     if not v:
@@ -90,6 +90,7 @@ class ShellIntegration(BaseTest):
         cmd = cmd or shell
         cmd = shlex.split(cmd.format(**locals()))
         env = (setup_env or safe_env_for_running_shell)(cmd, home_dir, rc=rc, shell=shell, with_kitten=self.with_kitten)
+        env['KITTY_RUNNING_SHELL_INTEGRATION_TEST'] = '1'
         try:
             if self.with_kitten:
                 cmd = [kitten_exe(), 'run-shell', '--shell', shlex.join(cmd)]
@@ -120,6 +121,7 @@ RPS1="{rps1}"
             self.ae(pty.callbacks.titlebuf[-1], '~')
             pty.callbacks.clear()
             pty.send_cmd_to_child('mkdir test && ls -a')
+            self.assert_command(pty)
             pty.wait_till(lambda: pty.screen_contents().count(rps1) == 2)
             self.ae(pty.callbacks.titlebuf[-2:], ['mkdir test && ls -a', '~'])
             q = '\n'.join(str(pty.screen.line(i)) for i in range(1, pty.screen.cursor.y))
@@ -137,10 +139,12 @@ RPS1="{rps1}"
             pty.wait_till(redrawn)
             self.ae(q, str(pty.screen.line(pty.screen.cursor.y)))
             pty.write_to_child('\r')
+            self.assert_command(pty, 'echo $COLUMNS')
             pty.wait_till(lambda: pty.screen_contents().count(rps1) == 3)
             self.ae('40', str(pty.screen.line(pty.screen.cursor.y - 1)))
             self.ae(q, str(pty.screen.line(pty.screen.cursor.y - 2)))
             pty.send_cmd_to_child('clear')
+            self.assert_command(pty)
             q = ps1 + ' ' * (pty.screen.columns - len(ps1) - len(rps1)) + rps1
             pty.wait_till(lambda: pty.screen_contents() == q)
             pty.wait_till(lambda: pty.screen.cursor.shape == CURSOR_BEAM)
@@ -148,20 +152,24 @@ RPS1="{rps1}"
             pty.wait_till(lambda: pty.screen.cursor.shape == 0)
             pty.write_to_child('\x04')
             pty.wait_till(lambda: pty.screen.cursor.shape == CURSOR_BEAM)
+            self.assert_command(pty)
         with self.run_shell(rc=f'''PS1="{ps1}"''') as pty:
             pty.callbacks.clear()
             pty.send_cmd_to_child('printf "%s\x16\a%s" "a" "b"')
             pty.wait_till(lambda: 'ab' in pty.screen_contents())
-            self.assertTrue(pty.screen.last_reported_cwd.endswith(self.home_dir))
+            self.assertTrue(pty.screen.last_reported_cwd.decode().endswith(self.home_dir))
             self.assertIn('%s^G%s', pty.screen_contents())
             q = os.path.join(self.home_dir, 'testing-cwd-notification-🐱')
             os.mkdir(q)
             pty.send_cmd_to_child(f'cd {q}')
-            pty.wait_till(lambda: pty.screen.last_reported_cwd.endswith(q))
+            pty.wait_till(lambda: pty.screen.last_reported_cwd.decode().endswith(q))
+            if not is_macos:  # Fails on older macOS like the one used to build kitty binary because of unicode encoding issues
+                self.assert_command(pty)
         with self.run_shell(rc=f'''PS1="{ps1}"\nexport ES="a\n b c\nd"''') as pty:
             pty.callbacks.clear()
             pty.send_cmd_to_child('clone-in-kitty')
             pty.wait_till(lambda: len(pty.callbacks.clone_cmds) == 1)
+            self.assert_command(pty)
             env = pty.callbacks.clone_cmds[0].env
             self.ae(env.get('ES'), 'a\n b c\nd')
 
@@ -184,23 +192,27 @@ function _set_status_prompt; function fish_prompt; echo -n "$pipestatus $status 
             self.ae(pty.screen_contents(), q)
 
             # shell integration dir must no be in XDG_DATA_DIRS
-            pty.send_cmd_to_child(f'string match -q -- "*{shell_integration_dir}*" "$XDG_DATA_DIRS" || echo "XDD_OK"')
+            cmd = f'string match -q -- "*{shell_integration_dir}*" "$XDG_DATA_DIRS" || echo "XDD_OK"'
+            pty.send_cmd_to_child(cmd)
             pty.wait_till(lambda: 'XDD_OK' in pty.screen_contents())
+            self.assert_command(pty, cmd)
 
             # CWD reporting
-            self.assertTrue(pty.screen.last_reported_cwd.endswith(self.home_dir))
+            self.assertTrue(pty.screen.last_reported_cwd.decode().endswith(self.home_dir))
             q = os.path.join(self.home_dir, 'testing-cwd-notification-🐱')
             os.mkdir(q)
             pty.send_cmd_to_child(f'cd {q}')
-            pty.wait_till(lambda: pty.screen.last_reported_cwd.endswith(q))
+            self.assert_command(pty)
+            pty.wait_till(lambda: pty.screen.last_reported_cwd.decode().endswith(q))
             pty.send_cmd_to_child('cd -')
-            pty.wait_till(lambda: pty.screen.last_reported_cwd.endswith(self.home_dir))
+            pty.wait_till(lambda: pty.screen.last_reported_cwd.decode().endswith(self.home_dir))
 
             # completion and prompt marking
             pty.wait_till(lambda: 'cd -' not in pty.screen_contents().splitlines()[-1])
             pty.send_cmd_to_child('clear')
             pty.wait_till(lambda: pty.screen_contents().count(right_prompt) == 1)
             pty.send_cmd_to_child('_test_comp_path')
+            self.assert_command(pty)
             pty.wait_till(lambda: pty.screen_contents().count(right_prompt) == 2)
             q = '\n'.join(str(pty.screen.line(i)) for i in range(1, pty.screen.cursor.y))
             self.ae(q, 'ok')
@@ -220,6 +232,7 @@ function _set_status_prompt; function fish_prompt; echo -n "$pipestatus $status 
             self.ae(q, str(pty.screen.line(pty.screen.cursor.y)))
             pty.write_to_child('\r')
             pty.wait_till(lambda: pty.screen_contents().count(right_prompt) == 3)
+            self.assert_command(pty, 'echo $COLUMNS')
             self.ae('40', str(pty.screen.line(pty.screen.cursor.y - 1)))
             self.ae(q, str(pty.screen.line(pty.screen.cursor.y - 2)))
 
@@ -244,10 +257,16 @@ function _set_status_prompt; function fish_prompt; echo -n "$pipestatus $status 
             pty.write_to_child('i')
             pty.wait_till(lambda: pty.screen.cursor.shape == CURSOR_BEAM)
             pty.send_cmd_to_child('_set_key default')
+            self.assert_command(pty)
             pty.wait_till(lambda: pty.screen_contents().count(right_prompt) == 4)
             pty.wait_till(lambda: pty.screen.cursor.shape == CURSOR_BEAM)
 
             pty.send_cmd_to_child('exit')
+
+    def assert_command(self, pty, cmd='', exit_status=0):
+        cmd = cmd or pty.last_cmd
+        pty.wait_till(lambda: pty.callbacks.last_cmd_exit_status == 0, timeout_msg=lambda: f'{pty.callbacks.last_cmd_exit_status=} != {exit_status}')
+        pty.wait_till(lambda: pty.callbacks.last_cmd_cmdline == cmd, timeout_msg=lambda: f'{pty.callbacks.last_cmd_cmdline=!r} != {cmd!r}')
 
     @unittest.skipUnless(bash_ok(), 'bash not installed, too old, or debug build')
     def test_bash_integration(self):
@@ -265,9 +284,11 @@ PS1="{ps1}"
             pty.wait_till(lambda: pty.callbacks.titlebuf[-1:] == ['~'])
             self.ae(pty.callbacks.titlebuf[-1], '~')
             pty.callbacks.clear()
-            pty.send_cmd_to_child('mkdir test && ls -a')
-            pty.wait_till(lambda: pty.callbacks.titlebuf[-2:] == ['mkdir test && ls -a', '~'])
+            cmd = 'mkdir test && ls -a'
+            pty.send_cmd_to_child(cmd)
+            pty.wait_till(lambda: pty.callbacks.titlebuf[-2:] == [cmd, '~'])
             pty.wait_till(lambda: pty.screen_contents().count(ps1) == 2)
+            self.assert_command(pty, cmd)
             q = '\n'.join(str(pty.screen.line(i)) for i in range(1, pty.screen.cursor.y))
             self.ae(pty.last_cmd_output(), q)
             # shrink the screen
@@ -299,18 +320,19 @@ PS1="{ps1}"
             pty.callbacks.clear()
             pty.send_cmd_to_child('declare')
             pty.wait_till(lambda: 'LOCAL_KSI_VAR' in pty.screen_contents())
+            self.assert_command(pty, 'declare')
         with self.run_shell(shell='bash', rc=f'''PS1="{ps1}"''') as pty:
             pty.callbacks.clear()
             pty.send_cmd_to_child('printf "%s\x16\a%s" "a" "b"')
             pty.wait_till(lambda: pty.screen_contents().count(ps1) == 2)
             self.ae(pty.screen_contents(), f'{ps1}printf "%s^G%s" "a" "b"\nab{ps1}')
-            self.assertTrue(pty.screen.last_reported_cwd.endswith(self.home_dir))
+            self.assertTrue(pty.screen.last_reported_cwd.decode().endswith(self.home_dir))
             pty.send_cmd_to_child('echo $HISTFILE')
-            pty.wait_till(lambda: '.bash_history' in pty.screen_contents())
+            pty.wait_till(lambda: '.bash_history' in pty.screen_contents().replace('\n', ''))
             q = os.path.join(self.home_dir, 'testing-cwd-notification-🐱')
             os.mkdir(q)
             pty.send_cmd_to_child(f'cd {q}')
-            pty.wait_till(lambda: pty.screen.last_reported_cwd.endswith(q))
+            pty.wait_till(lambda: pty.screen.last_reported_cwd.decode().endswith(q))
 
         for ps1 in ('line1\\nline\\2\\prompt> ', 'line1\nprompt> ', 'line1\\nprompt> ',):
             with self.subTest(ps1=ps1), self.run_shell(
@@ -331,6 +353,7 @@ PS1="{ps1}"
                 pty.wait_till(lambda: pty.screen_contents().count(ps1) == 3)
                 self.ae('40', str(pty.screen.line(pty.screen.cursor.y - len(ps1.splitlines()))))
                 self.ae(ps1.splitlines()[-1] + 'echo $COLUMNS', str(pty.screen.line(pty.screen.cursor.y - 1 - len(ps1.splitlines()))))
+                self.assert_command(pty, 'echo $COLUMNS')
 
         # test startup file sourcing
 
@@ -381,6 +404,7 @@ PS1="{ps1}"
             env = pty.callbacks.clone_cmds[0].env
             self.ae(env.get('ES'), 'a\n `b` c\n$d', f'Screen contents: {pty.screen_contents()!r}')
             self.ae(env.get('ES2'), 'XXX', f'Screen contents: {pty.screen_contents()!r}')
+
         for q, e in {
             'a': 'a',
             r'a\ab': 'a\ab',
@@ -389,8 +413,7 @@ PS1="{ps1}"
             r'a\U1f345x': 'a🍅x',
             r'a\c b': 'a\0b',
         }.items():
-            q = q + "'"
-            self.ae(decode_ansi_c_quoted_string(q, 0)[0], e, f'Failed to decode: {q!r}')
+            self.ae(decode_ansi_c_quoted_string(f"$'{q}'"), e, f'Failed to decode: {q!r}')
 
 
 class ShellIntegrationWithKitten(ShellIntegration):

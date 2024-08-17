@@ -11,11 +11,9 @@
 #include "threading.h"
 #include "screen.h"
 #include "fonts.h"
-#include "charsets.h"
 #include "monotonic.h"
 #include <termios.h>
 #include <unistd.h>
-#include <float.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
@@ -29,7 +27,7 @@ extern PyTypeObject Screen_Type;
 #endif
 
 #ifdef DEBUG_EVENT_LOOP
-#define EVDBG(...) log_event(__VA_ARGS__)
+#define EVDBG(...) timed_debug_print(__VA_ARGS__)
 #else
 #define EVDBG(...)
 #endif
@@ -40,8 +38,6 @@ extern PyTypeObject Screen_Type;
 #define MSG_NOSIGNAL 0
 #endif
 #define USE_RENDER_FRAMES (global_state.has_render_frames && OPT(sync_to_monitor))
-
-static void (*parse_func)(Screen*, PyObject*, monotonic_t);
 
 typedef struct {
     char *data;
@@ -62,6 +58,7 @@ typedef struct {
     Message *messages;
     size_t messages_capacity, messages_count;
     LoopData io_loop_data;
+    void (*parse_func)(void*, ParseData*, bool);
 } ChildMonitor;
 
 
@@ -156,7 +153,7 @@ mask_kitty_signals_process_wide(PyObject *self UNUSED, PyObject *a UNUSED) {
 }
 
 static PyObject *
-new(PyTypeObject *type, PyObject *args, PyObject UNUSED *kwds) {
+new_childmonitor_object(PyTypeObject *type, PyObject *args, PyObject UNUSED *kwds) {
     ChildMonitor *self;
     PyObject *dump_callback, *death_notify;
     int talk_fd = -1, listen_fd = -1;
@@ -180,8 +177,8 @@ new(PyTypeObject *type, PyObject *args, PyObject UNUSED *kwds) {
     self->death_notify = death_notify; Py_INCREF(death_notify);
     if (dump_callback != Py_None) {
         self->dump_callback = dump_callback; Py_INCREF(dump_callback);
-        parse_func = parse_worker_dump;
-    } else parse_func = parse_worker;
+        self->parse_func = parse_worker_dump;
+    } else self->parse_func = parse_worker;
     self->count = 0;
     children_fds[0].fd = self->io_loop_data.wakeup_read_fd; children_fds[1].fd = self->io_loop_data.signal_read_fd;
     children_fds[0].events = POLLIN; children_fds[1].events = POLLIN; children_fds[2].events = POLLIN;
@@ -439,24 +436,15 @@ shutdown_monitor(ChildMonitor *self, PyObject *a UNUSED) {
 
 static bool
 do_parse(ChildMonitor *self, Screen *screen, monotonic_t now, bool flush) {
-    bool input_read = false;
-    screen_mutex(lock, read);
-    if (screen->read_buf_sz || screen->pending_mode.used) {
-        monotonic_t time_since_new_input = now - screen->new_input_at;
-        if (flush || time_since_new_input >= OPT(input_delay)) {
-            bool read_buf_full = screen->read_buf_sz >= READ_BUF_SZ;
-            input_read = true;
-            parse_func(screen, self->dump_callback, now);
-            if (read_buf_full) wakeup_io_loop(self, false);  // Ensure the read fd has POLLIN set
-            screen->new_input_at = 0;
-            if (screen->pending_mode.activated_at) {
-                monotonic_t time_since_pending = MAX(0, now - screen->pending_mode.activated_at);
-                set_maximum_wait(screen->pending_mode.wait_time - time_since_pending);
-            }
-        } else set_maximum_wait(OPT(input_delay) - time_since_new_input);
-    }
-    screen_mutex(unlock, read);
-    return input_read;
+    ParseData pd = {.dump_callback = self->dump_callback, .now = now};
+    self->parse_func(screen, &pd, flush);
+    if (pd.input_read) {
+        if (pd.write_space_created) wakeup_io_loop(self, false);
+        if (screen->paused_rendering.expires_at) {
+            set_maximum_wait(MAX(0, screen->paused_rendering.expires_at - now));
+        } else set_maximum_wait(OPT(input_delay) - pd.time_since_new_input);
+    } else if (pd.has_pending_input) set_maximum_wait(OPT(input_delay) - pd.time_since_new_input);
+    return pd.input_read;
 }
 
 static bool
@@ -663,12 +651,14 @@ pyset_iutf8(ChildMonitor *self, PyObject *args) {
 
 static bool
 cursor_needs_render(Window *w) {
-    return w->cursor_visible_at_last_render != w->render_data.screen->cursor_render_info.is_visible || w->last_cursor_x != w->render_data.screen->cursor_render_info.x || w->last_cursor_y != w->render_data.screen->cursor_render_info.y || w->last_cursor_shape != w->render_data.screen->cursor_render_info.shape;
+#define cri w->render_data.screen->cursor_render_info
+    return w->cursor_opacity_at_last_render != cri.opacity || w->render_data.screen->last_rendered.cursor_x != cri.x || w->render_data.screen->last_rendered.cursor_y != cri.y || w->last_cursor_shape != cri.shape;
+#undef cri
 }
 
 static bool
 collect_cursor_info(CursorRenderInfo *ans, Window *w, monotonic_t now, OSWindow *os_window) {
-    ScreenRenderData *rd = &w->render_data;
+    WindowRenderData *rd = &w->render_data;
     const Cursor *cursor;
     if (screen_is_overlay_active(rd->screen)) {
         // Do not force the cursor to be visible here for the sake of some programs that prefer it hidden
@@ -676,25 +666,27 @@ collect_cursor_info(CursorRenderInfo *ans, Window *w, monotonic_t now, OSWindow 
         ans->x = rd->screen->overlay_line.cursor_x;
         ans->y = rd->screen->overlay_line.ynum;
     } else {
-        cursor = rd->screen->cursor;
+        cursor = rd->screen->paused_rendering.expires_at ? &rd->screen->paused_rendering.cursor : rd->screen->cursor;
         ans->x = cursor->x; ans->y = cursor->y;
     }
-    ans->is_visible = false;
+    ans->opacity = 0;
     if (rd->screen->scrolled_by || !screen_is_cursor_visible(rd->screen)) return cursor_needs_render(w);
     monotonic_t time_since_start_blink = now - os_window->cursor_blink_zero_time;
     bool cursor_blinking = OPT(cursor_blink_interval) > 0 && !cursor->non_blinking && os_window->is_focused && (OPT(cursor_stop_blinking_after) == 0 || time_since_start_blink <= OPT(cursor_stop_blinking_after));
-    bool do_draw_cursor = true;
+    ans->opacity = 1;
     if (cursor_blinking) {
-        int t = monotonic_t_to_ms(time_since_start_blink);
-        int d = monotonic_t_to_ms(OPT(cursor_blink_interval));
-        int n = t / d;
-        do_draw_cursor = n % 2 == 0 ? true : false;
-        monotonic_t bucket = ms_to_monotonic_t((monotonic_t)(n + 1) * d);
-        monotonic_t delay = bucket - time_since_start_blink;
-        set_maximum_wait(delay);
+        if (animation_is_valid(OPT(animation.cursor))) {
+            monotonic_t duration = OPT(cursor_blink_interval) * 2;
+            monotonic_t time_into_cycle = time_since_start_blink % duration;
+            double frac_into_cycle = (double)time_into_cycle / (double)duration;
+            ans->opacity = (float)apply_easing_curve(OPT(animation.cursor), frac_into_cycle, duration);
+            set_maximum_wait(ANIMATION_SAMPLE_WAIT);
+        } else {
+            monotonic_t n = time_since_start_blink / OPT(cursor_blink_interval);
+            ans->opacity = 1 - n % 2;
+            set_maximum_wait((n + 1) * OPT(cursor_blink_interval) - time_since_start_blink);
+        }
     }
-    if (!do_draw_cursor) { ans->is_visible = false; return cursor_needs_render(w); }
-    ans->is_visible = true;
     ans->shape = cursor->shape ? cursor->shape : OPT(cursor_shape);
     ans->is_focused = os_window->is_focused;
     return cursor_needs_render(w);
@@ -736,6 +728,7 @@ prepare_to_render_os_window(OSWindow *os_window, monotonic_t now, unsigned int *
         Window *w = tab->windows + i;
 #define WD w->render_data
         if (w->visible && WD.screen) {
+            screen_check_pause_rendering(WD.screen, now);
             *num_visible_windows += 1;
             color_type window_bg = colorprofile_to_color(WD.screen->color_profile, WD.screen->color_profile->overridden.default_bg, WD.screen->color_profile->configured.default_bg).rgb;
             if (*num_visible_windows == 1) first_window_bg = window_bg;
@@ -757,11 +750,11 @@ prepare_to_render_os_window(OSWindow *os_window, monotonic_t now, unsigned int *
                 set_os_window_title_from_window(w, os_window);
                 *active_window_bg = window_bg;
             } else {
-                if (WD.screen->render_unfocused_cursor) {
+                if (WD.screen->cursor_render_info.render_even_when_unfocused) {
                     if (collect_cursor_info(&WD.screen->cursor_render_info, w, now, os_window)) needs_render = true;
                     WD.screen->cursor_render_info.is_focused = false;
                 } else {
-                    WD.screen->cursor_render_info.is_visible = false;
+                    WD.screen->cursor_render_info.opacity = 0;
                 }
             }
             if (scan_for_animated_images) {
@@ -787,22 +780,22 @@ render_prepared_os_window(OSWindow *os_window, unsigned int active_window_id, co
     BorderRects *br = &tab->border_rects;
     draw_borders(br->vao_idx, br->num_border_rects, br->rect_buf, br->is_dirty, os_window->viewport_width, os_window->viewport_height, active_window_bg, num_visible_windows, all_windows_have_same_bg, os_window);
     br->is_dirty = false;
-    if (TD.screen && os_window->num_tabs >= OPT(tab_bar_min_tabs)) draw_cells(TD.vao_idx, &TD, os_window, true, false, NULL);
+    if (TD.screen && os_window->num_tabs >= OPT(tab_bar_min_tabs)) draw_cells(TD.vao_idx, &TD, os_window, true, true, false, NULL);
+    unsigned int num_of_visible_windows = 0;
+    for (unsigned int i = 0; i < tab->num_windows; i++) { if (tab->windows[i].visible) num_of_visible_windows++; }
     for (unsigned int i = 0; i < tab->num_windows; i++) {
         Window *w = tab->windows + i;
         if (w->visible && WD.screen) {
             bool is_active_window = i == tab->active_window;
-            draw_cells(WD.vao_idx, &WD, os_window, is_active_window, true, w);
-            if (WD.screen->start_visual_bell_at != 0) {
-                set_maximum_wait(OPT(repaint_delay));
-            }
-            w->cursor_visible_at_last_render = WD.screen->cursor_render_info.is_visible; w->last_cursor_x = WD.screen->cursor_render_info.x; w->last_cursor_y = WD.screen->cursor_render_info.y; w->last_cursor_shape = WD.screen->cursor_render_info.shape;
+            draw_cells(WD.vao_idx, &WD, os_window, is_active_window, false, num_of_visible_windows == 1, w);
+            if (WD.screen->start_visual_bell_at != 0) set_maximum_wait(ANIMATION_SAMPLE_WAIT);
+            w->cursor_opacity_at_last_render = WD.screen->cursor_render_info.opacity; w->last_cursor_shape = WD.screen->cursor_render_info.shape;
         }
     }
     swap_window_buffers(os_window);
     os_window->last_active_tab = os_window->active_tab; os_window->last_num_tabs = os_window->num_tabs; os_window->last_active_window_id = active_window_id;
     os_window->focused_at_last_render = os_window->is_focused;
-    os_window->is_damaged = false;
+    if (os_window->redraw_count) os_window->redraw_count--;
     if (USE_RENDER_FRAMES) request_frame_render(os_window);
 #undef WD
 #undef TD
@@ -815,7 +808,7 @@ no_render_frame_received_recently(OSWindow *w, monotonic_t now, monotonic_t max_
         if (global_state.is_wayland) {
             log_error("No render frame received in %.2f seconds", monotonic_t_to_s_double(max_wait));
         } else  {
-            log_error("No render frame received in %.2f seconds, re-requesting at: %f", monotonic_t_to_s_double(max_wait), monotonic_t_to_s_double(now));
+            log_error("No render frame received in %.2f seconds, re-requesting", monotonic_t_to_s_double(max_wait));
         }
     }
     return ans;
@@ -840,7 +833,7 @@ render_os_window(OSWindow *w, monotonic_t now, bool ignore_render_frames, bool s
     w->render_calls++;
     make_os_window_context_current(w);
     if (w->live_resize.in_progress) blank_os_window(w);
-    bool needs_render = w->is_damaged || w->live_resize.in_progress;
+    bool needs_render = w->redraw_count > 0 || w->live_resize.in_progress;
     if (w->viewport_size_dirty) {
         w->clear_count = 0;
         update_surface_size(w->viewport_width, w->viewport_height, 0);
@@ -940,14 +933,17 @@ monitor_pid(PyObject *self UNUSED, PyObject *args) {
 
 static void
 report_reaped_pids(void) {
+    static ReapedPID pids[64];
+    size_t i = 0;
     children_mutex(lock);
     if (reaped_pids_count) {
-        for (size_t i = 0; i < reaped_pids_count; i++) {
-            call_boss(on_monitored_pid_death, "ii", (int)reaped_pids[i].pid, reaped_pids[i].status);
+        for (; i < reaped_pids_count && i < arraysz(pids); i++) {
+            pids[i] = reaped_pids[i];
         }
         reaped_pids_count = 0;
     }
     children_mutex(unlock);
+    for (size_t n = 0; n < i; n++) { call_boss(on_monitored_pid_death, "li", (long)pids[n].pid, pids[n].status); }
 }
 
 static void*
@@ -1062,7 +1058,10 @@ process_pending_resizes(monotonic_t now) {
                 update_os_window_viewport(w, true);
                 change_live_resize_state(w, false);
                 zero_at_ptr(&w->live_resize);
-                w->is_damaged = true;  // because the window size should be hidden even if update_os_window_viewport does nothing
+                // because the window size should be hidden even if update_os_window_viewport does nothing
+                // On Wayland some compositors require two redraws after a
+                // resize to actually render correctly (Run kitty -1 --wait-for-os-window-close in sway to reproduce)
+                w->redraw_count = global_state.is_wayland ? 2 : 1;
             }
         }
     }
@@ -1070,14 +1069,10 @@ process_pending_resizes(monotonic_t now) {
 
 static void
 close_os_window(ChildMonitor *self, OSWindow *os_window) {
-    int w = os_window->content_area_width, h = os_window->content_area_height;
+    int w = os_window->window_width, h = os_window->window_height;
     if (os_window->before_fullscreen.is_set && is_os_window_fullscreen(os_window)) {
         w = os_window->before_fullscreen.w; h = os_window->before_fullscreen.h;
     }
-    // On GNOME Wayland w, h are the content area size, we need to add the frame size back
-    int content_area_width, content_area_height;
-    adjust_window_size_for_csd(os_window, w, h, &content_area_width, &content_area_height);
-    w += w - content_area_width; h += h - content_area_height;
     destroy_os_window(os_window);
     call_boss(on_os_window_closed, "Kii", os_window->id, w, h);
     for (size_t t=0; t < os_window->num_tabs; t++) {
@@ -1132,23 +1127,44 @@ process_pending_closes(ChildMonitor *self) {
 // glfw/cocoa. So we use a flag instead.
 static bool cocoa_pending_actions[NUM_COCOA_PENDING_ACTIONS] = {0};
 static bool has_cocoa_pending_actions = false;
+typedef struct cocoa_list { char **items; size_t count, capacity; } cocoa_list;
 typedef struct {
     char* wd;
-    char **open_urls;
-    size_t open_urls_count;
-    size_t open_urls_capacity;
+    cocoa_list open_urls, untracked_notifications;
 } CocoaPendingActionsData;
 static CocoaPendingActionsData cocoa_pending_actions_data = {0};
+
+static void
+cocoa_append_to_pending_list(cocoa_list *array, const char* item) {
+    ensure_space_for(array, items, char*, array->count + 1, capacity, 8, false);
+    array->items[array->count++] = strdup(item);
+}
+
+static void
+cocoa_free_pending_list(cocoa_list *array) {
+    for (size_t i = 0; i < array->count; i++) free(array->items[i]);
+    free(array->items); zero_at_ptr(array);
+}
+
+static void
+cocoa_free_actions_data(void) {
+    if (cocoa_pending_actions_data.wd) { free(cocoa_pending_actions_data.wd); cocoa_pending_actions_data.wd = NULL; }
+    cocoa_free_pending_list(&cocoa_pending_actions_data.open_urls);
+    cocoa_free_pending_list(&cocoa_pending_actions_data.untracked_notifications);
+}
 
 void
 set_cocoa_pending_action(CocoaPendingAction action, const char *data) {
     if (data) {
-        if (action == LAUNCH_URLS) {
-            ensure_space_for(&cocoa_pending_actions_data, open_urls, char*, cocoa_pending_actions_data.open_urls_count + 8, open_urls_capacity, 8, true);
-            cocoa_pending_actions_data.open_urls[cocoa_pending_actions_data.open_urls_count++] = strdup(data);
-        } else {
-            if (cocoa_pending_actions_data.wd) free(cocoa_pending_actions_data.wd);
-            cocoa_pending_actions_data.wd = strdup(data);
+        switch(action) {
+            case LAUNCH_URLS:
+                cocoa_append_to_pending_list(&cocoa_pending_actions_data.open_urls, data); break;
+            case COCOA_NOTIFICATION_UNTRACKED:
+                cocoa_append_to_pending_list(&cocoa_pending_actions_data.untracked_notifications, data); break;
+            default:
+                if (cocoa_pending_actions_data.wd) free(cocoa_pending_actions_data.wd);
+                cocoa_pending_actions_data.wd = strdup(data);
+                break;
         }
     }
     cocoa_pending_actions[action] = true;
@@ -1187,16 +1203,25 @@ process_cocoa_pending_actions(void) {
         free(cocoa_pending_actions_data.wd);
         cocoa_pending_actions_data.wd = NULL;
     }
-    if (cocoa_pending_actions_data.open_urls_count) {
-        for (unsigned cpa = 0; cpa < cocoa_pending_actions_data.open_urls_count; cpa++) {
-            if (cocoa_pending_actions_data.open_urls[cpa]) {
-                call_boss(launch_urls, "s", cocoa_pending_actions_data.open_urls[cpa]);
-                free(cocoa_pending_actions_data.open_urls[cpa]);
-                cocoa_pending_actions_data.open_urls[cpa] = NULL;
-            }
+    for (unsigned cpa = 0; cpa < cocoa_pending_actions_data.open_urls.count; cpa++) {
+        if (cocoa_pending_actions_data.open_urls.items[cpa]) {
+            call_boss(launch_urls, "s", cocoa_pending_actions_data.open_urls.items[cpa]);
+            free(cocoa_pending_actions_data.open_urls.items[cpa]);
+            cocoa_pending_actions_data.open_urls.items[cpa] = NULL;
         }
-        cocoa_pending_actions_data.open_urls_count = 0;
     }
+    cocoa_pending_actions_data.open_urls.count = 0;
+
+    for (unsigned cpa = 0; cpa < cocoa_pending_actions_data.untracked_notifications.count; cpa++) {
+        if (cocoa_pending_actions_data.untracked_notifications.items[cpa]) {
+            cocoa_report_live_notifications(cocoa_pending_actions_data.untracked_notifications.items[cpa]);
+            free(cocoa_pending_actions_data.untracked_notifications.items[cpa]);
+            cocoa_pending_actions_data.untracked_notifications.items[cpa] = NULL;
+        }
+    }
+    cocoa_pending_actions_data.untracked_notifications.count = 0;
+
+
     memset(cocoa_pending_actions, 0, sizeof(cocoa_pending_actions));
     has_cocoa_pending_actions = false;
 
@@ -1254,13 +1279,7 @@ main_loop(ChildMonitor *self, PyObject *a UNUSED) {
     state_check_timer = add_main_loop_timer(1000, true, do_state_check, self, NULL);
     run_main_loop(process_global_state, self);
 #ifdef __APPLE__
-    if (cocoa_pending_actions_data.wd) { free(cocoa_pending_actions_data.wd); cocoa_pending_actions_data.wd = NULL; }
-    if (cocoa_pending_actions_data.open_urls) {
-        for (unsigned cpa = 0; cpa < cocoa_pending_actions_data.open_urls_count; cpa++) {
-            if (cocoa_pending_actions_data.open_urls[cpa]) free(cocoa_pending_actions_data.open_urls[cpa]);
-        }
-        free(cocoa_pending_actions_data.open_urls); cocoa_pending_actions_data.open_urls = NULL;
-    }
+    cocoa_free_actions_data();
 #endif
     if (PyErr_Occurred()) return NULL;
     Py_RETURN_NONE;
@@ -1329,34 +1348,23 @@ remove_children(ChildMonitor *self) {
 static bool
 read_bytes(int fd, Screen *screen) {
     ssize_t len;
-    size_t available_buffer_space, orig_sz;
+    size_t available_buffer_space;
 
-    screen_mutex(lock, read);
-    orig_sz = screen->read_buf_sz;
-    if (orig_sz >= READ_BUF_SZ) { screen_mutex(unlock, read); return true; }  // screen read buffer is full
-    available_buffer_space = READ_BUF_SZ - orig_sz;
-    screen_mutex(unlock, read);
+    uint8_t *buf = vt_parser_create_write_buffer(screen->vt_parser, &available_buffer_space);
+    if (!available_buffer_space) return true;
 
     while(true) {
-        len = read(fd, screen->read_buf + orig_sz, available_buffer_space);
+        len = read(fd, buf, available_buffer_space);
         if (len < 0) {
             if (errno == EINTR || errno == EAGAIN) continue;
             if (errno != EIO) perror("Call to read() from child fd failed");
+            vt_parser_commit_write(screen->vt_parser, 0);
             return false;
         }
         break;
     }
-    if (UNLIKELY(len == 0)) return false;
-
-    screen_mutex(lock, read);
-    if (screen->new_input_at == 0) screen->new_input_at = monotonic();
-    if (orig_sz != screen->read_buf_sz) {
-        // The other thread consumed some of the screen read buffer
-        memmove(screen->read_buf + screen->read_buf_sz, screen->read_buf + orig_sz, len);
-    }
-    screen->read_buf_sz += len;
-    screen_mutex(unlock, read);
-    return true;
+    vt_parser_commit_write(screen->vt_parser, len);
+    return len != 0;
 }
 
 
@@ -1502,9 +1510,10 @@ io_loop(void *data) {
         for (i = 0; i < self->count; i++) {
             screen = children[i].screen;
             /* printf("i:%lu id:%lu fd: %d read_buf_sz: %lu write_buf_used: %lu\n", i, children[i].id, children[i].fd, screen->read_buf_sz, screen->write_buf_used); */
-            screen_mutex(lock, read); screen_mutex(lock, write);
-            children_fds[EXTRA_FDS + i].events = (screen->read_buf_sz < READ_BUF_SZ ? POLLIN : 0) | (screen->write_buf_used ? POLLOUT  : 0);
-            screen_mutex(unlock, read); screen_mutex(unlock, write);
+            children_fds[EXTRA_FDS + i].events = vt_parser_has_space_for_input(screen->vt_parser) ? POLLIN : 0;
+            screen_mutex(lock, write);
+            children_fds[EXTRA_FDS + i].events |= (screen->write_buf_used ? POLLOUT  : 0);
+            screen_mutex(unlock, write);
         }
         if (has_pending_wakeups) {
             now = monotonic();
@@ -1937,7 +1946,7 @@ PyTypeObject ChildMonitor_Type = {
     .tp_flags = Py_TPFLAGS_DEFAULT,
     .tp_doc = "ChildMonitor",
     .tp_methods = methods,
-    .tp_new = new,
+    .tp_new = new_childmonitor_object,
 };
 
 

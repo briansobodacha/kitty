@@ -1,9 +1,11 @@
 #!/usr/bin/env python
 # License: GPLv3 Copyright: 2020, Kovid Goyal <kovid at kovidgoyal.net>
 
-from typing import Any, Callable, Dict, NamedTuple, Tuple
+from typing import Any, Callable, NamedTuple, Optional, Union
 
 from .constants import is_macos, is_wayland
+from .fast_data_types import get_options
+from .options.types import Options
 from .types import FloatEdges
 from .typing import EdgeLiteral
 from .utils import log_error
@@ -35,14 +37,28 @@ def sanitize_window_size(x: Any) -> int:
     return max(20, min(ans, 50000))
 
 
-def initial_window_size_func(opts: WindowSizeData, cached_values: Dict[str, Any]) -> Callable[[int, int, float, float, float, float], Tuple[int, int]]:
+def edge_spacing(which: EdgeLiteral, opts:Optional[Union[WindowSizeData, Options]] = None) -> float:
+    if opts is None:
+        opts = get_options()
+    margin: float = getattr(opts.single_window_margin_width, which)
+    if margin < 0:
+        margin = getattr(opts.window_margin_width, which)
+
+    padding: float = getattr(opts.single_window_padding_width, which)
+    if padding < 0:
+        padding = getattr(opts.window_padding_width, which)
+    return float(padding + margin)
+
+
+
+def initial_window_size_func(opts: WindowSizeData, cached_values: dict[str, Any]) -> Callable[[int, int, float, float, float, float], tuple[int, int]]:
 
     if 'window-size' in cached_values and opts.remember_window_size:
         ws = cached_values['window-size']
         try:
             w, h = map(sanitize_window_size, ws)
 
-            def initial_window_size(*a: Any) -> Tuple[int, int]:
+            def initial_window_size(*a: Any) -> tuple[int, int]:
                 return w, h
             return initial_window_size
         except Exception:
@@ -51,7 +67,7 @@ def initial_window_size_func(opts: WindowSizeData, cached_values: Dict[str, Any]
     w, w_unit = opts.initial_window_sizes.width
     h, h_unit = opts.initial_window_sizes.height
 
-    def get_window_size(cell_width: int, cell_height: int, dpi_x: float, dpi_y: float, xscale: float, yscale: float) -> Tuple[int, int]:
+    def get_window_size(cell_width: int, cell_height: int, dpi_x: float, dpi_y: float, xscale: float, yscale: float) -> tuple[int, int]:
         if not is_macos and not is_wayland():
             # Not sure what the deal with scaling on X11 is
             xscale = yscale = 1

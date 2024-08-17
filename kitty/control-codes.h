@@ -55,17 +55,6 @@
 // *Delete*: Is ignored.
 #define DEL 0x7f
 
-#define IND 0x84
-#define NEL 0x85
-#define HTS 0x88
-#define RI  0x8d
-#define DCS 0x90
-#define CSI 0x9b
-#define ST 0x9c
-#define OSC 0x9d
-#define PM 0x9e
-#define APC 0x9f
-
 // Sharp control codes
 // -------------------
 
@@ -81,6 +70,7 @@
 #define ESC_ST '\\'
 #define ESC_PM '^'
 #define ESC_APC '_'
+#define ESC_SOS 'X'
 
 // *Reset*.
 #define ESC_RIS 'c'
@@ -240,4 +230,6 @@
 #define DECSCUSR 'q'
 
 // File transfer OSC number
-# define FILE_TRANSFER_CODE 5113
+#define FILE_TRANSFER_CODE 5113
+// Pending mode CSI code
+#define PENDING_MODE 2026

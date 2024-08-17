@@ -78,6 +78,10 @@ def select_graphic_rendition(*a: int) -> None:
     write(f'{CSI}{";".join(map(str, a))}m')
 
 
+def deccara(*a: int) -> None:
+    write(f'{CSI}{";".join(map(str, a))}$r')
+
+
 def screen_cursor_to_column(c: int) -> None:
     write(f'{CSI}{c}G')
 
@@ -146,6 +150,10 @@ def screen_erase_in_line(how: int, private: bool) -> None:
     write(f'{CSI}{"?" if private else ""}{how}K')
 
 
+def screen_erase_characters(num: int) -> None:
+    write(f'{CSI}{num}X')
+
+
 def screen_delete_lines(num: int) -> None:
     write(f'{CSI}{num}M')
 
@@ -156,6 +164,22 @@ def screen_cursor_up2(count: int) -> None:
 
 def screen_cursor_down(count: int) -> None:
     write(f'{CSI}{count}B')
+
+
+def screen_report_key_encoding_flags() -> None:
+    write(f'{CSI}?u')
+
+
+def screen_set_key_encoding_flags(flags: int, how: int) -> None:
+    write(f'{CSI}={flags};{how}u')
+
+
+def screen_push_key_encoding_flags(flags: int) -> None:
+    write(f'{CSI}>{flags}u')
+
+
+def screen_pop_key_encoding_flags(flags: int) -> None:
+    write(f'{CSI}<{flags}u')
 
 
 def screen_carriage_return() -> None:
@@ -196,7 +220,7 @@ def report_device_attributes(mode: int, char: int) -> None:
         x += chr(char)
     if mode:
         x += str(mode)
-    write(f'{CSI}{x}c')
+    write(f'{x}c')
 
 
 def screen_decsace(mode: int) -> None:
@@ -214,8 +238,13 @@ def write_osc(code: int, string: str = '') -> None:
         write(f'{OSC}{code}\x07')
 
 
-set_dynamic_color = set_color_table_color = process_cwd_notification = write_osc
+set_color_table_color = process_cwd_notification = write_osc
 clipboard_control_pending: str = ''
+
+
+def set_dynamic_color(payload: str) -> None:
+    code, data = payload.partition(' ')[::2]
+    write_osc(int(code), data)
 
 
 def shell_prompt_marking(payload: str) -> None:

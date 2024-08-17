@@ -10,6 +10,7 @@ import re
 import runpy
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
 import sysconfig
@@ -22,12 +23,28 @@ from pathlib import Path
 from typing import Callable, Dict, FrozenSet, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, Union, cast
 
 from glfw import glfw
-from glfw.glfw import Command, CompileKey
+from glfw.glfw import ISA, BinaryArch, Command, CompileKey, CompilerType
 
-if sys.version_info[:2] < (3, 8):
-    raise SystemExit('kitty requires python >= 3.8')
 src_base = os.path.dirname(os.path.abspath(__file__))
 
+def check_version_info() -> None:
+    with open(os.path.join(src_base, 'pyproject.toml')) as f:
+        raw = f.read()
+    m = re.search(r'''^requires-python\s*=\s*['"](.+?)['"]''', raw, flags=re.MULTILINE)
+    assert m is not None
+    minver = m.group(1)
+    match = re.match(r'(>=?)(\d+)\.(\d+)', minver)
+    assert match is not None
+    q = int(match.group(2)), int(match.group(3))
+    if match.group(1) == '>=':
+        is_ok = sys.version_info >= q
+    else:
+        is_ok = sys.version_info > q
+    if not is_ok:
+        exit(f'calibre requires Python {minver}. Current Python version: {".".join(map(str, sys.version_info[:3]))}')
+
+
+check_version_info()
 verbose = False
 build_dir = 'build'
 constants = os.path.join('kitty', 'constants.py')
@@ -53,6 +70,12 @@ is_arm = platform.processor() == 'arm' or platform.machine() in ('arm64', 'aarch
 Env = glfw.Env
 env = Env()
 PKGCONFIG = os.environ.get('PKGCONFIG_EXE', 'pkg-config')
+link_targets: List[str] = []
+macos_universal_arches = ('arm64', 'x86_64') if is_arm else ('x86_64', 'arm64')
+
+
+def LinkKey(output: str) -> CompileKey:
+    return CompileKey('', output)
 
 
 class CompilationDatabase:
@@ -61,6 +84,7 @@ class CompilationDatabase:
         self.incremental = incremental
         self.compile_commands: List[Command] = []
         self.link_commands: List[Command] = []
+        self.post_link_commands: List[Command] = []
 
     def add_command(
         self,
@@ -69,12 +93,16 @@ class CompilationDatabase:
         is_newer_func: Callable[[], bool],
         key: Optional[CompileKey] = None,
         on_success: Optional[Callable[[], None]] = None,
-        keyfile: Optional[str] = None
+        keyfile: Optional[str] = None,
+        is_post_link: bool = False,
     ) -> None:
         def no_op() -> None:
             pass
 
-        queue = self.link_commands if keyfile is None else self.compile_commands
+        if is_post_link:
+            queue = self.post_link_commands
+        else:
+            queue = self.link_commands if keyfile is None else self.compile_commands
         queue.append(Command(desc, cmd, is_newer_func, on_success or no_op, key, keyfile))
 
     def build_all(self) -> None:
@@ -97,13 +125,19 @@ class CompilationDatabase:
                 items.append(compile_cmd)
         parallel_run(items)
 
+        items = []
+        for compile_cmd in self.post_link_commands:
+            if not self.incremental or compile_cmd.is_newer_func():
+                items.append(compile_cmd)
+        parallel_run(items)
+
     def cmd_changed(self, compile_cmd: Command) -> bool:
         key, cmd = compile_cmd.key, compile_cmd.cmd
         return bool(self.db.get(key) != cmd)
 
     def __enter__(self) -> 'CompilationDatabase':
         self.all_keys: Set[CompileKey] = set()
-        self.dbpath = os.path.abspath(os.path.join('build', 'compile_commands.json'))
+        self.dbpath = os.path.abspath(os.path.join(build_dir, 'compile_commands.json'))
         self.linkdbpath = os.path.join(os.path.dirname(self.dbpath), 'link_commands.json')
         try:
             with open(self.dbpath) as f:
@@ -150,7 +184,7 @@ class Options:
     python_compiler_flags: str = ''
     python_linker_flags: str = ''
     incremental: bool = True
-    build_universal_binary: bool = False
+    build_dsym: bool = False
     ignore_compiler_warnings: bool = False
     profile: bool = False
     libdir_name: str = 'lib'
@@ -163,7 +197,9 @@ class Options:
     egl_library: Optional[str] = os.getenv('KITTY_EGL_LIBRARY')
     startup_notification_library: Optional[str] = os.getenv('KITTY_STARTUP_NOTIFICATION_LIBRARY')
     canberra_library: Optional[str] = os.getenv('KITTY_CANBERRA_LIBRARY')
+    systemd_library: Optional[str] = os.getenv('KITTY_SYSTEMD_LIBRARY')
     fontconfig_library: Optional[str] = os.getenv('KITTY_FONTCONFIG_LIBRARY')
+    building_arch: str = ''
 
     # Extras
     compilation_database: CompilationDatabase = CompilationDatabase()
@@ -232,11 +268,15 @@ def libcrypto_flags() -> Tuple[List[str], List[str]]:
                 openssl_dirs = glob.glob(f'/opt/homebrew/{q}') + glob.glob(f'/usr/local/{q}')
                 if openssl_dirs:
                     break
-            if not openssl_dirs:
+            else:
                 raise SystemExit(f'Failed to find OpenSSL version {v[0]}.{v[1]} on your system')
             extra_pc_dir = os.pathsep.join(openssl_dirs)
         cflags = pkg_config('libcrypto', '--cflags-only-I', extra_pc_dir=extra_pc_dir)
-    return cflags, pkg_config('libcrypto', '--libs', extra_pc_dir=extra_pc_dir)
+    ldflags = pkg_config('libcrypto', '--libs', extra_pc_dir=extra_pc_dir)
+    # Workaround bug in homebrew openssl package. This bug appears in CI only
+    if is_macos and ldflags and 'homebrew/Cellar' in ldflags[0] and not ldflags[0].endswith('/lib'):
+        ldflags.insert(0, ldflags[0] + '/lib')
+    return cflags, ldflags
 
 
 def at_least_version(package: str, major: int, minor: int = 0) -> None:
@@ -337,13 +377,25 @@ def get_python_flags(args: Options, cflags: List[str], for_main_executable: bool
 
 
 def get_sanitize_args(cc: List[str], ccver: Tuple[int, int]) -> List[str]:
-    sanitize_args = ['-fsanitize=address']
-    if ccver >= (5, 0):
-        sanitize_args.append('-fsanitize=undefined')
-        # if cc == 'gcc' or (cc == 'clang' and ccver >= (4, 2)):
-        #     sanitize_args.append('-fno-sanitize-recover=all')
-    sanitize_args.append('-fno-omit-frame-pointer')
-    return sanitize_args
+    return ['-fsanitize=address,undefined', '-fno-omit-frame-pointer']
+
+
+def get_binary_arch(path: str) -> BinaryArch:
+    with open(path, 'rb') as f:
+        sig = f.read(64)
+    if sig.startswith(b'\x7fELF'):  # ELF
+        bits = {1: 32, 2: 64}[sig[4]]
+        endian = {1: '<', 2: '>'}[sig[5]]
+        machine, = struct.unpack_from(endian + 'H', sig, 0x12)
+        isa = {i.value:i for i in ISA}.get(machine, ISA.Other)
+    elif sig[:4] in (b'\xcf\xfa\xed\xfe', b'\xce\xfa\xed\xfe'): # Mach-O
+        s, cpu_type, = struct.unpack_from('<II', sig, 0)
+        bits = {0xfeedface: 32, 0xfeedfacf: 64}[s]
+        cpu_type &= 0xff
+        isa = {0x7: ISA.AMD64, 0xc: ISA.ARM64}[cpu_type]
+    else:
+        raise SystemExit(f'Unknown binary format with signature: {sig[:4]!r}')
+    return BinaryArch(bits=bits, isa=isa)
 
 
 def test_compile(
@@ -354,18 +406,25 @@ def test_compile(
     show_stderr: bool = False,
     libraries: Iterable[str] = (),
     ldflags: Iterable[str] = (),
-) -> bool:
+    get_output_arch: bool = False,
+) -> Union[bool, BinaryArch]:
     src = src or 'int main(void) { return 0; }'
     with tempfile.TemporaryDirectory(prefix='kitty-test-compile-') as tdir:
         with open(os.path.join(tdir, f'source.{source_ext}'), 'w', encoding='utf-8') as srcf:
             print(src, file=srcf)
-        return subprocess.Popen(
+        output = os.path.join(tdir, 'source.output')
+        ret = subprocess.Popen(
             cc + ['-Werror=implicit-function-declaration'] + list(cflags) + ([] if link_also else ['-c']) +
-            ['-o', os.path.join(tdir, 'source.output'), srcf.name] +
+            ['-o', output, srcf.name] +
             [f'-l{x}' for x in libraries] + list(ldflags),
             stdout=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
             stderr=None if show_stderr else subprocess.DEVNULL
-        ).wait() == 0
+        ).wait()
+        if get_output_arch:
+            if ret != 0:
+                raise SystemExit(f'Failed to determine target architecture compiling test program failed with exit code: {ret}')
+            return get_binary_arch(output)
+        return ret == 0
 
 
 def first_successful_compile(cc: List[str], *cflags: str, src: str = '', source_ext: str = 'c') -> str:
@@ -375,7 +434,7 @@ def first_successful_compile(cc: List[str], *cflags: str, src: str = '', source_
     return ''
 
 
-def set_arches(flags: List[str], arches: Iterable[str] = ('x86_64', 'arm64')) -> None:
+def set_arches(flags: List[str], *arches: str) -> None:
     while True:
         try:
             idx = flags.index('-arch')
@@ -387,16 +446,6 @@ def set_arches(flags: List[str], arches: Iterable[str] = ('x86_64', 'arm64')) ->
         flags.extend(('-arch', arch))
 
 
-def is_gcc(cc: Iterable[str]) -> bool:
-
-    @lru_cache()
-    def f(cc: Tuple[str]) -> bool:
-        raw = subprocess.check_output(cc + ('--version',)).decode('utf-8').splitlines()[0]
-        return '(GCC)' in raw.split()
-
-    return f(tuple(cc))
-
-
 def init_env(
     debug: bool = False,
     sanitize: bool = False,
@@ -406,26 +455,23 @@ def init_env(
     egl_library: Optional[str] = None,
     startup_notification_library: Optional[str] = None,
     canberra_library: Optional[str] = None,
+    systemd_library: Optional[str] = None,
     fontconfig_library: Optional[str] = None,
     extra_logging: Iterable[str] = (),
     extra_include_dirs: Iterable[str] = (),
     ignore_compiler_warnings: bool = False,
-    build_universal_binary: bool = False,
+    building_arch: str = '',
     extra_library_dirs: Iterable[str] = (),
     verbose: bool = True,
     vcs_rev: str = '',
 ) -> Env:
-    native_optimizations = native_optimizations and not sanitize and not debug
-    if native_optimizations and is_macos and is_arm:
-        # see https://github.com/kovidgoyal/kitty/issues/3126
-        # -march=native is not supported when targeting Apple Silicon
-        native_optimizations = False
+    native_optimizations = native_optimizations and not sanitize
     cc, ccver = cc_version()
     if verbose:
         print('CC:', cc, ccver)
     stack_protector = first_successful_compile(cc, '-fstack-protector-strong', '-fstack-protector')
     missing_braces = ''
-    if ccver < (5, 2) and is_gcc(cc):
+    if ccver < (5, 2):
         missing_braces = '-Wno-missing-braces'
     df = '-g3'
     float_conversion = ''
@@ -434,7 +480,7 @@ def init_env(
         float_conversion = '-Wfloat-conversion'
     fortify_source = '' if sanitize and is_macos else '-D_FORTIFY_SOURCE=2'
     optimize = df if debug or sanitize else '-O3'
-    sanitize_args = get_sanitize_args(cc, ccver) if sanitize else set()
+    sanitize_args = get_sanitize_args(cc, ccver) if sanitize else []
     cppflags_ = os.environ.get(
         'OVERRIDE_CPPFLAGS', '-D{}DEBUG'.format('' if debug else 'N'),
     )
@@ -442,28 +488,18 @@ def init_env(
     for el in extra_logging:
         cppflags.append('-DDEBUG_{}'.format(el.upper().replace('-', '_')))
     has_copy_file_range = test_compile(cc, src='#define _GNU_SOURCE 1\n#include <unistd.h>\nint main() { copy_file_range(1, NULL, 2, NULL, 0, 0); return 0; }')
-    if has_copy_file_range:
-        cppflags.append('-DHAS_COPY_FILE_RANGE')
     werror = '' if ignore_compiler_warnings else '-pedantic-errors -Werror'
     std = '' if is_openbsd else '-std=c11'
     sanitize_flag = ' '.join(sanitize_args)
-    march = '-march=native' if native_optimizations else ''
-    # Using -mbranch-protection=standard causes crashes on Linux ARM, reported
-    # in https://github.com/kovidgoyal/kitty/issues/6845#issuecomment-1835886938
-    arm_control_flow_protection = '-mbranch-protection=standard' if is_macos else ''
-    # Universal build fails with -fcf-protection clang is not smart enough to filter it out for the ARM part
-    intel_control_flow_protection = '-fcf-protection=full' if ccver >= (9, 0) and not build_universal_binary else ''
-    control_flow_protection = arm_control_flow_protection if is_arm else intel_control_flow_protection
     env_cflags = shlex.split(os.environ.get('CFLAGS', ''))
     env_cppflags = shlex.split(os.environ.get('CPPFLAGS', ''))
     env_ldflags = shlex.split(os.environ.get('LDFLAGS', ''))
-    if control_flow_protection and not test_compile(cc, control_flow_protection, *env_cppflags, *env_cflags, ldflags=env_ldflags):
-        control_flow_protection = ''
+
     cflags_ = os.environ.get(
         'OVERRIDE_CFLAGS', (
             f'-Wextra {float_conversion} -Wno-missing-field-initializers -Wall -Wstrict-prototypes {std}'
             f' {werror} {optimize} {sanitize_flag} -fwrapv {stack_protector} {missing_braces}'
-            f' -pipe {march} -fvisibility=hidden {fortify_source} {control_flow_protection}'
+            f' -pipe -fvisibility=hidden -fno-plt'
         )
     )
     cflags = shlex.split(cflags_) + shlex.split(
@@ -477,6 +513,12 @@ def init_env(
     ldflags.append('-shared')
     cppflags += env_cppflags
     cflags += env_cflags
+    if fortify_source:
+        for x in cflags:
+            if '_FORTIFY_SOURCE' in x:
+                break
+        else:
+            cflags.append(fortify_source)
     ldflags += env_ldflags
     if not debug and not sanitize and not is_openbsd and link_time_optimization:
         # See https://github.com/google/sanitizers/issues/647
@@ -491,6 +533,9 @@ def init_env(
         cflags.append('-g3')
         ldflags.append('-lprofiler')
 
+    if debug or profile:
+        cflags.append('-fno-omit-frame-pointer')
+
     library_paths: Dict[str, List[str]] = {}
 
     def add_lpath(which: str, name: str, val: Optional[str]) -> None:
@@ -502,6 +547,7 @@ def init_env(
     add_lpath('glfw/egl_context.c', '_GLFW_EGL_LIBRARY', egl_library)
     add_lpath('kitty/desktop.c', '_KITTY_STARTUP_NOTIFICATION_LIBRARY', startup_notification_library)
     add_lpath('kitty/desktop.c', '_KITTY_CANBERRA_LIBRARY', canberra_library)
+    add_lpath('kitty/systemd.c', '_KITTY_SYSTEMD_LIBRARY', systemd_library)
     add_lpath('kitty/fontconfig.c', '_KITTY_FONTCONFIG_LIBRARY', fontconfig_library)
 
     for path in extra_include_dirs:
@@ -515,31 +561,64 @@ def init_env(
         cflags.insert(0, f'-I{os.environ["DEVELOP_ROOT"]}/include')
         ldpaths.insert(0, f'-L{os.environ["DEVELOP_ROOT"]}/lib')
 
-    if build_universal_binary:
-        set_arches(cflags)
-        set_arches(ldflags)
+    if building_arch:
+        set_arches(cflags, building_arch)
+        set_arches(ldflags, building_arch)
+    ba = test_compile(cc, *(cppflags + cflags), ldflags=ldflags, get_output_arch=True)
+    assert isinstance(ba, BinaryArch)
+    if ba.isa not in (ISA.AMD64, ISA.X86, ISA.ARM64):
+        cppflags.append('-DKITTY_NO_SIMD')
 
-    return Env(cc, cppflags, cflags, ldflags, library_paths, ccver=ccver, ldpaths=ldpaths, vcs_rev=vcs_rev)
+    control_flow_protection = ''
+    if ba.isa == ISA.AMD64:
+        control_flow_protection = '-fcf-protection=full' if ccver >= (9, 0) else ''
+    elif ba.isa == ISA.ARM64:
+        # Using -mbranch-protection=standard causes crashes on Linux ARM, reported
+        # in https://github.com/kovidgoyal/kitty/issues/6845#issuecomment-1835886938
+        if is_macos:
+            control_flow_protection = '-mbranch-protection=standard'
+
+    if control_flow_protection:
+        cflags.append(control_flow_protection)
+
+    if native_optimizations and ba.isa in (ISA.AMD64, ISA.X86):
+        cflags.extend('-march=native -mtune=native'.split())
+
+    ans = Env(
+        cc, cppflags, cflags, ldflags, library_paths, binary_arch=ba, native_optimizations=native_optimizations,
+        ccver=ccver, ldpaths=ldpaths, vcs_rev=vcs_rev,
+    )
+    ans.has_copy_file_range = bool(has_copy_file_range)
+    if verbose:
+        print(ans.cc_version_string.strip())
+        print('Detected:', ans.compiler_type)
+    return ans
 
 
 def kitty_env(args: Options) -> Env:
     ans = env.copy()
     cflags = ans.cflags
     cflags.append('-pthread')
+    cppflags = ans.cppflags
     # We add 4000 to the primary version because vim turns on SGR mouse mode
     # automatically if this version is high enough
-    libcrypto_cflags, libcrypto_ldflags = libcrypto_flags()
-    cppflags = ans.cppflags
-    cppflags.append(f'-DPRIMARY_VERSION={version[0] + 4000}')
-    cppflags.append(f'-DSECONDARY_VERSION={version[1]}')
-    cppflags.append('-DXT_VERSION="{}"'.format('.'.join(map(str, version))))
+    ans.primary_version = version[0] + 4000
+    ans.secondary_version = version[1]
+    ans.xt_version = '.'.join(map(str, version))
+
     at_least_version('harfbuzz', 1, 5)
     cflags.extend(pkg_config('libpng', '--cflags-only-I'))
     cflags.extend(pkg_config('lcms2', '--cflags-only-I'))
+    # simde doesnt come with pkg-config files but some Linux distros add
+    # them and on macOS when building with homebrew it is required
+    with suppress(SystemExit, subprocess.CalledProcessError):
+        cflags.extend(pkg_config('simde', '--cflags-only-I', fatal=False))
+    libcrypto_cflags, libcrypto_ldflags = libcrypto_flags()
     cflags.extend(libcrypto_cflags)
     if is_macos:
         platform_libs = [
             '-framework', 'Carbon', '-framework', 'CoreText', '-framework', 'CoreGraphics',
+            '-framework', 'AudioToolbox',
         ]
         test_program_src = '''#include <UserNotifications/UserNotifications.h>
         int main(void) { return 0; }\n'''
@@ -548,7 +627,7 @@ def kitty_env(args: Options) -> Env:
         if user_notifications_framework:
             platform_libs.extend(shlex.split(user_notifications_framework))
         else:
-            cppflags.append('-DKITTY_USE_DEPRECATED_MACOS_NOTIFICATION_API')
+            raise SystemExit('UserNotifications framework missing')
         # Apple deprecated OpenGL in Mojave (10.14) silence the endless
         # warnings about it
         cppflags.append('-DGL_SILENCE_DEPRECATION')
@@ -571,7 +650,6 @@ def kitty_env(args: Options) -> Env:
     if '-lz' not in ans.ldpaths:
         ans.ldpaths.append('-lz')
 
-    os.makedirs(build_dir, exist_ok=True)
     return ans
 
 
@@ -613,17 +691,81 @@ def get_vcs_rev() -> str:
     return ans
 
 
-def get_source_specific_defines(env: Env, src: str) -> Tuple[str, Optional[List[str]]]:
-    if src == 'kitty/parser_dump.c':
-        return 'kitty/parser.c', ['DUMP_COMMANDS']
+@lru_cache
+def base64_defines(isa: ISA) -> List[str]:
+    defs = {
+        'HAVE_AVX512': 0,
+        'HAVE_AVX2': 0,
+        'HAVE_NEON32': 0,
+        'HAVE_NEON64': 0,
+        'HAVE_SSSE3': 0,
+        'HAVE_SSE41': 0,
+        'HAVE_SSE42': 0,
+        'HAVE_AVX': 0,
+    }
+    if isa == ISA.ARM64:
+        defs['HAVE_NEON64'] = 1
+    elif isa == ISA.AMD64:
+        defs['HAVE_AVX2'] = 1
+        defs['HAVE_AVX'] = 1
+        defs['HAVE_SSE42'] = 1
+        defs['HAVE_SSE41'] = 1
+        defs['HAVE_SSE3'] = 1
+    elif isa == ISA.X86:
+        defs['HAVE_SSE42'] = 1
+        defs['HAVE_SSE41'] = 1
+        defs['HAVE_SSE3'] = 1
+    return [f'{k}={v}' for k, v in defs.items()]
+
+
+def get_source_specific_defines(env: Env, src: str) -> Tuple[str, List[str], Optional[List[str]]]:
+    if src == 'kitty/vt-parser-dump.c':
+        return 'kitty/vt-parser.c', [], ['DUMP_COMMANDS']
     if src == 'kitty/data-types.c':
         if not env.vcs_rev:
             env.vcs_rev = get_vcs_rev()
-        return src, [f'KITTY_VCS_REV="{env.vcs_rev}"', f'WRAPPED_KITTENS="{wrapped_kittens()}"']
+        return src, [], [f'KITTY_VCS_REV="{env.vcs_rev}"', f'WRAPPED_KITTENS="{wrapped_kittens()}"']
+    if src.startswith('3rdparty/base64/'):
+        return src, ['3rdparty/base64',], base64_defines(env.binary_arch.isa)
+    if src == 'kitty/screen.c':
+        return src, [], [f'PRIMARY_VERSION={env.primary_version}', f'SECONDARY_VERSION={env.secondary_version}', f'XT_VERSION="{env.xt_version}"']
+    if src == 'kitty/fast-file-copy.c':
+        return src, [], (['HAS_COPY_FILE_RANGE'] if env.has_copy_file_range else None)
     try:
-        return src, env.library_paths[src]
+        return src, [], env.library_paths[src]
     except KeyError:
-        return src, None
+        return src, [], None
+
+
+def get_source_specific_cflags(env: Env, src: str) -> List[str]:
+    ans = list(env.cflags)
+    # SIMD specific flags
+    if src in ('kitty/simd-string-128.c', 'kitty/simd-string-256.c'):
+        # simde recommends these are used for best performance
+        ans.extend(('-fopenmp-simd', '-DSIMDE_ENABLE_OPENMP'))
+        if env.binary_arch.isa in (ISA.AMD64, ISA.X86):
+            ans.append('-msse4.2' if '128' in src else '-mavx2')
+            if '256' in src:
+                # We have manual vzeroupper so prevent compiler from emitting it causing duplicates
+                if env.compiler_type is CompilerType.clang:
+                    ans.append('-mllvm')
+                    ans.append('-x86-use-vzeroupper=0')
+                else:
+                    ans.append('-mno-vzeroupper')
+    elif src.startswith('3rdparty/base64/lib/arch/'):
+        if env.binary_arch.isa in (ISA.AMD64, ISA.X86):
+            q = src.split(os.path.sep)
+            if 'sse3' in q:
+                ans.append('-msse3')
+            elif 'sse41' in q:
+                ans.append('-msse4.1')
+            elif 'sse42' in q:
+                ans.append('-msse4.2')
+            elif 'avx' in q:
+                ans.append('-mavx')
+            elif 'avx2' in q:
+                ans.append('-mavx2')
+    return ans
 
 
 def newer(dest: str, *sources: str) -> bool:
@@ -696,7 +838,7 @@ def parallel_run(items: List[Command]) -> None:
             if verbose:
                 print(' '.join(compile_cmd.cmd))
             elif isatty:
-                print(f'\r\x1b[K[{num}/{total}] {compile_cmd.desc}', end='')
+                print(f'\r\x1b[K[{num}/{total}] {compile_cmd.desc}', end='')  # ]]
             else:
                 print(f'[{num}/{total}] {compile_cmd.desc}', flush=True)
             printed = True
@@ -712,33 +854,68 @@ def parallel_run(items: List[Command]) -> None:
         run_tool(list(failed.cmd))
 
 
+def add_builtin_fonts(args: Options) -> None:
+    fonts_dir = os.path.join(src_base, 'fonts')
+    os.makedirs(fonts_dir, exist_ok=True)
+
+    for psname, (filename, human_name) in {
+        'SymbolsNFM': ('SymbolsNerdFontMono-Regular.ttf', 'Symbols NERD Font Mono')
+    }.items():
+        dest = os.path.join(fonts_dir, filename)
+        if os.path.exists(dest):
+            continue
+        font_file = ''
+        if is_macos:
+            for candidate in (os.path.expanduser('~/Library/Fonts'), '/Library/Fonts', '/System/Library/Fonts', '/Network/Library/Fonts'):
+                q = os.path.join(candidate, filename)
+                if os.path.exists(q):
+                    font_file = q
+                    break
+        else:
+            lines = subprocess.check_output([
+                'fc-match', '--format', '%{file}\n%{postscriptname}', f'term:postscriptname={psname}', 'file', 'postscriptname']).decode().splitlines()
+            if len(lines) != 2:
+                raise SystemExit(f'fc-match returned unexpected output: {lines}')
+            if lines[1] != psname:
+                raise SystemExit(f'The font {human_name!r} was not found on your system, please install it')
+            font_file = lines[0]
+        if not font_file:
+            raise SystemExit(f'The font {human_name!r} was not found on your system, please install it')
+        print(f'Copying {human_name!r} from {font_file}')
+        shutil.copy(font_file, dest)
+        os.chmod(dest, 0o644)
+
+
 def compile_c_extension(
     kenv: Env,
     module: str,
     compilation_database: CompilationDatabase,
     sources: List[str],
     headers: List[str],
-    desc_prefix: str = ''
+    desc_prefix: str = '',
+    build_dsym: bool = False,
 ) -> None:
     prefix = os.path.basename(module)
     objects = [
-        os.path.join(build_dir, f'{prefix}-{os.path.basename(src)}.o')
+        os.path.join(build_dir, f'{prefix}-{src.replace("/", "-")}.o')
         for src in sources
     ]
 
     for original_src, dest in zip(sources, objects):
         src = original_src
         cppflags = kenv.cppflags[:]
-        src, defines = get_source_specific_defines(kenv, src)
+        src, include_paths, defines = get_source_specific_defines(kenv, src)
         if defines is not None:
             cppflags.extend(map(define, defines))
-        cmd = kenv.cc + ['-MMD'] + cppflags + kenv.cflags
+        cflags = get_source_specific_cflags(kenv, src)
+        cmd = kenv.cc + ['-MMD'] + cppflags + [f'-I{x}' for x in include_paths] + cflags
         cmd += ['-c', src] + ['-o', dest]
         key = CompileKey(original_src, os.path.basename(dest))
         desc = f'Compiling {emphasis(desc_prefix + src)} ...'
         compilation_database.add_command(desc, cmd, partial(newer, dest, *dependecies_for(src, dest, headers)), key=key, keyfile=src)
     dest = os.path.join(build_dir, f'{module}.so')
     real_dest = f'{module}.so'
+    link_targets.append(os.path.abspath(real_dest))
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     desc = f'Linking {emphasis(desc_prefix + module)} ...'
     # Old versions of clang don't like -pthread being passed to the linker
@@ -751,7 +928,12 @@ def compile_c_extension(
     def on_success() -> None:
         os.rename(dest, real_dest)
 
-    compilation_database.add_command(desc, cmd, partial(newer, real_dest, *objects), on_success=on_success, key=CompileKey('', f'{module}.so'))
+    compilation_database.add_command(desc, cmd, partial(newer, real_dest, *objects), on_success=on_success, key=LinkKey(f'{module}.so'))
+    if is_macos and build_dsym:
+        real_dest = os.path.abspath(real_dest)
+        desc = f'Linking dSYM {emphasis(desc_prefix + module)} ...'
+        dsym = f'{real_dest}.dSYM/Contents/Resources/DWARF/{os.path.basename(real_dest)}'
+        compilation_database.add_command(desc, ['dsymutil', real_dest], partial(newer, dsym, real_dest), key=LinkKey(dsym), is_post_link=True)
 
 
 def find_c_files() -> Tuple[List[str], List[str]]:
@@ -768,11 +950,19 @@ def find_c_files() -> Tuple[List[str], List[str]]:
             ans.append(os.path.join('kitty', x))
         elif ext == '.h':
             headers.append(os.path.join('kitty', x))
-    ans.append('kitty/parser_dump.c')
+    ans.append('kitty/vt-parser-dump.c')
+
+    # ringbuf
+    ans.append('3rdparty/ringbuf/ringbuf.c')
+    # base64
+    ans.extend(glob.glob('3rdparty/base64/lib/arch/*/codec.c'))
+    ans.append('3rdparty/base64/lib/tables/tables.c')
+    ans.append('3rdparty/base64/lib/codec_choose.c')
+    ans.append('3rdparty/base64/lib/lib.c')
     return ans, headers
 
 
-def compile_glfw(compilation_database: CompilationDatabase) -> None:
+def compile_glfw(compilation_database: CompilationDatabase, build_dsym: bool = False) -> None:
     modules = 'cocoa' if is_macos else 'x11 wayland'
     for module in modules.split():
         try:
@@ -794,7 +984,7 @@ def compile_glfw(compilation_database: CompilationDatabase) -> None:
                 continue
         compile_c_extension(
             genv, f'kitty/glfw-{module}', compilation_database,
-            sources, all_headers, desc_prefix=f'[{module}] ')
+            sources, all_headers, desc_prefix=f'[{module}] ', build_dsym=build_dsym)
 
 
 def kittens_env(args: Options) -> Env:
@@ -829,19 +1019,19 @@ def compile_kittens(args: Options) -> None:
         files('transfer', 'rsync', libraries=pkg_config('libxxhash', '--libs'), includes=pkg_config('libxxhash', '--cflags-only-I')),
     ):
         final_env = kenv.copy()
-        final_env.cflags.extend(f'-I{x}' for x in includes)
+        final_env.cflags.extend(includes)
         final_env.ldpaths[:0] = list(libraries)
         compile_c_extension(
-            final_env, dest, args.compilation_database, sources, all_headers + ['kitty/data-types.h'])
+            final_env, dest, args.compilation_database, sources, all_headers + ['kitty/data-types.h'], build_dsym=args.build_dsym)
 
 
 def init_env_from_args(args: Options, native_optimizations: bool = False) -> None:
     global env
     env = init_env(
         args.debug, args.sanitize, native_optimizations, args.link_time_optimization, args.profile,
-        args.egl_library, args.startup_notification_library, args.canberra_library, args.fontconfig_library,
+        args.egl_library, args.startup_notification_library, args.canberra_library, args.systemd_library, args.fontconfig_library,
         args.extra_logging, args.extra_include_dirs, args.ignore_compiler_warnings,
-        args.build_universal_binary, args.extra_library_dirs, verbose=args.verbose > 0, vcs_rev=args.vcs_rev,
+        args.building_arch, args.extra_library_dirs, verbose=args.verbose > 0, vcs_rev=args.vcs_rev,
     )
 
 
@@ -931,10 +1121,12 @@ def build(args: Options, native_optimizations: bool = True, call_init: bool = Tr
     headers.append(build_ref_map(args.skip_code_generation))
     headers.append(build_uniforms_header(args.skip_code_generation))
     compile_c_extension(
-        kitty_env(args), 'kitty/fast_data_types', args.compilation_database, sources, headers
+        kitty_env(args), 'kitty/fast_data_types', args.compilation_database, sources, headers,
+        build_dsym=args.build_dsym,
     )
-    compile_glfw(args.compilation_database)
+    compile_glfw(args.compilation_database, args.build_dsym)
     compile_kittens(args)
+    add_builtin_fonts(args)
 
 
 def safe_makedirs(path: str) -> None:
@@ -951,9 +1143,11 @@ def update_go_generated_files(args: Options, kitty_exe: str) -> None:
 
     env = os.environ.copy()
     env['ASAN_OPTIONS'] = 'detect_leaks=0'
-    cp = subprocess.run([kitty_exe, '+launch', os.path.join(src_base, 'gen/go_code.py')], stdout=subprocess.PIPE, env=env)
+    cp = subprocess.run([kitty_exe, '+launch', os.path.join(src_base, 'gen/go_code.py')], stdout=subprocess.DEVNULL, env=env)
     if cp.returncode != 0:
-        raise SystemExit(cp.returncode)
+        if os.environ.get('CI') == 'true' and cp.returncode < 0 and shutil.which('coredumpctl'):
+            subprocess.run(['sh', '-c', 'echo bt | coredumpctl debug'])
+        raise SystemExit(f'Generating go code failed with exit code: {cp.returncode}')
 
 
 def parse_go_version(x: str) -> Tuple[int, int, int]:
@@ -1002,31 +1196,31 @@ def build_static_kittens(
         dest += f'-{for_platform[0]}-{for_platform[1]}'
     src = os.path.abspath('tools/cmd')
 
-    def run_one(dest: str, **env: str) -> None:
+    def run_one(dest: str) -> None:
         c = cmd + ['-o', dest, src]
         if args.verbose:
             print(shlex.join(c))
         e = os.environ.copy()
-        e.update(env)
         # https://github.com/kovidgoyal/kitty/issues/6051#issuecomment-1441369828
         e.pop('PWD', None)
         if for_platform:
             e['CGO_ENABLED'] = '0'
             e['GOOS'] = for_platform[0]
             e['GOARCH'] = for_platform[1]
+        elif args.building_arch:
+            e['GOARCH'] = {'x86_64': 'amd64', 'arm64': 'arm64'}[args.building_arch]
         cp = subprocess.run(c, env=e)
         if cp.returncode != 0:
             raise SystemExit(cp.returncode)
 
-    if args.build_universal_binary and not for_platform:
-        outs = []
-        for arch in ('amd64', 'arm64'):
-            d = dest + f'-{arch}'
-            run_one(d, GOOS='darwin', GOARCH=arch)
-            outs.append(d)
-        subprocess.check_call(['lipo', '-create', '-output', dest] + outs)
-        for x in outs:
-            os.remove(x)
+    if is_macos and for_freeze and not for_platform:
+        adests = []
+        for arch in macos_universal_arches:
+            args.building_arch = arch
+            adest = dest + '-' + arch
+            adests.append(adest)
+            run_one(adest)
+        lipo({dest: adests})
     else:
         run_one(dest)
     return dest
@@ -1043,6 +1237,30 @@ def build_static_binaries(args: Options, launcher_dir: str) -> None:
             build_static_kittens(args, launcher_dir, args.dir_for_static_binaries, for_platform=(os_, arch))
 
 
+@lru_cache(2)
+def kitty_cli_boolean_options() -> Tuple[str, ...]:
+    with open(os.path.join(src_base, 'kitty/cli.py')) as f:
+        raw = f.read()
+    m = re.search(r"^\s*OPTIONS = '''(.+?)'''", raw, flags=re.MULTILINE | re.DOTALL)
+    assert m is not None
+    ans: List[str] = []
+    in_option: List[str] = []
+    prev_line_was_blank = False
+    for line in m.group(1).splitlines():
+        if in_option:
+            is_blank = not line.strip()
+            if is_blank:
+                if prev_line_was_blank:
+                    in_option = []
+            prev_line_was_blank = is_blank
+            if line.startswith('type=bool-'):
+                ans.extend(x.lstrip('-') for x in in_option)
+        else:
+            if line.startswith('-'):
+                in_option = line.strip().split()
+    return tuple(ans)
+
+
 def build_launcher(args: Options, launcher_dir: str = '.', bundle_type: str = 'source') -> None:
     werror = '' if args.ignore_compiler_warnings else '-pedantic-errors -Werror'
     cflags = f'-Wall {werror} -fpie'.split()
@@ -1050,14 +1268,12 @@ def build_launcher(args: Options, launcher_dir: str = '.', bundle_type: str = 's
     libs: List[str] = []
     ldflags = shlex.split(os.environ.get('LDFLAGS', ''))
     if args.profile or args.sanitize:
+        cflags.append('-g3')
         if args.sanitize:
-            cflags.append('-g3')
             sanitize_args = get_sanitize_args(env.cc, env.ccver)
             cflags.extend(sanitize_args)
             ldflags.extend(sanitize_args)
-            libs += ['-lasan'] if is_gcc(env.cc) and not is_macos else []
-        else:
-            cflags.append('-g')
+            libs += ['-lasan'] if not is_macos and env.compiler_type is not CompilerType.clang else []
         if args.profile:
             libs.append('-lprofiler')
     else:
@@ -1091,9 +1307,9 @@ def build_launcher(args: Options, launcher_dir: str = '.', bundle_type: str = 's
     cflags += shlex.split(os.environ.get('CFLAGS', ''))
     for path in args.extra_include_dirs:
         cflags.append(f'-I{path}')
-    if args.build_universal_binary:
-        set_arches(cflags)
-        set_arches(ldflags)
+    if args.building_arch:
+        set_arches(cflags, args.building_arch)
+        set_arches(ldflags, args.building_arch)
     if bundle_type == 'linux-freeze':
         # --disable-new-dtags prevents -rpath from generating RUNPATH instead of
         # RPATH entries in the launcher. The ld dynamic linker does not search
@@ -1102,16 +1318,23 @@ def build_launcher(args: Options, launcher_dir: str = '.', bundle_type: str = 's
     os.makedirs(launcher_dir, exist_ok=True)
     os.makedirs(build_dir, exist_ok=True)
     objects = []
-    for src in ('kitty/launcher/main.c',):
+    cppflags.append('-DKITTY_CLI_BOOL_OPTIONS=" ' + ' '.join(kitty_cli_boolean_options()) + ' "')
+    cppflags.append('-DKITTY_VERSION="' + '.'.join(map(str, version)) + '"')
+    for src in ('kitty/launcher/main.c', 'kitty/launcher/single-instance.c'):
         obj = os.path.join(build_dir, src.replace('/', '-').replace('.c', '.o'))
         objects.append(obj)
         cmd = env.cc + cppflags + cflags + ['-c', src, '-o', obj]
         key = CompileKey(src, os.path.basename(obj))
         args.compilation_database.add_command(f'Compiling {emphasis(src)} ...', cmd, partial(newer, obj, src), key=key, keyfile=src)
     dest = os.path.join(launcher_dir, 'kitty')
+    link_targets.append(os.path.abspath(dest))
     desc = f'Linking {emphasis("launcher")} ...'
     cmd = env.cc + ldflags + objects + libs + pylib + ['-o', dest]
-    args.compilation_database.add_command(desc, cmd, partial(newer, dest, *objects), key=CompileKey('', 'kitty'))
+    args.compilation_database.add_command(desc, cmd, partial(newer, dest, *objects), key=LinkKey('kitty'))
+    if args.build_dsym and is_macos:
+        desc = f'Linking dSYM {emphasis("launcher")} ...'
+        dsym = f'{dest}.dSYM/Contents/Resources/DWARF/{os.path.basename(dest)}'
+        args.compilation_database.add_command(desc, ['dsymutil', dest], partial(newer, dsym, dest), key=LinkKey(dsym), is_post_link=True)
     args.compilation_database.build_all()
 
 
@@ -1204,11 +1427,11 @@ Name=kitty
 GenericName=Terminal emulator
 Comment=Fast, feature-rich, GPU based terminal
 TryExec=kitty
+StartupNotify=true
 Exec=kitty
 Icon=kitty
 Categories=System;TerminalEmulator;
-'''
-            )
+''')
     with open(os.path.join(deskdir, 'kitty-open.desktop'), 'w') as f:
         f.write(
             '''\
@@ -1218,14 +1441,14 @@ Type=Application
 Name=kitty URL Launcher
 GenericName=Terminal emulator
 Comment=Open URLs with kitty
+StartupNotify=true
 TryExec=kitty
 Exec=kitty +open %U
 Icon=kitty
 Categories=System;TerminalEmulator;
 NoDisplay=true
 MimeType=image/*;application/x-sh;application/x-shellscript;inode/directory;text/*;x-scheme-handler/kitty;x-scheme-handler/ssh;
-'''
-            )
+''')
 
     if os.path.exists(in_src_launcher):
         os.remove(in_src_launcher)
@@ -1365,7 +1588,7 @@ def macos_info_plist() -> bytes:
         NSHumanReadableCopyright=time.strftime('Copyright %Y, Kovid Goyal'),
         CFBundleGetInfoString='kitty - The fast, feature-rich, GPU based terminal emulator. https://sw.kovidgoyal.net/kitty/',
         # Operating System Version
-        LSMinimumSystemVersion='10.12.0',
+        LSMinimumSystemVersion='10.15.0',
         # Categorization
         CFBundlePackageType='APPL',
         CFBundleSignature='????',
@@ -1491,7 +1714,7 @@ def create_macos_bundle_gunk(dest: str, for_freeze: bool, args: Options) -> str:
     return str(kitty_exe)
 
 
-def package(args: Options, bundle_type: str) -> None:
+def package(args: Options, bundle_type: str, do_build_all: bool = True) -> None:
     ddir = args.prefix
     for_freeze = bundle_type.endswith('-freeze')
     if bundle_type == 'linux-freeze':
@@ -1502,7 +1725,8 @@ def package(args: Options, bundle_type: str) -> None:
     launcher_dir = os.path.join(ddir, 'bin')
     safe_makedirs(launcher_dir)
     if for_freeze:  # freeze launcher is built separately
-        args.compilation_database.build_all()
+        if do_build_all:
+            args.compilation_database.build_all()
     else:
         build_launcher(args, launcher_dir, bundle_type)
     os.makedirs(os.path.join(libdir, 'logo'))
@@ -1519,6 +1743,7 @@ def package(args: Options, bundle_type: str) -> None:
     shutil.copy2('logo/beam-cursor.png', os.path.join(libdir, 'logo'))
     shutil.copy2('logo/beam-cursor@2x.png', os.path.join(libdir, 'logo'))
     shutil.copytree('shell-integration', os.path.join(libdir, 'shell-integration'), dirs_exist_ok=True)
+    shutil.copytree('fonts', os.path.join(libdir, 'fonts'), dirs_exist_ok=True)
     allowed_extensions = frozenset('py glsl so'.split())
 
     def src_ignore(parent: str, entries: Iterable[str]) -> List[str]:
@@ -1597,7 +1822,7 @@ def clean(for_cross_compile: bool = False) -> None:
     safe_remove(
         'build', 'compile_commands.json', 'link_commands.json',
         'linux-package', 'kitty.app', 'asan-launcher',
-        'kitty-profile')
+        'kitty-profile')  # no fonts as that is not generated by build
     if not for_cross_compile:
         safe_remove('docs/generated')
     clean_launcher_dir('kitty/launcher')
@@ -1605,6 +1830,13 @@ def clean(for_cross_compile: bool = False) -> None:
     def excluded(root: str, d: str) -> bool:
         q = os.path.relpath(os.path.join(root, d), src_base).replace(os.sep, '/')
         return q in ('.git', 'bypy/b', 'dependencies')
+
+    def is_generated(f: str) -> bool:
+        e = f.endswith
+        return (
+            e('_generated.h') or e('_generated.go') or e('_generated.bin') or
+            e('_generated.s') or e('_generated_test.s') or e('_generated_test.go')
+        )
 
     for root, dirs, files in os.walk(src_base, topdown=True):
         dirs[:] = [d for d in dirs if not excluded(root, d)]
@@ -1614,9 +1846,7 @@ def clean(for_cross_compile: bool = False) -> None:
             dirs.remove(d)
         for f in files:
             ext = f.rpartition('.')[-1]
-            if ext in ('so', 'dylib', 'pyc', 'pyo') or (not for_cross_compile and (
-                    f.endswith('_generated.h') or f.endswith('_generated.go') or f.endswith('_generated.bin'))
-            ):
+            if ext in ('so', 'dylib', 'pyc', 'pyo') or (not for_cross_compile and is_generated(f)):
                 os.unlink(os.path.join(root, f))
     for x in glob.glob('glfw/wayland-*-protocol.[ch]'):
         os.unlink(x)
@@ -1784,6 +2014,13 @@ def option_parser() -> argparse.ArgumentParser:  # {{{
         ' This can be used to change the name of the loaded library or specify an absolute path.'
     )
     p.add_argument(
+        '--systemd-library',
+        type=str,
+        default=Options.systemd_library,
+        help='The filename argument passed to dlopen for libsystemd.'
+        ' This can be used to change the name of the loaded library or specify an absolute path.'
+    )
+    p.add_argument(
         '--fontconfig-library',
         type=str,
         default=Options.fontconfig_library,
@@ -1803,9 +2040,9 @@ def option_parser() -> argparse.ArgumentParser:  # {{{
         help='Ignore any warnings from the compiler while building'
     )
     p.add_argument(
-        '--build-universal-binary',
-        default=Options.build_universal_binary, action='store_true',
-        help='Build a universal binary (ARM + Intel on macOS, ignored on other platforms)'
+        '--build-dSYM', dest='build_dsym',
+        default=Options.build_dsym, action='store_true',
+        help='Build the dSYM bundle on macOS, ignored on other platforms'
     )
     return p
 # }}}
@@ -1820,7 +2057,7 @@ def build_dep() -> None:
     p.add_argument(
         '--platform',
         default=Options.platform,
-        choices='all macos linux linux-32 linux-arm64 linux-64'.split(),
+        choices='all macos linux linux-arm64 linux-64'.split(),
         help='Platforms to build the dep for'
     )
     p.add_argument(
@@ -1832,7 +2069,6 @@ def build_dep() -> None:
     args = p.parse_args(sys.argv[2:], namespace=Options())
     linux_platforms = [
         ['linux', '--arch=64'],
-        ['linux', '--arch=32'],
         ['linux', '--arch=arm64'],
     ]
     if args.platform == 'all':
@@ -1852,16 +2088,49 @@ def build_dep() -> None:
         run_tool(cmd)
 
 
-def main() -> None:
-    global verbose
-    if len(sys.argv) > 1 and sys.argv[1] == 'build-dep':
-        return build_dep()
-    args = option_parser().parse_args(namespace=Options())
-    if not is_macos:
-        args.build_universal_binary = False
-    verbose = args.verbose > 0
-    args.prefix = os.path.abspath(args.prefix)
-    os.chdir(src_base)
+def lipo(target_map: Dict[str, List[str]]) -> None:
+    print(f'Using lipo to generate {len(target_map)} universal binaries...')
+    for dest, inputs in target_map.items():
+        cmd = ['lipo', '-create', '-output', dest] + inputs
+        subprocess.check_call(cmd)
+        for x in inputs:
+            os.remove(x)
+
+
+def macos_freeze(args: Options, launcher_dir: str, only_frozen_launcher: bool = False) -> None:
+    global build_dir
+    # Need to build a universal binary in two stages
+    orig_build_dir = build_dir
+    link_target_map: Dict[str, List[str]] = {}
+    bundle_type = 'macos-freeze'
+    for arch in macos_universal_arches:
+        args.building_arch = arch
+        build_dir = os.path.join(orig_build_dir, arch)
+        os.makedirs(build_dir, exist_ok=True)
+        print('Building for arch:', arch, 'in', build_dir)
+        if arch is not macos_universal_arches[0]:
+            args.skip_code_generation = True  # cant run kitty as its not a native arch
+        link_targets.clear()
+        with CompilationDatabase() as cdb:
+            args.compilation_database = cdb
+            init_env_from_args(args, native_optimizations=False)
+            if only_frozen_launcher:
+                build_launcher(args, launcher_dir=launcher_dir, bundle_type=bundle_type)
+            else:
+                build_launcher(args, launcher_dir=launcher_dir)
+                build(args, native_optimizations=False, call_init=False)
+            cdb.build_all()
+        for x in link_targets:
+            arch_specific = x + '-' + arch
+            link_target_map.setdefault(x, []).append(arch_specific)
+            os.rename(x, arch_specific)
+    build_dir = orig_build_dir
+    lipo(link_target_map)
+    if not only_frozen_launcher:
+        package(args, bundle_type=bundle_type, do_build_all=False)
+
+
+def do_build(args: Options) -> None:
     launcher_dir = 'kitty/launcher'
 
     if args.action == 'test':
@@ -1870,6 +2139,11 @@ def main() -> None:
     if args.action == 'clean':
         clean(for_cross_compile=args.clean_for_cross_compile)
         return
+    if args.action == 'macos-freeze':
+        return macos_freeze(args, launcher_dir)
+    if args.action == 'build-frozen-launcher' and is_macos:
+        launcher_dir=os.path.join(args.prefix, 'bin')
+        return macos_freeze(args, launcher_dir, only_frozen_launcher=True)
 
     with CompilationDatabase(args.incremental) as cdb:
         args.compilation_database = cdb
@@ -1902,11 +2176,6 @@ def main() -> None:
         elif args.action == 'linux-freeze':
             build(args, native_optimizations=False)
             package(args, bundle_type='linux-freeze')
-        elif args.action == 'macos-freeze':
-            init_env_from_args(args, native_optimizations=False)
-            build_launcher(args, launcher_dir=launcher_dir)
-            build(args, native_optimizations=False, call_init=False)
-            package(args, bundle_type='macos-freeze')
         elif args.action == 'kitty.app':
             args.prefix = 'kitty.app'
             if os.path.exists(args.prefix):
@@ -1920,6 +2189,18 @@ def main() -> None:
             subprocess.check_call(cmd + ['macos'])
         elif args.action == 'build-static-binaries':
             build_static_binaries(args, launcher_dir)
+
+
+def main() -> None:
+    global verbose, build_dir
+    if len(sys.argv) > 1 and sys.argv[1] == 'build-dep':
+        return build_dep()
+    args = option_parser().parse_args(namespace=Options())
+    verbose = args.verbose > 0
+    args.prefix = os.path.abspath(args.prefix)
+    os.chdir(src_base)
+    os.makedirs(build_dir, exist_ok=True)
+    do_build(args)
 
 
 if __name__ == '__main__':

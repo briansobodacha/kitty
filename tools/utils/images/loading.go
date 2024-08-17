@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,8 +22,8 @@ import (
 	"kitty/tools/utils"
 	"kitty/tools/utils/shm"
 
-	"github.com/disintegration/imaging"
-	"golang.org/x/exp/slices"
+	"github.com/edwvee/exiffix"
+	"github.com/kovidgoyal/imaging"
 )
 
 var _ = fmt.Print
@@ -245,7 +246,7 @@ func OpenNativeImageFromReader(f io.ReadSeeker) (ans *ImageData, err error) {
 	if err != nil {
 		return nil, err
 	}
-	f.Seek(0, io.SeekStart)
+	_, _ = f.Seek(0, io.SeekStart)
 	ans = &ImageData{Width: c.Width, Height: c.Height, Format_uppercase: strings.ToUpper(fmt)}
 
 	if ans.Format_uppercase == "GIF" {
@@ -254,7 +255,7 @@ func OpenNativeImageFromReader(f io.ReadSeeker) (ans *ImageData, err error) {
 			return nil, err
 		}
 	} else {
-		img, err := imaging.Decode(f, imaging.AutoOrientation(true))
+		img, _, err := exiffix.Decode(f)
 		if err != nil {
 			return nil, err
 		}

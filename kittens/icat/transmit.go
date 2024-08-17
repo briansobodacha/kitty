@@ -11,7 +11,7 @@ import (
 	"io"
 	"kitty"
 	"math"
-	not_rand "math/rand"
+	not_rand "math/rand/v2"
 	"os"
 	"path/filepath"
 	"strings"
@@ -210,8 +210,8 @@ func calculate_in_cell_x_offset(width, cell_width int) int {
 }
 
 func place_cursor(imgd *image_data) {
-	cw := int(screen_size.Xpixel) / int(screen_size.Col)
-	ch := int(screen_size.Ypixel) / int(screen_size.Row)
+	cw := max(int(screen_size.Xpixel)/int(screen_size.Col), 1)
+	ch := max(int(screen_size.Ypixel)/int(screen_size.Row), 1)
 	imgd.cell_x_offset = calculate_in_cell_x_offset(imgd.canvas_width, cw)
 	imgd.width_cells = int(math.Ceil(float64(imgd.canvas_width) / float64(cw)))
 	imgd.height_cells = int(math.Ceil(float64(imgd.canvas_height) / float64(ch)))
@@ -278,7 +278,7 @@ func write_unicode_placeholder(imgd *image_data) {
 
 var seen_image_ids *utils.Set[uint32]
 
-func transmit_image(imgd *image_data) {
+func transmit_image(imgd *image_data, no_trailing_newline bool) {
 	if seen_image_ids == nil {
 		seen_image_ids = utils.NewSet[uint32](32)
 	}
@@ -406,7 +406,7 @@ func transmit_image(imgd *image_data) {
 			return
 		}
 	}
-	if imgd.move_to.x == 0 {
+	if imgd.move_to.x == 0 && !no_trailing_newline {
 		fmt.Println() // ensure cursor is on new line
 	}
 }

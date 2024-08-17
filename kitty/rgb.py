@@ -41,6 +41,17 @@ def parse_rgb(spec: str) -> Optional[Color]:
     return None
 
 
+def parse_single_intensity(x: str) -> int:
+    return int(max(0, min(abs(float(x)), 1)) * 255)
+
+
+def parse_rgbi(spec: str) -> Optional[Color]:
+    colors = spec.split('/')
+    if len(colors) == 3:
+        return Color(*map(parse_single_intensity, colors))
+    return None
+
+
 def color_from_int(x: int) -> Color:
     return Color((x >> 16) & 255, (x >> 8) & 255, x & 255)
 
@@ -67,10 +78,14 @@ def to_color(raw: str, validate: bool = False) -> Optional[Color]:
     with suppress(Exception):
         if raw.startswith('#'):
             val = parse_sharp(raw[1:])
-        elif raw.startswith('rgb:'):
-            val = parse_rgb(raw[4:])
+        else:
+            k, sep, v = raw.partition(':')
+            if k == 'rgb':
+                val = parse_rgb(v)
+            elif k == 'rgbi':
+                val = parse_rgbi(v)
     if val is None and validate:
-        raise ValueError(f'Invalid color name: {raw}')
+        raise ValueError(f'Invalid color name: {raw!r}')
     return val
 
 
@@ -830,27 +845,3 @@ color_names = {
  'yellow4': Color(139, 139, 0),
  'yellowgreen': Color(154, 205, 50)}
 # END_DATA_SECTION }}}
-
-if __name__ == '__main__':
-    # Read RGB color table from specified rgb.txt file
-    import pprint
-    import sys
-    data = {}
-    with open(sys.argv[-1]) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith('!'):
-                continue
-            parts = line.split()
-            r, g, b = map(int, parts[:3])
-            name = ' '.join(parts[3:]).lower()
-            data[name] = data[name.replace(' ', '')] = r, g, b
-    formatted_data = pprint.pformat(data).replace('{', '{\n ').replace('(', 'Color(')
-    with open(__file__, 'r+') as src:
-        raw = src.read()
-        raw = re.sub(
-            r'^# BEGIN_DATA_SECTION {{{$.*^# END_DATA_SECTION }}}',
-            '# BEGIN_DATA_SECTION {{{\ncolor_names = %s\n# END_DATA_SECTION }}}' % formatted_data,
-            raw, flags=re.DOTALL | re.MULTILINE
-        )
-        src.seek(0), src.truncate(), src.write(raw)

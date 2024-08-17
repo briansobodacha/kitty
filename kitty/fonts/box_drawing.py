@@ -7,10 +7,11 @@
 #
 
 import math
+from collections.abc import Iterable, Iterator, MutableSequence, Sequence
 from functools import lru_cache, wraps
 from functools import partial as p
 from itertools import repeat
-from typing import Any, Callable, Dict, Iterable, Iterator, List, MutableSequence, Optional, Sequence, Tuple
+from typing import Any, Callable, Literal, Optional
 
 scale = (0.001, 1., 1.5, 2.)
 _dpi = 96.0
@@ -27,9 +28,9 @@ def thickness(level: int = 1, horizontal: bool = True) -> int:
     return int(math.ceil(pts * (_dpi / 72.0)))
 
 
-def draw_hline(buf: BufType, width: int, x1: int, x2: int, y: int, level: int) -> None:
-    ' Draw a horizontal line between [x1, x2) centered at y with the thickness given by level '
-    sz = thickness(level=level, horizontal=False)
+def draw_hline(buf: BufType, width: int, x1: int, x2: int, y: int, level: int, supersample_factor: int = 1) -> None:
+    ' Draw a horizontal line between [x1, x2) centered at y with the thickness given by level and supersample factor '
+    sz = int(supersample_factor * thickness(level=level, horizontal=False))
     start = y - sz // 2
     for y in range(start, start + sz):
         offset = y * width
@@ -37,9 +38,9 @@ def draw_hline(buf: BufType, width: int, x1: int, x2: int, y: int, level: int) -
             buf[offset + x] = 255
 
 
-def draw_vline(buf: BufType, width: int, y1: int, y2: int, x: int, level: int) -> None:
-    ' Draw a vertical line between [y1, y2) centered at x with the thickness given by level '
-    sz = thickness(level=level, horizontal=True)
+def draw_vline(buf: BufType, width: int, y1: int, y2: int, x: int, level: int, supersample_factor: float = 1.0) -> None:
+    ' Draw a vertical line between [y1, y2) centered at x with the thickness given by level and supersample factor '
+    sz = int(supersample_factor * thickness(level=level, horizontal=True))
     start = x - sz // 2
     for x in range(start, start + sz):
         for y in range(y1, y2):
@@ -56,7 +57,7 @@ def half_vline(buf: BufType, width: int, height: int, level: int = 1, which: str
     draw_vline(buf, width, y1, y2, width // 2, level)
 
 
-def get_holes(sz: int, hole_sz: int, num: int) -> List[Tuple[int, ...]]:
+def get_holes(sz: int, hole_sz: int, num: int) -> list[tuple[int, ...]]:
     all_holes_use = (num + 1) * hole_sz
     individual_block_size = (sz - all_holes_use) // (num + 1)
     half_hole_sz = hole_sz // 2
@@ -144,7 +145,7 @@ def cross(buf: BufType, width: int, height: int, a: int = 1, b: int = 1, c: int 
 
 
 def downsample(src: BufType, dest: BufType, dest_width: int, dest_height: int, factor: int = 4) -> None:
-    src_width = 4 * dest_width
+    src_width = factor * dest_width
 
     def average_intensity_in_src(dest_x: int, dest_y: int) -> int:
         src_y = dest_y * factor
@@ -201,7 +202,7 @@ def line_equation(x1: int, y1: int, x2: int, y2: int) -> Callable[[int], float]:
 
 
 @supersampled()
-def triangle(buf: SSByteArray, width: int, height: int, left: bool = True) -> None:
+def triangle(buf: SSByteArray, width: int, height: int, left: bool = True, inverted: bool = False) -> None:
     ay1, by1, y2 = 0, height - 1, height // 2
     if left:
         x1, x2 = 0, width - 1
@@ -210,7 +211,7 @@ def triangle(buf: SSByteArray, width: int, height: int, left: bool = True) -> No
     uppery = line_equation(x1, ay1, x2, y2)
     lowery = line_equation(x1, by1, x2, y2)
     xlimits = [(uppery(x), lowery(x)) for x in range(width)]
-    fill_region(buf, width, height, xlimits)
+    fill_region(buf, width, height, xlimits, inverted)
 
 
 @supersampled()
@@ -256,7 +257,7 @@ def half_triangle(buf: SSByteArray, width: int, height: int, which: str = 'left'
     fill_region(buf, width, height, limits, inverted)
 
 
-def thick_line(buf: BufType, width: int, height: int, thickness_in_pixels: int, p1: Tuple[int, int], p2: Tuple[int, int]) -> None:
+def thick_line(buf: BufType, width: int, height: int, thickness_in_pixels: int, p1: tuple[int, int], p2: tuple[int, int]) -> None:
     if p1[0] > p2[0]:
         p1, p2 = p2, p1
     leq = line_equation(*p1, *p2)
@@ -278,6 +279,16 @@ def cross_line(buf: SSByteArray, width: int, height: int, left: bool = True, lev
     else:
         p1, p2 = (width - 1, 0), (0, height - 1)
     thick_line(buf, width, height, buf.supersample_factor * thickness(level), p1, p2)
+
+
+@supersampled()
+def cross_shade(buf: SSByteArray, width: int, height: int, rotate: bool = False, num_of_lines: int = 7) -> None:
+    line_thickness = max(buf.supersample_factor, width // num_of_lines)
+    delta = int(2 * line_thickness)
+    y1, y2 = (height, 0) if rotate else (0, height)
+    for x in range(0, width, delta):
+        thick_line(buf, width, height, line_thickness, (0 + x, y1), (width + x, y2))
+        thick_line(buf, width, height, line_thickness, (0 - x, y1), (width - x, y2))
 
 
 @supersampled()
@@ -303,7 +314,7 @@ def half_cross_line(buf: SSByteArray, width: int, height: int, which: str = 'tl'
 def mid_lines(buf: SSByteArray, width: int, height: int, level: int = 1, pts: Iterable[str] = ('lt',)) -> None:
     mid_x, mid_y = width // 2, height // 2
 
-    def pt_to_coords(p: str) -> Tuple[int, int]:
+    def pt_to_coords(p: str) -> tuple[int, int]:
         if p == 'l':
             return 0, mid_y
         if p == 't':
@@ -319,10 +330,45 @@ def mid_lines(buf: SSByteArray, width: int, height: int, level: int = 1, pts: It
         thick_line(buf, width, height, buf.supersample_factor * thickness(level), p1, p2)
 
 
+def get_fading_lines(total_length: int, num: int = 1, fade: str = 'right') -> Iterator[tuple[int, int]]:
+    if fade == 'left' or fade == 'up':
+        d1 = total_length
+        dir = -1
+    else:
+        d1 = 0
+        dir = 1
+
+    step = total_length // num
+
+    for i in range(num):
+        sz = step * (num - i) // (num + 1)
+        if sz >= step - 1 and step > 2:
+            sz = step - 2
+        d2 = d1 + dir * sz
+        yield (d1, d2) if d1 <= d2 else (d2, d1)
+        d1 += step * dir
+
+
+@supersampled()
+def fading_hline(buf: SSByteArray, width: int, height: int, level: int = 1, num: int = 1, fade: str = 'right') -> None:
+    factor = buf.supersample_factor
+    y = (height // 2 // factor) * factor
+    for x1, x2 in get_fading_lines(width, num, fade):
+        draw_hline(buf, width, x1, x2, y, level, supersample_factor = factor)
+
+
+@supersampled()
+def fading_vline(buf: SSByteArray, width: int, height: int, level: int = 1, num: int = 1, fade: str = 'down') -> None:
+    factor = buf.supersample_factor
+    x = (width // 2 // factor) * factor
+    for y1, y2 in get_fading_lines(height, num, fade):
+        draw_vline(buf, width, y1, y2, x, level, supersample_factor = factor)
+
+
 ParameterizedFunc = Callable[[float], float]
 
 
-def cubic_bezier(start: Tuple[int, int], end: Tuple[int, int], c1: Tuple[int, int], c2: Tuple[int, int]) -> Tuple[ParameterizedFunc, ParameterizedFunc]:
+def cubic_bezier(start: tuple[int, int], end: tuple[int, int], c1: tuple[int, int], c2: tuple[int, int]) -> tuple[ParameterizedFunc, ParameterizedFunc]:
 
     def bezier_eq(p0: int, p1: int, p2: int, p3: int) -> ParameterizedFunc:
 
@@ -352,7 +398,7 @@ def find_bezier_for_D(width: int, height: int) -> int:
         cx += 1
 
 
-def get_bezier_limits(bezier_x: ParameterizedFunc, bezier_y: ParameterizedFunc) -> Iterator[Tuple[float, float]]:
+def get_bezier_limits(bezier_x: ParameterizedFunc, bezier_y: ParameterizedFunc) -> Iterator[tuple[float, float]]:
     start_x = int(bezier_x(0))
     max_x = int(bezier_x(0.5))
     last_t, t_limit = 0., 0.5
@@ -433,10 +479,28 @@ def draw_parametrized_curve(
                         buf[pos] = min(255, buf[pos] + 255)
 
 
+def circle_equations(
+    origin_x: int = 0, origin_y: int = 0, radius: float = 10., # radius is in pixels as are origin co-ords
+    start_at: float = 0., end_at: float = 360.
+) -> tuple[ParameterizedFunc, ParameterizedFunc]:
+    conv = math.pi / 180.
+    start = start_at * conv
+    end = end_at * conv
+    amt = end - start
+
+    def x(t: float) -> float:
+        return origin_x + radius * math.cos(start + amt * t)
+
+    def y(t: float) -> float:
+        return origin_y + radius * math.sin(start + amt * t)
+
+    return x, y
+
+
 def rectircle_equations(
     cell_width: int, cell_height: int, supersample_factor: int,
     which: str = '╭'
-) -> Tuple[ParameterizedFunc, ParameterizedFunc]:
+) -> tuple[ParameterizedFunc, ParameterizedFunc]:
     '''
     Return two functions, x(t) and y(t) that map the parameter t which must be
     in the range [0, 1] to x and y coordinates in the cell. The rectircle equation
@@ -512,7 +576,47 @@ def rounded_separator(buf: SSByteArray, width: int, height: int, level: int = 1,
                 buf[offset + dest_x] = mbuf[offset + src_x]
 
 
-def half_dhline(buf: BufType, width: int, height: int, level: int = 1, which: str = 'left', only: Optional[str] = None) -> Tuple[int, int]:
+@supersampled()
+def spinner(buf: SSByteArray, width: int, height: int, level: int = 1, start: float = 0, end: float = 360) -> None:
+    w, h = width // 2, height // 2
+    radius = min(w, h) - int(thickness(level) * buf.supersample_factor) // 2
+    arc_x, arc_y = circle_equations(w, h, radius, start_at=start, end_at=end)
+    draw_parametrized_curve(buf, width, height, level, arc_x, arc_y)
+
+
+def draw_circle(buf: SSByteArray, width: int, height: int, scale: float = 1.0, gap: int = 0, invert: bool = False) -> None:
+    w, h = width // 2, height // 2
+    radius = int(scale * min(w, h) - gap / 2)
+    fill = 0 if invert else 255
+    for y in range(height):
+        for x in range(width):
+            if (x - w) ** 2 + (y - h) ** 2 <= radius ** 2:
+                buf[y * width + x] = fill
+
+
+@supersampled()
+def commit(buf: SSByteArray, width: int, height: int, level: int = 1, scale: float = 0.75, line: str = 'none', solid: bool = True) -> None:
+    ' Draw a circular commit with the given scale. Commits can either be solid or hollow and can have vertical, horizontal, up, down, left, or right line(s) '
+
+    factor = buf.supersample_factor
+    # Round half width/height to supersample factor to avoid misalignment with non-supersampled lines
+    hwidth, hheight = factor * (width // 2 // factor), factor * (height // 2 // factor)
+
+    if line == 'horizontal' or line == 'right':
+        draw_hline(buf, width, hwidth, width, hheight, level, supersample_factor=factor)
+    if line == 'horizontal' or line == 'left':
+        draw_hline(buf, width, 0, hwidth, hheight, level, supersample_factor=factor)
+    if line == 'vertical' or line == 'down':
+        draw_vline(buf, width, hheight, height, hwidth, level, supersample_factor=factor)
+    if line == 'vertical' or line == 'up':
+        draw_vline(buf, width, 0, hheight, hwidth, level, supersample_factor=factor)
+
+    draw_circle(buf, width, height, scale=scale)
+    if not solid:
+        draw_circle(buf, width, height, scale=scale, gap=thickness(level) * factor, invert=True)
+
+
+def half_dhline(buf: BufType, width: int, height: int, level: int = 1, which: str = 'left', only: Optional[str] = None) -> tuple[int, int]:
     x1, x2 = (0, width // 2) if which == 'left' else (width // 2, width)
     gap = thickness(level + 1, horizontal=False)
     if only != 'bottom':
@@ -522,7 +626,7 @@ def half_dhline(buf: BufType, width: int, height: int, level: int = 1, which: st
     return height // 2 - gap, height // 2 + gap
 
 
-def half_dvline(buf: BufType, width: int, height: int, level: int = 1, which: str = 'top', only: Optional[str] = None) -> Tuple[int, int]:
+def half_dvline(buf: BufType, width: int, height: int, level: int = 1, which: str = 'top', only: Optional[str] = None) -> tuple[int, int]:
     y1, y2 = (0, height // 2) if which == 'top' else (height // 2, height)
     gap = thickness(level + 1, horizontal=True)
     if only != 'right':
@@ -532,12 +636,12 @@ def half_dvline(buf: BufType, width: int, height: int, level: int = 1, which: st
     return width // 2 - gap, width // 2 + gap
 
 
-def dvline(buf: BufType, width: int, height: int, only: Optional[str] = None, level: int = 1) -> Tuple[int, int]:
+def dvline(buf: BufType, width: int, height: int, only: Optional[str] = None, level: int = 1) -> tuple[int, int]:
     half_dvline(buf, width, height, only=only, level=level)
     return half_dvline(buf, width, height, only=only, which='bottom', level=level)
 
 
-def dhline(buf: BufType, width: int, height: int, only: Optional[str] = None, level: int = 1) -> Tuple[int, int]:
+def dhline(buf: BufType, width: int, height: int, only: Optional[str] = None, level: int = 1) -> tuple[int, int]:
     half_dhline(buf, width, height, only=only, level=level)
     return half_dhline(buf, width, height, only=only, which='bottom', level=level)
 
@@ -613,22 +717,144 @@ def inner_corner(buf: BufType, width: int, height: int, which: str = 'tl', level
     draw_vline(buf, width, y1, y2, width // 2 + (xd * hgap), level)
 
 
-def shade(buf: BufType, width: int, height: int, light: bool = False, invert: bool = False) -> None:
-    square_sz = max(1, width // 12)
-    number_of_rows = height // square_sz
-    number_of_cols = width // square_sz
-    nums = range(square_sz)
+def shade(
+    buf: BufType, width: int, height: int, light: bool = False, invert: bool = False, which_half: str = '', fill_blank: bool = False,
+    xnum: int = 12, ynum: int = 0
+) -> None:
 
-    for r in range(number_of_rows):
-        for c in range(number_of_cols):
+    square_width = max(1, width // xnum)
+    square_height = max(1, (height // ynum) if ynum else square_width)
+    number_of_rows = height // square_height
+    number_of_cols = width // square_width
+
+    # Make sure the parity is correct
+    # (except when that would cause division by zero)
+    if number_of_cols > 1 and number_of_cols % 2 != xnum % 2:
+        number_of_cols -= 1
+    if number_of_rows > 1 and number_of_rows % 2 != ynum % 2:
+        number_of_rows -= 1
+
+    # Calculate how much space remains unused, and how frequently
+    # to insert an extra column/row to fill all of it
+    excess_cols = width - (square_width * number_of_cols)
+    square_width_extension = excess_cols / number_of_cols
+
+    excess_rows = height - (square_height * number_of_rows)
+    square_height_extension = excess_rows / number_of_rows
+
+    rows = range(number_of_rows)
+    cols = range(number_of_cols)
+    if which_half == 'top':
+        rows = range(number_of_rows // 2)
+        square_height_extension *= 2   # this is to remove gaps between half-filled characters
+    elif which_half == 'bottom':
+        rows = range(number_of_rows // 2, number_of_rows)
+        square_height_extension *= 2
+    elif which_half == 'left':
+        cols = range(number_of_cols // 2)
+        square_width_extension *= 2
+    elif which_half == 'right':
+        cols = range(number_of_cols // 2, number_of_cols)
+        square_width_extension *= 2
+
+    extra_row = False
+    ey, old_ey, drawn_rows = 0, 0, 0
+
+    for r in rows:
+        # Keep track of how much extra height has accumulated,
+        # and add an extra row at every passed integer, including 0
+        old_ey = ey
+        ey = math.ceil(drawn_rows * square_height_extension)
+        extra_row = ey != old_ey
+
+        drawn_rows += 1
+
+        extra_col = False
+        ex, old_ex, drawn_cols = 0, 0, 0
+
+        for c in cols:
+            old_ex = ex
+            ex = math.ceil(drawn_cols * square_width_extension)
+            extra_col = ex != old_ex
+
+            drawn_cols += 1
+
+            # Fill extra rows with semi-transparent pixels that match the pattern
+            if extra_row:
+                y = r * square_height + old_ey
+                offset = width * y
+                for xc in range(square_width):
+                    x = c * square_width + xc + ex
+                    if light:
+                        if invert:
+                            buf[offset + x] = 255 if c % 2 else 70
+                        else:
+                            buf[offset + x] = 0 if c % 2 else 70
+                    else:
+                        buf[offset + x] = 120 if c % 2 == invert else 30
+            # Do the same for the extra columns
+            if extra_col:
+                x = c * square_width + old_ex
+                for yr in range(square_height):
+                    y = r * square_height + yr + ey
+                    offset = width * y
+                    if light:
+                        if invert:
+                            buf[offset + x] = 255 if r % 2 else 70
+                        else:
+                            buf[offset + x] = 0 if r % 2 else 70
+                    else:
+                        buf[offset + x] = 120 if r % 2 == invert else 30
+            # And in case they intersect, set the corner pixel too
+            if extra_row and extra_col:
+                x = c * square_width + old_ex
+                y = r * square_height + old_ey
+                offset = width * y
+                buf[offset + x] = 50
+
+            # Blank space
             if invert ^ ((r % 2 != c % 2) or (light and r % 2 == 1)):
                 continue
-            for yr in nums:
-                y = r * square_sz + yr
+
+            # Fill the square
+            for yr in range(square_height):
+                y = r * square_height + yr + ey
                 offset = width * y
-                for xc in nums:
-                    x = c * square_sz + xc
+                for xc in range(square_width):
+                    x = c * square_width + xc + ex
                     buf[offset + x] = 255
+
+    if not fill_blank:
+        return
+    if which_half == 'bottom':
+        rows = range(height//2)
+        cols = range(width)
+    elif which_half == 'top':
+        rows = range(height//2 - 1, height)
+        cols = range(width)
+    elif which_half == 'right':
+        cols = range(width // 2)
+        rows = range(height)
+    elif which_half == 'left':
+        cols = range(width // 2 - 1, width)
+        rows = range(height)
+
+    for r in rows:
+        off = r * width
+        for c in cols:
+            buf[off + c] = 255
+
+
+def mask(
+    mask_func: Callable[[BufType, int, int], None], buf: BufType, width: int, height: int,
+) -> None:
+    m = bytearray(width * height)
+    mask_func(m, width, height)
+    for y in range(height):
+        offset = y * width
+        for x in range(width):
+            p = offset + x
+            buf[p] = int(255.0 * (buf[p] / 255.0 * m[p] / 255.0))
 
 
 def quad(buf: BufType, width: int, height: int, x: int = 0, y: int = 0) -> None:
@@ -676,7 +902,7 @@ def sextant(buf: BufType, width: int, height: int, level: int = 1, which: int = 
 @supersampled()
 def smooth_mosaic(
     buf: SSByteArray, width: int, height: int, level: int = 1,
-    lower: bool = True, a: Tuple[float, float] = (0, 0), b: Tuple[float, float] = (0, 0)
+    lower: bool = True, a: tuple[float, float] = (0, 0), b: tuple[float, float] = (0, 0)
 ) -> None:
     ax, ay = int(a[0] * (width - 1)), int(a[1] * (height - 1))
     bx, by = int(b[0] * (width - 1)), int(b[1] * (height - 1))
@@ -728,13 +954,64 @@ def eight_bar(buf: BufType, width: int, height: int, level: int = 1, which: int 
             buf[offset + x] = 255
 
 
-def eight_block(buf: BufType, width: int, height: int, level: int = 1, which: Tuple[int, ...] = (0,), horizontal: bool = False) -> None:
+def eight_block(buf: BufType, width: int, height: int, level: int = 1, which: tuple[int, ...] = (0,), horizontal: bool = False) -> None:
     for x in which:
         eight_bar(buf, width, height, level, x, horizontal)
 
 
+def frame(buf: BufType, width: int, height: int, edges: tuple[Literal['l', 'r', 't', 'b'], ...] = ('l', 'r', 't', 'b'), level: int = 0) -> None:
+    h = thickness(level=level, horizontal=True)
+    v = thickness(level=level, horizontal=False)
+
+    def line(x1: int, x2: int, y1: int, y2: int) -> None:
+        for y in range(y1, y2):
+            offset = y * width
+            for x in range(x1, x2):
+                buf[x + offset] = 255
+
+    def hline(y1: int, y2: int) -> None:
+        line(0, width, y1, y2)
+
+    def vline(x1: int, x2: int) -> None:
+        line(x1, x2, 0, height)
+
+    if 't' in edges:
+        hline(0, h + 1)
+    if 'b' in edges:
+        hline(height - h - 1, height)
+    if 'l' in edges:
+        vline(0, v + 1)
+    if 'r' in edges:
+        vline(width - v - 1, width)
+
+
+def progress_bar(buf: BufType, width: int, height: int, which: Literal['l', 'm', 'r'] = 'l', filled: bool = False, level: int = 1, gap_factor: int = 3) -> None:
+    if which == 'l':
+        frame(buf, width, height, edges=('l', 't', 'b'), level=level)
+    elif which == 'm':
+        frame(buf, width, height, edges=('t', 'b'), level=level)
+    else:
+        frame(buf, width, height, edges=('r', 't', 'b'), level=level)
+    if not filled:
+        return
+    h = thickness(level=level, horizontal=True)
+    v = thickness(level=level, horizontal=False)
+    y1 = gap_factor * h
+    y2 = height - gap_factor*h
+    if which == 'l':
+        x1, x2 = gap_factor * v, width
+    elif which == 'm':
+        x1, x2 = 0, width
+    else:
+        x1, x2 = 0, width - gap_factor*v
+    for y in range(y1, y2):
+        offset = y * width
+        for x in range(x1, x2):
+            buf[x + offset] = 255
+
+
 @lru_cache(maxsize=64)
-def distribute_dots(available_space: int, num_of_dots: int) -> Tuple[Tuple[int, ...], int]:
+def distribute_dots(available_space: int, num_of_dots: int) -> tuple[tuple[int, ...], int]:
     dot_size = max(1, available_space // (2 * num_of_dots))
     extra = available_space - 2 * num_of_dots * dot_size
     gaps = list(repeat(dot_size, num_of_dots))
@@ -772,7 +1049,7 @@ def braille(buf: BufType, width: int, height: int, which: int = 0) -> None:
             braille_dot(buf, width, height, col, row)
 
 
-box_chars: Dict[str, List[Callable[[BufType, int, int], Any]]] = {
+box_chars: dict[str, list[Callable[[BufType, int, int], Any]]] = {
     '─': [hline],
     '━': [p(hline, level=3)],
     '│': [vline],
@@ -802,21 +1079,48 @@ box_chars: Dict[str, List[Callable[[BufType, int, int], Any]]] = {
     '╾': [p(half_hline, level=3), p(half_hline, which='right')],
     '╿': [p(half_vline, level=3), p(half_vline, which='bottom')],
     '': [triangle],
+    '': [p(triangle, inverted=True)],
     '': [p(half_cross_line, which='tl'), p(half_cross_line, which='bl')],
     '': [p(triangle, left=False)],
+    '': [p(triangle, left=False, inverted=True)],
     '': [p(half_cross_line, which='tr'), p(half_cross_line, which='br')],
     '': [D],
+    '◗': [D],
     '': [rounded_separator],
     '': [p(D, left=False)],
+    '◖': [p(D, left=False)],
     '': [p(rounded_separator, left=False)],
     '': [p(corner_triangle, corner='bottom-left')],
+    '◣': [p(corner_triangle, corner='bottom-left')],
     '': [cross_line],
     '': [p(corner_triangle, corner='bottom-right')],
+    '◢': [p(corner_triangle, corner='bottom-right')],
     '': [p(cross_line, left=False)],
     '': [p(corner_triangle, corner='top-left')],
+    '◤': [p(corner_triangle, corner='top-left')],
     '': [p(cross_line, left=False)],
     '': [p(corner_triangle, corner='top-right')],
+    '◥': [p(corner_triangle, corner='top-right')],
     '': [cross_line],
+    '': [p(progress_bar, which='l')],
+    '': [p(progress_bar, which='m')],
+    '': [p(progress_bar, which='r')],
+    '': [p(progress_bar, which='l', filled=True)],
+    '': [p(progress_bar, which='m', filled=True)],
+    '': [p(progress_bar, which='r', filled=True)],
+    '': [p(spinner, start=235, end=305)],
+    '': [p(spinner, start=270, end=390)],
+    '': [p(spinner, start=315, end=470)],
+    '': [p(spinner, start=360, end=540)],
+    '': [p(spinner, start=80, end=220)],
+    '': [p(spinner, start=170, end=270)],
+    '○': [p(spinner, start=0, end=360, level=0)],    # circle
+    '◜': [p(spinner, start=180, end=270)],  # upper-left
+    '◝': [p(spinner, start=270, end=360)],  # upper-right
+    '◞': [p(spinner, start=360, end=450)],  # lower-right
+    '◟': [p(spinner, start=450, end=540)],  # lower-left
+    '◠': [p(spinner, start=180, end=360)],  # upper-half
+    '◡': [p(spinner, start=0, end=180)],    # lower-half
     '═': [dhline],
     '║': [dvline],
 
@@ -862,10 +1166,29 @@ box_chars: Dict[str, List[Callable[[BufType, int, int], Any]]] = {
     '▎': [p(eight_block, which=(0, 1))],
     '▏': [p(eight_bar)],
     '▐': [p(eight_block, which=(4, 5, 6, 7))],
+
     '░': [p(shade, light=True)],
     '▒': [shade],
     '▓': [p(shade, light=True, invert=True)],
+    '🮌': [p(shade, which_half='left')],
+    '🮍': [p(shade, which_half='right')],
+    '🮎': [p(shade, which_half='top')],
+    '🮏': [p(shade, which_half='bottom')],
     '🮐': [p(shade, invert=True)],
+    '🮑': [p(shade, which_half='bottom', invert=True, fill_blank=True)],
+    '🮒': [p(shade, which_half='top', invert=True, fill_blank=True)],
+    '🮓': [p(shade, which_half='right', invert=True, fill_blank=True)],
+    '🮔': [p(shade, which_half='left', invert=True, fill_blank=True)],
+    '🮕': [p(shade, xnum=4, ynum=4)],
+    '🮖': [p(shade, xnum=4, ynum=4, invert=True)],
+    '🮗': [p(shade, xnum=1, ynum=4, invert=True)],
+    '🮜': [shade, p(mask, p(corner_triangle, corner='top-left'))],
+    '🮝': [shade, p(mask, p(corner_triangle, corner='top-right'))],
+    '🮞': [shade, p(mask, p(corner_triangle, corner='bottom-right'))],
+    '🮟': [shade, p(mask, p(corner_triangle, corner='bottom-left'))],
+    '🮘': [cross_shade],
+    '🮙': [p(cross_shade, rotate=True)],
+
     '▔': [p(eight_bar, horizontal=True)],
     '▕': [p(eight_bar, which=7)],
     '▖': [p(quad, y=1)],
@@ -879,66 +1202,68 @@ box_chars: Dict[str, List[Callable[[BufType, int, int], Any]]] = {
     '▞': [p(quad, x=1), p(quad, y=1)],
     '▟': [p(quad, x=1), p(quad, y=1), p(quad, x=1, y=1)],
 
-    '🬼': [p(smooth_mosaic, a=(0, 0.75), b=(0.5, 1))],
-    '🬽': [p(smooth_mosaic, a=(0, 0.75), b=(1, 1))],
-    '🬾': [p(smooth_mosaic, a=(0, 0.25), b=(0.5, 1))],
-    '🬿': [p(smooth_mosaic, a=(0, 0.25), b=(1, 1))],
+    '🬼': [p(smooth_mosaic, a=(0, 2 / 3), b=(0.5, 1))],
+    '🬽': [p(smooth_mosaic, a=(0, 2 / 3), b=(1, 1))],
+    '🬾': [p(smooth_mosaic, a=(0, 1 / 3), b=(0.5, 1))],
+    '🬿': [p(smooth_mosaic, a=(0, 1 / 3), b=(1, 1))],
     '🭀': [p(smooth_mosaic, a=(0, 0), b=(0.5, 1))],
 
-    '🭁': [p(smooth_mosaic, a=(0, 0.25), b=(0.5, 0))],
-    '🭂': [p(smooth_mosaic, a=(0, 0.25), b=(1, 0))],
-    '🭃': [p(smooth_mosaic, a=(0, 0.75), b=(0.5, 0))],
-    '🭄': [p(smooth_mosaic, a=(0, 0.75), b=(1, 0))],
+    '🭁': [p(smooth_mosaic, a=(0, 1 / 3), b=(0.5, 0))],
+    '🭂': [p(smooth_mosaic, a=(0, 1 / 3), b=(1, 0))],
+    '🭃': [p(smooth_mosaic, a=(0, 2 / 3), b=(0.5, 0))],
+    '🭄': [p(smooth_mosaic, a=(0, 2 / 3), b=(1, 0))],
     '🭅': [p(smooth_mosaic, a=(0, 1), b=(0.5, 0))],
-    '🭆': [p(smooth_mosaic, a=(0, 0.75), b=(1, 0.25))],
+    '🭆': [p(smooth_mosaic, a=(0, 2 / 3), b=(1, 1 / 3))],
 
-    '🭇': [p(smooth_mosaic, a=(0.5, 1), b=(1, 0.75))],
-    '🭈': [p(smooth_mosaic, a=(0, 1), b=(1, 0.75))],
-    '🭉': [p(smooth_mosaic, a=(0.5, 1), b=(1, 0.25))],
-    '🭊': [p(smooth_mosaic, a=(0, 1), b=(1, 0.25))],
+    '🭇': [p(smooth_mosaic, a=(0.5, 1), b=(1, 2 / 3))],
+    '🭈': [p(smooth_mosaic, a=(0, 1), b=(1, 2 / 3))],
+    '🭉': [p(smooth_mosaic, a=(0.5, 1), b=(1, 1 / 3))],
+    '🭊': [p(smooth_mosaic, a=(0, 1), b=(1, 1 / 3))],
     '🭋': [p(smooth_mosaic, a=(0.5, 1), b=(1, 0))],
 
-    '🭌': [p(smooth_mosaic, a=(0.5, 0), b=(1, 0.25))],
-    '🭍': [p(smooth_mosaic, a=(0, 0), b=(1, 0.25))],
-    '🭎': [p(smooth_mosaic, a=(0.5, 0), b=(1, 0.75))],
-    '🭏': [p(smooth_mosaic, a=(0, 0), b=(1, 0.75))],
+    '🭌': [p(smooth_mosaic, a=(0.5, 0), b=(1, 1 / 3))],
+    '🭍': [p(smooth_mosaic, a=(0, 0), b=(1, 1 / 3))],
+    '🭎': [p(smooth_mosaic, a=(0.5, 0), b=(1, 2 / 3))],
+    '🭏': [p(smooth_mosaic, a=(0, 0), b=(1, 2 / 3))],
     '🭐': [p(smooth_mosaic, a=(0.5, 0), b=(1, 1))],
-    '🭑': [p(smooth_mosaic, a=(0, 0.25), b=(1, 0.75))],
+    '🭑': [p(smooth_mosaic, a=(0, 1 / 3), b=(1, 2 / 3))],
 
-    '🭒': [p(smooth_mosaic, lower=False, a=(0, 0.75), b=(0.5, 1))],
-    '🭓': [p(smooth_mosaic, lower=False, a=(0, 0.75), b=(1, 1))],
-    '🭔': [p(smooth_mosaic, lower=False, a=(0, 0.25), b=(0.5, 1))],
-    '🭕': [p(smooth_mosaic, lower=False, a=(0, 0.25), b=(1, 1))],
+    '🭒': [p(smooth_mosaic, lower=False, a=(0, 2 / 3), b=(0.5, 1))],
+    '🭓': [p(smooth_mosaic, lower=False, a=(0, 2 / 3), b=(1, 1))],
+    '🭔': [p(smooth_mosaic, lower=False, a=(0, 1 / 3), b=(0.5, 1))],
+    '🭕': [p(smooth_mosaic, lower=False, a=(0, 1 / 3), b=(1, 1))],
     '🭖': [p(smooth_mosaic, lower=False, a=(0, 0), b=(0.5, 1))],
 
-    '🭗': [p(smooth_mosaic, lower=False, a=(0, 0.25), b=(0.5, 0))],
-    '🭘': [p(smooth_mosaic, lower=False, a=(0, 0.25), b=(1, 0))],
-    '🭙': [p(smooth_mosaic, lower=False, a=(0, 0.75), b=(0.5, 0))],
-    '🭚': [p(smooth_mosaic, lower=False, a=(0, 0.75), b=(1, 0))],
+    '🭗': [p(smooth_mosaic, lower=False, a=(0, 1 / 3), b=(0.5, 0))],
+    '🭘': [p(smooth_mosaic, lower=False, a=(0, 1 / 3), b=(1, 0))],
+    '🭙': [p(smooth_mosaic, lower=False, a=(0, 2 / 3), b=(0.5, 0))],
+    '🭚': [p(smooth_mosaic, lower=False, a=(0, 2 / 3), b=(1, 0))],
     '🭛': [p(smooth_mosaic, lower=False, a=(0, 1), b=(0.5, 0))],
 
-    '🭜': [p(smooth_mosaic, lower=False, a=(0, 0.75), b=(1, 0.25))],
-    '🭝': [p(smooth_mosaic, lower=False, a=(0.5, 1), b=(1, 0.75))],
-    '🭞': [p(smooth_mosaic, lower=False, a=(0, 1), b=(1, 0.75))],
-    '🭟': [p(smooth_mosaic, lower=False, a=(0.5, 1), b=(1, 0.25))],
-    '🭠': [p(smooth_mosaic, lower=False, a=(0, 1), b=(1, 0.25))],
+    '🭜': [p(smooth_mosaic, lower=False, a=(0, 2 / 3), b=(1, 1 / 3))],
+    '🭝': [p(smooth_mosaic, lower=False, a=(0.5, 1), b=(1, 2 / 3))],
+    '🭞': [p(smooth_mosaic, lower=False, a=(0, 1), b=(1, 2 / 3))],
+    '🭟': [p(smooth_mosaic, lower=False, a=(0.5, 1), b=(1, 1 / 3))],
+    '🭠': [p(smooth_mosaic, lower=False, a=(0, 1), b=(1, 1 / 3))],
     '🭡': [p(smooth_mosaic, lower=False, a=(0.5, 1), b=(1, 0))],
 
-    '🭢': [p(smooth_mosaic, lower=False, a=(0.5, 0), b=(1, 0.25))],
-    '🭣': [p(smooth_mosaic, lower=False, a=(0, 0), b=(1, 0.25))],
-    '🭤': [p(smooth_mosaic, lower=False, a=(0.5, 0), b=(1, 0.75))],
-    '🭥': [p(smooth_mosaic, lower=False, a=(0, 0), b=(1, 0.75))],
+    '🭢': [p(smooth_mosaic, lower=False, a=(0.5, 0), b=(1, 1 / 3))],
+    '🭣': [p(smooth_mosaic, lower=False, a=(0, 0), b=(1, 1 / 3))],
+    '🭤': [p(smooth_mosaic, lower=False, a=(0.5, 0), b=(1, 2 / 3))],
+    '🭥': [p(smooth_mosaic, lower=False, a=(0, 0), b=(1, 2 / 3))],
     '🭦': [p(smooth_mosaic, lower=False, a=(0.5, 0), b=(1, 1))],
-    '🭧': [p(smooth_mosaic, lower=False, a=(0, 0.25), b=(1, 0.75))],
+    '🭧': [p(smooth_mosaic, lower=False, a=(0, 1 / 3), b=(1, 2 / 3))],
 
     '🭨': [p(half_triangle, inverted=True)],
     '🭩': [p(half_triangle, which='top', inverted=True)],
     '🭪': [p(half_triangle, which='right', inverted=True)],
     '🭫': [p(half_triangle, which='bottom', inverted=True)],
     '🭬': [half_triangle],
+    '🮛': [half_triangle, p(half_triangle, which='right')],
     '🭭': [p(half_triangle, which='top')],
     '🭮': [p(half_triangle, which='right')],
     '🭯': [p(half_triangle, which='bottom')],
+    '🮚': [p(half_triangle, which='bottom'), p(half_triangle, which='top')],
 
     '🭼': [eight_bar, p(eight_bar, which=7, horizontal=True)],
     '🭽': [eight_bar, p(eight_bar, horizontal=True)],
@@ -974,6 +1299,51 @@ box_chars: Dict[str, List[Callable[[BufType, int, int], Any]]] = {
     '🮬': [p(mid_lines, pts=('rt', 'lt', 'rb'))],
     '🮭': [p(mid_lines, pts=('rt', 'lt', 'lb'))],
     '🮮': [p(mid_lines, pts=('rt', 'rb', 'lt', 'lb'))],
+
+    '': [hline],
+    '': [vline],
+    '': [p(fading_hline, num=4, fade='right')],
+    '': [p(fading_hline, num=4, fade='left')],
+    '': [p(fading_vline, num=5, fade='down')],
+    '': [p(fading_vline, num=5, fade='up')],
+    '': [p(rounded_corner, which='╭')],
+    '': [p(rounded_corner, which='╮')],
+    '': [p(rounded_corner, which='╰')],
+    '': [p(rounded_corner, which='╯')],
+    '': [vline, p(rounded_corner, which='╰')],
+    '': [vline, p(rounded_corner, which='╭')],
+    '': [p(rounded_corner, which='╰'), p(rounded_corner, which='╭')],
+    '': [vline, p(rounded_corner, which='╯')],
+    '': [vline, p(rounded_corner, which='╮')],
+    '': [p(rounded_corner, which='╮'), p(rounded_corner, which='╯')],
+    '': [hline, p(rounded_corner, which='╮')],
+    '': [hline, p(rounded_corner, which='╭')],
+    '': [p(rounded_corner, which='╭'), p(rounded_corner, which='╮')],
+    '': [hline, p(rounded_corner, which='╯')],
+    '': [hline, p(rounded_corner, which='╰')],
+    '': [p(rounded_corner, which='╰'), p(rounded_corner, which='╯')],
+    '': [vline, p(rounded_corner, which='╰'), p(rounded_corner, which='╯')],
+    '': [vline, p(rounded_corner, which='╭'), p(rounded_corner, which='╮')],
+    '': [hline, p(rounded_corner, which='╮'), p(rounded_corner, which='╯')],
+    '': [hline, p(rounded_corner, which='╰'), p(rounded_corner, which='╭')],
+    '': [vline, p(rounded_corner, which='╭'), p(rounded_corner, which='╯')],
+    '': [vline, p(rounded_corner, which='╮'), p(rounded_corner, which='╰')],
+    '': [hline, p(rounded_corner, which='╭'), p(rounded_corner, which='╯')],
+    '': [hline, p(rounded_corner, which='╮'), p(rounded_corner, which='╰')],
+    '': [commit],
+    '': [p(commit, solid=False)],
+    '': [p(commit, line='right')],
+    '': [p(commit, solid=False, line='right')],
+    '': [p(commit, line='left')],
+    '': [p(commit, solid=False, line='left')],
+    '': [p(commit, line='horizontal')],
+    '': [p(commit, solid=False, line='horizontal')],
+    '': [p(commit, line='down')],
+    '': [p(commit, solid=False, line='down')],
+    '': [p(commit, line='up')],
+    '': [p(commit, solid=False, line='up')],
+    '': [p(commit, line='vertical')],
+    '': [p(commit, solid=False, line='vertical')],
 }
 
 t, f = 1, 3
@@ -1026,12 +1396,7 @@ def render_box_char(ch: str, buf: BufType, width: int, height: int, dpi: float =
 
 
 def render_missing_glyph(buf: BufType, width: int, height: int) -> None:
-    hgap = thickness(level=0, horizontal=True) + 1
-    vgap = thickness(level=0, horizontal=False) + 1
-    draw_hline(buf, width, hgap, width - hgap + 1, vgap, 0)
-    draw_hline(buf, width, hgap, width - hgap + 1, height - vgap, 0)
-    draw_vline(buf, width, vgap, height - vgap + 1, hgap, 0)
-    draw_vline(buf, width, vgap, height - vgap + 1, width - hgap, 0)
+    frame(buf, width, height)
 
 
 def test_char(ch: str, sz: int = 48) -> None:

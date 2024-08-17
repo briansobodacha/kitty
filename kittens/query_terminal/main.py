@@ -5,14 +5,11 @@ import re
 import sys
 from binascii import hexlify, unhexlify
 from contextlib import suppress
-from typing import Dict, Iterable, List, Optional, Type
+from typing import Dict, Optional, Type
 
-from kitty.cli import parse_args
-from kitty.cli_stub import QueryTerminalCLIOptions
 from kitty.constants import appname, str_version
 from kitty.options.types import Options
 from kitty.terminfo import names
-from kitty.utils import TTYIO
 
 
 class Query:
@@ -50,7 +47,7 @@ class Query:
         return self.ans
 
     @staticmethod
-    def get_result(opts: Options) -> str:
+    def get_result(opts: Options, window_id: int, os_window_id: int) -> str:
         raise NotImplementedError()
 
 
@@ -69,7 +66,7 @@ class TerminalName(Query):
     help_text: str = f'Terminal name (e.g. :code:`{names[0]}`)'
 
     @staticmethod
-    def get_result(opts: Options) -> str:
+    def get_result(opts: Options, window_id: int, os_window_id: int) -> str:
         return appname
 
 
@@ -79,7 +76,7 @@ class TerminalVersion(Query):
     help_text: str = f'Terminal version (e.g. :code:`{str_version}`)'
 
     @staticmethod
-    def get_result(opts: Options) -> str:
+    def get_result(opts: Options, window_id: int, os_window_id: int) -> str:
         return str_version
 
 
@@ -89,7 +86,7 @@ class AllowHyperlinks(Query):
     help_text: str = 'The config option :opt:`allow_hyperlinks` in :file:`kitty.conf` for allowing hyperlinks can be :code:`yes`, :code:`no` or :code:`ask`'
 
     @staticmethod
-    def get_result(opts: Options) -> str:
+    def get_result(opts: Options, window_id: int, os_window_id: int) -> str:
         return 'ask' if opts.allow_hyperlinks == 0b11 else ('yes' if opts.allow_hyperlinks else 'no')
 
 
@@ -99,10 +96,10 @@ class FontFamily(Query):
     help_text: str = 'The current font\'s PostScript name'
 
     @staticmethod
-    def get_result(opts: Options) -> str:
+    def get_result(opts: Options, window_id: int, os_window_id: int) -> str:
         from kitty.fast_data_types import current_fonts
-        cf = current_fonts()
-        return str(cf['medium'].display_name())
+        cf = current_fonts(os_window_id)
+        return cf['medium'].postscript_name()
 
 
 @query
@@ -111,10 +108,10 @@ class BoldFont(Query):
     help_text: str = 'The current bold font\'s PostScript name'
 
     @staticmethod
-    def get_result(opts: Options) -> str:
+    def get_result(opts: Options, window_id: int, os_window_id: int) -> str:
         from kitty.fast_data_types import current_fonts
-        cf = current_fonts()
-        return str(cf['bold'].display_name())
+        cf = current_fonts(os_window_id)
+        return cf['bold'].postscript_name()
 
 
 @query
@@ -123,10 +120,10 @@ class ItalicFont(Query):
     help_text: str = 'The current italic font\'s PostScript name'
 
     @staticmethod
-    def get_result(opts: Options) -> str:
+    def get_result(opts: Options, window_id: int, os_window_id: int) -> str:
         from kitty.fast_data_types import current_fonts
-        cf = current_fonts()
-        return str(cf['italic'].display_name())
+        cf = current_fonts(os_window_id)
+        return cf['italic'].postscript_name()
 
 
 @query
@@ -135,20 +132,88 @@ class BiFont(Query):
     help_text: str = 'The current bold-italic font\'s PostScript name'
 
     @staticmethod
-    def get_result(opts: Options) -> str:
+    def get_result(opts: Options, window_id: int, os_window_id: int) -> str:
         from kitty.fast_data_types import current_fonts
-        cf = current_fonts()
-        return str(cf['bi'].display_name())
+        cf = current_fonts(os_window_id)
+        return cf['bi'].postscript_name()
 
 
 @query
 class FontSize(Query):
     name: str = 'font_size'
-    help_text: str = 'The current overall font size (individual windows can have different per window font sizes)'
+    help_text: str = 'The current font size in pts'
 
     @staticmethod
-    def get_result(opts: Options) -> str:
-        return f'{opts.font_size:g}'
+    def get_result(opts: Options, window_id: int, os_window_id: int) -> str:
+        from kitty.fast_data_types import current_fonts
+        cf = current_fonts(os_window_id)
+        return f'{cf["font_sz_in_pts"]:g}'
+
+@query
+class DpiX(Query):
+    name: str = 'dpi_x'
+    help_text: str = 'The current DPI on the x-axis'
+
+    @staticmethod
+    def get_result(opts: Options, window_id: int, os_window_id: int) -> str:
+        from kitty.fast_data_types import current_fonts
+        cf = current_fonts(os_window_id)
+        return f'{cf["logical_dpi_x"]:g}'
+
+@query
+class DpiY(Query):
+    name: str = 'dpi_y'
+    help_text: str = 'The current DPI on the y-axis'
+
+    @staticmethod
+    def get_result(opts: Options, window_id: int, os_window_id: int) -> str:
+        from kitty.fast_data_types import current_fonts
+        cf = current_fonts(os_window_id)
+        return f'{cf["logical_dpi_y"]:g}'
+
+
+@query
+class Foreground(Query):
+    name: str = 'foreground'
+    help_text: str = 'The current foreground color as a 24-bit # color code'
+
+    @staticmethod
+    def get_result(opts: Options, window_id: int, os_window_id: int) -> str:
+        from kitty.fast_data_types import get_boss, get_options
+        boss = get_boss()
+        w = boss.window_id_map.get(window_id)
+        if w is None:
+            return opts.foreground.as_sharp
+        return (w.screen.color_profile.default_fg or get_options().foreground).as_sharp
+
+
+@query
+class Background(Query):
+    name: str = 'background'
+    help_text: str = 'The current background color as a 24-bit # color code'
+
+    @staticmethod
+    def get_result(opts: Options, window_id: int, os_window_id: int) -> str:
+        from kitty.fast_data_types import get_boss, get_options
+        boss = get_boss()
+        w = boss.window_id_map.get(window_id)
+        if w is None:
+            return opts.background.as_sharp
+        return (w.screen.color_profile.default_bg or get_options().background).as_sharp
+
+
+@query
+class BackgroundOpacity(Query):
+    name: str = 'background_opacity'
+    help_text: str = 'The current background opacity as a number between 0 and 1'
+
+    @staticmethod
+    def get_result(opts: Options, window_id: int, os_window_id: int) -> str:
+        from kitty.fast_data_types import background_opacity_of
+        ans = background_opacity_of(os_window_id)
+        if ans is None:
+            ans = 1.0
+        return f'{ans:g}'
 
 
 @query
@@ -157,41 +222,16 @@ class ClipboardControl(Query):
     help_text: str = 'The config option :opt:`clipboard_control` in :file:`kitty.conf` for allowing reads/writes to/from the clipboard'
 
     @staticmethod
-    def get_result(opts: Options) -> str:
+    def get_result(opts: Options, window_id: int, os_window_id: int) -> str:
         return ' '.join(opts.clipboard_control)
 
 
-def get_result(name: str) -> Optional[str]:
+def get_result(name: str, window_id: int, os_window_id: int) -> Optional[str]:
     from kitty.fast_data_types import get_options
     q = all_queries.get(name)
     if q is None:
         return None
-    return q.get_result(get_options())
-
-
-def do_queries(queries: Iterable[str], cli_opts: QueryTerminalCLIOptions) -> Dict[str, str]:
-    actions = tuple(all_queries[x]() for x in queries)
-    qstring = ''.join(a.query_code() for a in actions)
-    received = b''
-    pat = re.compile(rb'\x1b\[\?.+?c')
-
-    def more_needed(data: bytes) -> bool:
-        nonlocal received
-        received += data
-        has_da1_response = pat.search(received) is not None
-        if has_da1_response:
-            return False
-        for a in actions:
-            if a.more_needed(received):
-                return True
-        return has_da1_response
-
-    with TTYIO() as ttyio:
-        ttyio.send(qstring)
-        ttyio.send('\x1b[c')  # DA1 query https://vt100.net/docs/vt510-rm/DA1.html
-        ttyio.recv(more_needed, timeout=cli_opts.wait_for)
-
-    return {a.name: a.output_line() for a in actions}
+    return q.get_result(get_options(), window_id, os_window_id)
 
 
 def options_spec() -> str:
@@ -230,29 +270,8 @@ Available queries are:
 usage = '[query1 query2 ...]'
 
 
-def main(args: List[str] = sys.argv) -> None:
-    cli_opts, items_ = parse_args(
-        args[1:],
-        options_spec,
-        usage,
-        help_text,
-        f'{appname} +kitten query_terminal',
-        result_class=QueryTerminalCLIOptions
-    )
-    queries: List[str] = list(items_)
-    if 'all' in queries or not queries:
-        queries = sorted(all_queries)
-    else:
-        extra = frozenset(queries) - frozenset(all_queries)
-        if extra:
-            raise SystemExit(f'Unknown queries: {", ".join(extra)}')
-
-    for key, val in do_queries(queries, cli_opts).items():
-        print(f'{key}:', val)
-
-
 if __name__ == '__main__':
-    main()
+    raise SystemExit('Should be run as kitten hints')
 elif __name__ == '__doc__':
     cd = sys.cli_docs  # type: ignore
     cd['usage'] = usage

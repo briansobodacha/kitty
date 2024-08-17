@@ -2,18 +2,166 @@
 # License: GPL v3 Copyright: 2017, Kovid Goyal <kovid at kovidgoyal.net>
 
 import os
-import shutil
-import sys
 import tempfile
 import unittest
 from functools import partial
 
 from kitty.constants import is_macos, read_kitty_resource
-from kitty.fast_data_types import DECAWM, get_fallback_font, sprite_map_set_layout, sprite_map_set_limits, test_render_line, test_sprite_position_for, wcwidth
+from kitty.fast_data_types import (
+    DECAWM,
+    ParsedFontFeature,
+    get_fallback_font,
+    sprite_map_set_layout,
+    sprite_map_set_limits,
+    test_render_line,
+    test_sprite_position_for,
+    wcwidth,
+)
+from kitty.fonts import family_name_to_key
 from kitty.fonts.box_drawing import box_chars
+from kitty.fonts.common import FontSpec, all_fonts_map, face_from_descriptor, get_font_files, get_named_style, spec_for_face
 from kitty.fonts.render import coalesce_symbol_maps, render_string, setup_for_testing, shape_string
+from kitty.options.types import Options
 
 from . import BaseTest
+
+
+def parse_font_spec(spec):
+    return FontSpec.from_setting(spec)
+
+
+class Selection(BaseTest):
+
+    def test_font_selection(self):
+        self.set_options({'font_features': {'LiberationMono': (ParsedFontFeature('-dlig'),)}})
+        opts = Options()
+        fonts_map = all_fonts_map(True)
+        names = set(fonts_map['family_map']) | set(fonts_map['variable_map'])
+        del fonts_map
+
+        def s(family: str, *expected: str, alternate=None) -> None:
+            opts.font_family = parse_font_spec(family)
+            ff = get_font_files(opts)
+            actual = tuple(face_from_descriptor(ff[x]).postscript_name() for x in ('medium', 'bold', 'italic', 'bi'))  # type: ignore
+            del ff
+            for x in actual:
+                if '/' in x:  # Old FreeType failed to generate postscript name for a variable font probably
+                    return
+            with self.subTest(spec=family):
+                try:
+                    self.ae(expected, actual)
+                except AssertionError:
+                    if alternate:
+                        self.ae(alternate, actual)
+                    else:
+                        raise
+
+        def both(family: str, *expected: str, alternate=None) -> None:
+            for family in (family, f'family="{family}"'):
+                s(family, *expected, alternate=alternate)
+
+        def has(family, allow_missing_in_ci=False):
+            ans = family_name_to_key(family) in names
+            if self.is_ci and not allow_missing_in_ci and not ans:
+                raise AssertionError(f'The family: {family} is not available')
+            return ans
+
+        def t(family, psprefix, bold='Bold', italic='Italic', bi='', reg='Regular', allow_missing_in_ci=False, alternate=None):
+            if has(family, allow_missing_in_ci=allow_missing_in_ci):
+                bi = bi or bold + italic
+                if reg:
+                    reg = '-' + reg
+                both(family, f'{psprefix}{reg}', f'{psprefix}-{bold}', f'{psprefix}-{italic}', f'{psprefix}-{bi}', alternate=alternate)
+
+        t('Source Code Pro', 'SourceCodePro', 'Semibold', 'It')
+        t('sourcecodeVf', 'SourceCodeVF', 'Semibold')
+
+        # The Arch ttf-fira-code package excludes the variable fonts for some reason
+        t('fira code', 'FiraCodeRoman', 'SemiBold', 'Regular', 'SemiBold', alternate=(
+            'FiraCode-Regular', 'FiraCode-SemiBold', 'FiraCode-Retina', 'FiraCode-SemiBold'))
+        t('hack', 'Hack')
+        # some ubuntu systems (such as the build VM) have only the regular and
+        # bold faces of DejaVu Sans Mono installed.
+        # t('DejaVu Sans Mono', 'DejaVuSansMono', reg='', italic='Oblique')
+        t('ubuntu mono', 'UbuntuMono')
+        t('liberation mono', 'LiberationMono', reg='')
+        t('ibm plex mono', 'IBMPlexMono', 'SmBld', reg='')
+        t('iosevka fixed', 'Iosevka-Fixed', 'Semibold', reg='', bi='Semibold-Italic', allow_missing_in_ci=True)
+        t('iosevka term', 'Iosevka-Term', 'Semibold', reg='', bi='Semibold-Italic', allow_missing_in_ci=True)
+        t('fantasque sans mono', 'FantasqueSansMono')
+        t('jetbrains mono', 'JetBrainsMono', 'SemiBold')
+        t('consolas', 'Consolas', reg='', allow_missing_in_ci=True)
+        if has('cascadia code'):
+            if is_macos:
+                both('cascadia code', 'CascadiaCode-Regular', 'CascadiaCode-Regular_SemiBold', 'CascadiaCode-Italic', 'CascadiaCode-Italic_SemiBold-Italic')
+            else:
+                both('cascadia code', 'CascadiaCodeRoman-Regular', 'CascadiaCodeRoman-SemiBold', 'CascadiaCode-Italic', 'CascadiaCode-SemiBoldItalic')
+        if has('cascadia mono'):
+            if is_macos:
+                both('cascadia mono', 'CascadiaMono-Regular', 'CascadiaMono-Regular_SemiBold', 'CascadiaMono-Italic', 'CascadiaMono-Italic_SemiBold-Italic')
+            else:
+                both('cascadia mono', 'CascadiaMonoRoman-Regular', 'CascadiaMonoRoman-SemiBold', 'CascadiaMono-Italic', 'CascadiaMono-SemiBoldItalic')
+        if has('operator mono', allow_missing_in_ci=True):
+            both('operator mono', 'OperatorMono-Medium', 'OperatorMono-Bold', 'OperatorMono-MediumItalic', 'OperatorMono-BoldItalic')
+
+        # Test variable font selection
+
+        if has('SourceCodeVF'):
+            opts = Options()
+            opts.font_family = parse_font_spec('family="SourceCodeVF" variable_name="SourceCodeUpright" style="Bold"')
+            ff = get_font_files(opts)
+            face = face_from_descriptor(ff['medium'])
+            self.ae(get_named_style(face)['name'], 'Bold')
+            face = face_from_descriptor(ff['italic'])
+            self.ae(get_named_style(face)['name'], 'Bold Italic')
+            face = face_from_descriptor(ff['bold'])
+            self.ae(get_named_style(face)['name'], 'Black')
+            face = face_from_descriptor(ff['bi'])
+            self.ae(get_named_style(face)['name'], 'Black Italic')
+            opts.font_family = parse_font_spec('family=SourceCodeVF variable_name=SourceCodeUpright wght=470')
+            opts.italic_font = parse_font_spec('family=SourceCodeVF variable_name=SourceCodeItalic style=Black')
+            ff = get_font_files(opts)
+            self.assertFalse(get_named_style(ff['medium']))
+            self.ae(get_named_style(ff['italic'])['name'], 'Black Italic')
+        if has('cascadia code'):
+            opts = Options()
+            opts.font_family = parse_font_spec('family="cascadia code"')
+            opts.italic_font = parse_font_spec('family="cascadia code" variable_name= style="Light Italic"')
+            ff = get_font_files(opts)
+
+            def t(x, **kw):
+                if 'spec' in kw:
+                    fs = FontSpec.from_setting('family="Cascadia Code" ' + kw['spec'])._replace(created_from_string='')
+                else:
+                    kw['family'] = 'Cascadia Code'
+                    fs = FontSpec(**kw)
+                face = face_from_descriptor(ff[x])
+                self.ae(fs.as_setting, spec_for_face('Cascadia Code', face).as_setting)
+
+            t('medium', variable_name='CascadiaCodeRoman', style='Regular')
+            t('italic', variable_name='', style='Light Italic')
+
+            opts = Options()
+            opts.font_family = parse_font_spec('family="cascadia code" variable_name=CascadiaCodeRoman wght=455')
+            opts.italic_font = parse_font_spec('family="cascadia code" variable_name= wght=405')
+            opts.bold_font = parse_font_spec('family="cascadia code" variable_name=CascadiaCodeRoman wght=603')
+            ff = get_font_files(opts)
+            t('medium', spec='variable_name=CascadiaCodeRoman wght=455')
+            t('italic', spec='variable_name= wght=405')
+            t('bold', spec='variable_name=CascadiaCodeRoman wght=603')
+            t('bi', spec='variable_name= wght=603')
+
+        # Test font features
+        if has('liberation mono'):
+            opts = Options()
+            opts.font_family = parse_font_spec('family="liberation mono"')
+            ff = get_font_files(opts)
+            self.ae(face_from_descriptor(ff['medium']).applied_features(), {'dlig': '-dlig'})
+            self.ae(face_from_descriptor(ff['bold']).applied_features(), {})
+            opts.font_family = parse_font_spec('family="liberation mono" features="dlig test=3"')
+            ff = get_font_files(opts)
+            self.ae(face_from_descriptor(ff['medium']).applied_features(), {'dlig': 'dlig', 'test': 'test=3'})
+            self.ae(face_from_descriptor(ff['bold']).applied_features(), {'dlig': 'dlig', 'test': 'test=3'})
 
 
 class Rendering(BaseTest):
@@ -34,7 +182,7 @@ class Rendering(BaseTest):
     def tearDown(self):
         self.test_ctx.__exit__()
         del self.sprites, self.cell_width, self.cell_height, self.test_ctx
-        shutil.rmtree(self.tdir)
+        self.rmtree_ignoring_errors(self.tdir)
         super().tearDown()
 
     def test_sprite_map(self):
@@ -150,14 +298,8 @@ class Rendering(BaseTest):
     def test_fallback_font_not_last_resort(self):
         # Ensure that the LastResort font is not reported as a fallback font on
         # macOS. See https://github.com/kovidgoyal/kitty/issues/799
-        from io import StringIO
-        orig, buf = sys.stderr, StringIO()
-        sys.stderr = buf
-        try:
-            self.assertRaises(ValueError, get_fallback_font, '\U0010FFFF', False, False)
-        finally:
-            sys.stderr = orig
-        self.assertIn('LastResort', buf.getvalue())
+        with self.assertRaises(ValueError, msg='No fallback font found'):
+            get_fallback_font('\U0010FFFF', False, False)
 
     def test_coalesce_symbol_maps(self):
         q = {(2, 3): 'a', (4, 6): 'b', (5, 5): 'b', (7, 7): 'b', (9, 9): 'b', (1, 1): 'a'}

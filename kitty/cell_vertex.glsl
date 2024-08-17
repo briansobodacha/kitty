@@ -6,10 +6,10 @@
 layout(std140) uniform CellRenderData {
     float xstart, ystart, dx, dy, sprite_dx, sprite_dy, background_opacity, use_cell_bg_for_selection_fg, use_cell_fg_for_selection_fg, use_cell_for_selection_bg;
 
-    uint default_fg, default_bg, highlight_fg, highlight_bg, cursor_fg, cursor_bg, url_color, url_style, inverted;
+    uint default_fg, default_bg, highlight_fg, highlight_bg, cursor_fg, cursor_bg, url_color, url_style, inverted, second_transparent_bg;
 
     uint xnum, ynum, cursor_fg_sprite_idx;
-    float cursor_x, cursor_y, cursor_w;
+    float cursor_x, cursor_y, cursor_w, cursor_opacity;
 
     uint color_table[NUM_COLORS + MARK_MASK + MARK_MASK + 2];
 };
@@ -44,7 +44,7 @@ uniform float dim_opacity;
 out vec3 sprite_pos;
 out vec3 underline_pos;
 out vec3 cursor_pos;
-out vec4 cursor_color_vec;
+out vec4 cursor_color_premult;
 out vec3 strike_pos;
 out vec3 foreground;
 out vec3 decoration_fg;
@@ -185,8 +185,8 @@ void main() {
     strike_pos = to_sprite_pos(cell_data.pos, ((text_attrs >> STRIKE_SHIFT) & ONE) * STRIKE_SPRITE_INDEX, ZERO, ZERO);
 
     // Cursor
-    cursor_color_vec = vec4(color_to_vec(cursor_bg), 1.0);
-    vec3 final_cursor_text_color = color_to_vec(cursor_fg);
+    cursor_color_premult = vec4(color_to_vec(cursor_bg) * cursor_opacity, cursor_opacity);
+    vec3 final_cursor_text_color = mix(foreground, color_to_vec(cursor_fg), cursor_opacity);
     foreground = choose_color(cell_data.has_block_cursor, final_cursor_text_color, foreground);
     decoration_fg = choose_color(cell_data.has_block_cursor, final_cursor_text_color, decoration_fg);
     cursor_pos = to_sprite_pos(cell_data.pos, cursor_fg_sprite_idx * uint(cell_data.has_cursor), ZERO, ZERO);
@@ -194,7 +194,9 @@ void main() {
     // }}}
 
     // Background {{{
-    float cell_has_non_default_bg = step(1, float(abs(bg_as_uint - default_colors[1])));
+    float cell_has_non_default_bg = step(1, float(abs(
+        (bg_as_uint - default_colors[1]) * (bg_as_uint - second_transparent_bg)
+    )));
     draw_bg = 1;
 
 #if (PHASE == PHASE_BACKGROUND)
@@ -222,7 +224,7 @@ void main() {
 
     // Selection and cursor
     bg = choose_color(float(is_selected & ONE), choose_color(use_cell_for_selection_bg, color_to_vec(fg_as_uint), color_to_vec(highlight_bg)), bg);
-    background = choose_color(cell_data.has_block_cursor, color_to_vec(cursor_bg), bg);
+    background = choose_color(cell_data.has_block_cursor, mix(bg, color_to_vec(cursor_bg), cursor_opacity), bg);
 #if !defined(TRANSPARENT) && (PHASE == PHASE_SPECIAL)
     float is_special_cell = cell_data.has_block_cursor + float(is_selected & ONE);
     bg_alpha = step(0.5, is_special_cell);

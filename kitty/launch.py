@@ -4,8 +4,9 @@
 
 import os
 import shutil
+from collections.abc import Container, Iterable, Iterator, Sequence
 from contextlib import suppress
-from typing import Any, Container, Dict, FrozenSet, Iterable, Iterator, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, NamedTuple, Optional
 
 from .boss import Boss
 from .child import Child
@@ -27,12 +28,42 @@ except ImportError:
 
 class LaunchSpec(NamedTuple):
     opts: LaunchCLIOptions
-    args: List[str]
+    args: list[str]
+
+
+env_docs = '''\
+type=list
+Environment variables to set in the child process. Can be specified multiple
+times to set different environment variables. Syntax: :code:`name=value`. Using
+:code:`name=` will set to empty string and just :code:`name` will remove the
+environment variable.
+'''
+
+
+remote_control_password_docs = '''\
+type=list
+Restrict the actions remote control is allowed to take. This works like
+:opt:`remote_control_password`. You can specify a password and list of actions
+just as for :opt:`remote_control_password`. For example::
+
+    --remote-control-password '"my passphrase" get-* set-colors'
+
+This password will be in effect for this window only.
+Note that any passwords you have defined for :opt:`remote_control_password`
+in :file:`kitty.conf` are also in effect. You can override them by using the same password here.
+You can also disable all :opt:`remote_control_password` global passwords for this window, by using::
+
+    --remote-control-password '!'
+
+This option only takes effect if :option:`--allow-remote-control`
+is also specified. Can be specified multiple times to create multiple passwords.
+This option was added to kitty in version 0.26.0
+'''
 
 
 @run_once
 def options_spec() -> str:
-    return '''
+    return f'''
 --window-title --title
 The title to set for the new window. By default, title is controlled by the
 child process. The special value :code:`current` will copy the title from the
@@ -103,11 +134,7 @@ refers to the process that was originally started when the window was created.
 
 
 --env
-type=list
-Environment variables to set in the child process. Can be specified multiple
-times to set different environment variables. Syntax: :code:`name=value`. Using
-:code:`name=` will set to empty string and just :code:`name` will remove the
-environment variable.
+{env_docs}
 
 
 --var
@@ -159,6 +186,45 @@ active window. The default is to place the window in a layout dependent manner,
 typically, after the currently active window.
 
 
+--bias
+type=float
+default=0
+The bias used to alter the size of the window.
+It controls what fraction of available space the window takes. The exact meaning
+of bias depends on the current layout.
+
+* Splits layout: The bias is interpreted as a percentage between 0 and 100.
+When splitting a window into two, the new window will take up the specified fraction
+of the space alloted to the original window and the original window will take up
+the remainder of the space.
+
+* Vertical/horizontal layout: The bias is interpreted as adding/subtracting from the
+normal size of the window. It should be a number between -90 and 90. This number is
+the percentage of the OS Window size that should be added to the window size.
+So for example, if a window would normally have been size 50 in the layout inside an
+OS Window that is size 80 high and --bias -10 is used it will become *approximately*
+size 42 high. Note that sizes are approximations, you cannot use this method to
+create windows of fixed sizes.
+
+* Tall layout: If the window being created is the *first* window in a column, then
+the bias is interpreted as a percentage, as for the splits layout, splitting the OS
+Window width between columns. If the window is a second or subsequent window in a column
+the bias is interpreted as adding/subtracting from the window size as for the vertical
+layout above.
+
+* Fat layout: Same as tall layout except it goes by rows instead of columns.
+
+* Grid layout: The bias is interpreted the same way as for the Vertical and Horizontal
+layouts, as something to be added/subtracted to the normal size. However, the
+since in a grid layout there are rows *and* columns, the bias on the first window in a column
+operates on the columns. Any later windows in that column operate on the row.
+So, for example, if you bias the first window in a grid layout it will change the width
+of the first column, the second window, the width of the second column, the third window,
+the height of the second row and so on.
+
+The bias option was introduced in kitty version 0.36.0.
+
+
 --allow-remote-control
 type=bool-set
 Programs running in this window can control kitty (even if remote control is not
@@ -171,24 +237,7 @@ remote control.
 
 
 --remote-control-password
-type=list
-Restrict the actions remote control is allowed to take. This works like
-:opt:`remote_control_password`. You can specify a password and list of actions
-just as for :opt:`remote_control_password`. For example::
-
-    --remote-control-password '"my passphrase" get-* set-colors'
-
-This password will be in effect for this window only.
-Note that any passwords you have defined for :opt:`remote_control_password`
-in :file:`kitty.conf` are also in effect. You can override them by using the same password here.
-You can also disable all :opt:`remote_control_password` global passwords for this window, by using::
-
-    --remote-control-password '!'
-
-This option only takes effect if :option:`--allow-remote-control`
-is also specified. Can be specified multiple times to create multiple passwords.
-This option was added to kitty in version 0.26.0
-
+{remote_control_password_docs}
 
 --stdin-source
 type=choices
@@ -321,12 +370,12 @@ def parse_launch_args(args: Optional[Sequence[str]] = None) -> LaunchSpec:
     try:
         opts, args = parse_args(result_class=LaunchCLIOptions, args=args, ospec=options_spec)
     except SystemExit as e:
-        raise ValueError from e
+        raise ValueError(str(e)) from e
     return LaunchSpec(opts, args)
 
 
-def get_env(opts: LaunchCLIOptions, active_child: Optional[Child] = None, base_env: Optional[Dict[str,str]] = None) -> Dict[str, str]:
-    env: Dict[str, str] = {}
+def get_env(opts: LaunchCLIOptions, active_child: Optional[Child] = None, base_env: Optional[dict[str,str]] = None) -> dict[str, str]:
+    env: dict[str, str] = {}
     if opts.copy_env and active_child:
         env.update(active_child.foreground_environ)
     if base_env is not None:
@@ -366,7 +415,7 @@ def tab_for_window(boss: Boss, opts: LaunchCLIOptions, target_tab: Optional[Tab]
     return tab
 
 
-watcher_modules: Dict[str, Any] = {}
+watcher_modules: dict[str, Any] = {}
 
 
 def load_watch_modules(watchers: Iterable[str]) -> Optional[Watchers]:
@@ -413,17 +462,18 @@ def load_watch_modules(watchers: Iterable[str]) -> Optional[Watchers]:
 class LaunchKwds(TypedDict):
 
     allow_remote_control: bool
-    remote_control_passwords: Optional[Dict[str, Sequence[str]]]
+    remote_control_passwords: Optional[dict[str, Sequence[str]]]
     cwd_from: Optional[CwdRequest]
     cwd: Optional[str]
     location: Optional[str]
     override_title: Optional[str]
     copy_colors_from: Optional[Window]
     marker: Optional[str]
-    cmd: Optional[List[str]]
+    cmd: Optional[list[str]]
     overlay_for: Optional[int]
     stdin: Optional[bytes]
     hold: bool
+    bias: Optional[float]
 
 
 def apply_colors(window: Window, spec: Sequence[str]) -> None:
@@ -433,7 +483,7 @@ def apply_colors(window: Window, spec: Sequence[str]) -> None:
     patch_color_profiles(colors, profiles, True)
 
 
-def parse_var(defn: Iterable[str]) -> Iterator[Tuple[str, str]]:
+def parse_var(defn: Iterable[str]) -> Iterator[tuple[str, str]]:
     for item in defn:
         a, sep, b = item.partition('=')
         yield a, b
@@ -462,16 +512,27 @@ force_window_launch = ForceWindowLaunch()
 non_window_launch_types = 'background', 'clipboard', 'primary'
 
 
+def parse_remote_control_passwords(allow_remote_control: bool, passwords: Sequence[str]) -> Optional[dict[str, Sequence[str]]]:
+    remote_control_restrictions: Optional[dict[str, Sequence[str]]] = None
+    if allow_remote_control and passwords:
+        from kitty.options.utils import remote_control_password
+        remote_control_restrictions = {}
+        for rcp in passwords:
+            for pw, rcp_items in remote_control_password(rcp, {}):
+                remote_control_restrictions[pw] = rcp_items
+    return remote_control_restrictions
+
+
 def _launch(
     boss: Boss,
     opts: LaunchCLIOptions,
-    args: List[str],
+    args: list[str],
     target_tab: Optional[Tab] = None,
     force_target_tab: bool = False,
     active: Optional[Window] = None,
     is_clone_launch: str = '',
     rc_from_window: Optional[Window] = None,
-    base_env: Optional[Dict[str, str]] = None,
+    base_env: Optional[dict[str, str]] = None,
 ) -> Optional[Window]:
     active = active or boss.active_window_for_cwd
     if active:
@@ -487,16 +548,9 @@ def _launch(
         tm = boss.active_tab_manager
         opts.os_window_title = get_os_window_title(tm.os_window_id) if tm else None
     env = get_env(opts, active_child, base_env)
-    remote_control_restrictions: Optional[Dict[str, Sequence[str]]] = None
-    if opts.allow_remote_control and opts.remote_control_password:
-        from kitty.options.utils import remote_control_password
-        remote_control_restrictions = {}
-        for rcp in opts.remote_control_password:
-            for pw, rcp_items in remote_control_password(rcp, {}):
-                remote_control_restrictions[pw] = rcp_items
     kw: LaunchKwds = {
         'allow_remote_control': opts.allow_remote_control,
-        'remote_control_passwords': remote_control_restrictions,
+        'remote_control_passwords': parse_remote_control_passwords(opts.allow_remote_control, opts.remote_control_password),
         'cwd_from': None,
         'cwd': None,
         'location': None,
@@ -507,11 +561,14 @@ def _launch(
         'overlay_for': None,
         'stdin': None,
         'hold': False,
+        'bias': None,
     }
     spacing = {}
     if opts.spacing:
         from .rc.set_spacing import parse_spacing_settings, patch_window_edges
         spacing = parse_spacing_settings(opts.spacing)
+    if opts.bias:
+        kw['bias'] = max(-100, min(opts.bias, 100))
     if opts.cwd:
         if opts.cwd == 'current':
             if active:
@@ -533,7 +590,7 @@ def _launch(
         kw['location'] = opts.location
     if opts.copy_colors and active:
         kw['copy_colors_from'] = active
-    pipe_data: Dict[str, Any] = {}
+    pipe_data: dict[str, Any] = {}
     if opts.stdin_source != 'none':
         q = str(opts.stdin_source)
         if opts.stdin_add_formatting:
@@ -552,7 +609,7 @@ def _launch(
     if opts.copy_cmdline and active_child:
         cmd = active_child.foreground_cmdline
     if cmd:
-        final_cmd: List[str] = []
+        final_cmd: list[str] = []
         for x in cmd:
             if active and not opts.copy_cmdline:
                 if x == '@selection':
@@ -643,13 +700,13 @@ def _launch(
 def launch(
     boss: Boss,
     opts: LaunchCLIOptions,
-    args: List[str],
+    args: list[str],
     target_tab: Optional[Tab] = None,
     force_target_tab: bool = False,
     active: Optional[Window] = None,
     is_clone_launch: str = '',
     rc_from_window: Optional[Window] = None,
-    base_env: Optional[Dict[str, str]] = None,
+    base_env: Optional[dict[str, str]] = None,
 ) -> Optional[Window]:
     active = active or boss.active_window_for_cwd
     if opts.keep_focus and active:
@@ -661,7 +718,7 @@ def launch(
             active.ignore_focus_changes = orig
 
 @run_once
-def clone_safe_opts() -> FrozenSet[str]:
+def clone_safe_opts() -> frozenset[str]:
     return frozenset((
         'window_title', 'tab_title', 'type', 'keep_focus', 'cwd', 'env', 'var', 'hold',
         'location', 'os_window_class', 'os_window_name', 'os_window_title', 'os_window_state',
@@ -669,7 +726,7 @@ def clone_safe_opts() -> FrozenSet[str]:
     ))
 
 
-def parse_opts_for_clone(args: List[str]) -> Tuple[LaunchCLIOptions, List[str]]:
+def parse_opts_for_clone(args: list[str]) -> tuple[LaunchCLIOptions, list[str]]:
     unsafe, unsafe_args = parse_launch_args(args)
     default_opts, default_args = parse_launch_args()
     # only copy safe options, those that dont lead to local code exec
@@ -678,7 +735,7 @@ def parse_opts_for_clone(args: List[str]) -> Tuple[LaunchCLIOptions, List[str]]:
     return default_opts, unsafe_args
 
 
-def parse_null_env(text: str) -> Dict[str, str]:
+def parse_null_env(text: str) -> dict[str, str]:
     ans = {}
     for line in text.split('\0'):
         if line:
@@ -690,7 +747,7 @@ def parse_null_env(text: str) -> Dict[str, str]:
     return ans
 
 
-def parse_message(msg: str, simple: Container[str]) -> Iterator[Tuple[str, str]]:
+def parse_message(msg: str, simple: Container[str]) -> Iterator[tuple[str, str]]:
     from base64 import standard_b64decode
     for x in msg.split(','):
         try:
@@ -706,7 +763,7 @@ class EditCmd:
 
     def __init__(self, msg: str) -> None:
         self.tdir = ''
-        self.args: List[str] = []
+        self.args: list[str] = []
         self.cwd = self.file_name = self.file_localpath = ''
         self.file_data = b''
         self.file_inode = -1, -1
@@ -815,8 +872,8 @@ class EditCmd:
 class CloneCmd:
 
     def __init__(self, msg: str) -> None:
-        self.args: List[str] = []
-        self.env: Optional[Dict[str, str]] = None
+        self.args: list[str] = []
+        self.env: Optional[dict[str, str]] = None
         self.cwd = ''
         self.shell = ''
         self.envfmt = 'default'
@@ -861,7 +918,7 @@ class CloneCmd:
                 self.history = v
 
 
-edits_in_flight: Dict[int, EditCmd] = {}
+edits_in_flight: dict[int, EditCmd] = {}
 
 
 def remote_edit(msg: str, window: Window) -> None:

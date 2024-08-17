@@ -540,6 +540,12 @@ typedef enum GLFWMouseButton {
 } GLFWMouseButton;
 /*! @} */
 
+typedef enum GLFWColorScheme {
+    GLFW_COLOR_SCHEME_NO_PREFERENCE = 0,
+    GLFW_COLOR_SCHEME_DARK = 1,
+    GLFW_COLOR_SCHEME_LIGHT = 2
+} GLFWColorScheme;
+
 /*! @defgroup joysticks Joysticks
  *  @brief Joystick IDs.
  *
@@ -1034,10 +1040,10 @@ typedef enum {
     SRGB_COLORSPACE = 1,
     DISPLAY_P3_COLORSPACE = 2,
 } GlfwCocoaColorSpaces;
-/*! @brief macOS specific
- *  [window hint](@ref GLFW_COCOA_BLUR_RADIUS_hint).
+/*! @brief Blur Radius. On macOS the actual radius is used. On Linux it is treated as a bool.
+ *  [window hint](@ref GLFW_BLUR_RADIUS).
  */
-#define GLFW_COCOA_BLUR_RADIUS 0x00023005
+#define GLFW_BLUR_RADIUS       0x0002305
 
 /*! @brief X11 specific
  *  [window hint](@ref GLFW_X11_CLASS_NAME_hint).
@@ -1047,9 +1053,9 @@ typedef enum {
  *  [window hint](@ref GLFW_X11_CLASS_NAME_hint).
  */
 #define GLFW_X11_INSTANCE_NAME      0x00024002
-#define GLFW_X11_BLUR               0x00024003
 
 #define GLFW_WAYLAND_APP_ID         0x00025001
+#define GLFW_WAYLAND_BGCOLOR        0x00025002
 /*! @} */
 
 #define GLFW_NO_API                          0
@@ -1162,6 +1168,7 @@ typedef enum {
  *  macOS specific [init hint](@ref GLFW_COCOA_MENUBAR_hint).
  */
 #define GLFW_COCOA_MENUBAR          0x00051002
+#define GLFW_WAYLAND_IME            0x00051003
 /*! @} */
 
 #define GLFW_DONT_CARE              -1
@@ -1288,7 +1295,30 @@ typedef struct GLFWkeyevent
     // For internal use only. On Linux it is the actual keycode reported by the windowing system, in contrast
     // to native_key which can be the result of a compose operation. On macOS it is the same as native_key.
     uint32_t native_key_id;
+
+    // True if this is a synthesized event on focus change
+    bool fake_event_on_focus_change;
 } GLFWkeyevent;
+
+typedef enum { GLFW_LAYER_SHELL_NONE, GLFW_LAYER_SHELL_BACKGROUND, GLFW_LAYER_SHELL_PANEL } GLFWLayerShellType;
+
+typedef enum { GLFW_EDGE_TOP, GLFW_EDGE_BOTTOM, GLFW_EDGE_LEFT, GLFW_EDGE_RIGHT } GLFWEdge;
+
+typedef enum { GLFW_FOCUS_NOT_ALLOWED, GLFW_FOCUS_EXCLUSIVE, GLFW_FOCUS_ON_DEMAND} GLFWFocusPolicy;
+
+typedef struct GLFWLayerShellConfig {
+    GLFWLayerShellType type;
+    GLFWEdge edge;
+    char output_name[64];
+    GLFWFocusPolicy focus_policy;
+    unsigned size_in_cells;
+    void (*size_callback)(GLFWwindow *window, const struct GLFWLayerShellConfig *config, unsigned monitor_width, unsigned monitor_height, uint32_t *width, uint32_t *height);
+} GLFWLayerShellConfig;
+
+typedef struct GLFWDBUSNotificationData {
+    const char *app_name, *icon, *summary, *body, *category, **actions; size_t num_actions;
+    int32_t timeout; uint8_t urgency; uint32_t replaces; int muted;
+} GLFWDBUSNotificationData;
 
 /*! @brief The function pointer type for error callbacks.
  *
@@ -1408,7 +1438,7 @@ typedef void (* GLFWapplicationclosefun)(int);
  *
  *  @ingroup window
  */
-typedef void (* GLFWsystemcolorthemechangefun)(int);
+typedef void (* GLFWsystemcolorthemechangefun)(GLFWColorScheme);
 
 
 /*! @brief The function pointer type for window content refresh callbacks.
@@ -1760,7 +1790,7 @@ typedef void (* GLFWjoystickfun)(int,int);
 typedef void (* GLFWuserdatafun)(unsigned long long, void*);
 typedef void (* GLFWtickcallback)(void*);
 typedef void (* GLFWactivationcallback)(GLFWwindow *window, const char *token, void *data);
-typedef bool (* GLFWdrawtextfun)(GLFWwindow *window, const char *text, uint32_t fg, uint32_t bg, uint8_t *output_buf, size_t width, size_t height, float x_offset, float y_offset, size_t right_margin);
+typedef bool (* GLFWdrawtextfun)(GLFWwindow *window, const char *text, uint32_t fg, uint32_t bg, uint8_t *output_buf, size_t width, size_t height, float x_offset, float y_offset, size_t right_margin, bool is_single_glyph);
 typedef char* (* GLFWcurrentselectionfun)(void);
 typedef bool (* GLFWhascurrentselectionfun)(void);
 typedef void (* GLFWclipboarddatafreefun)(void* data);
@@ -3797,6 +3827,7 @@ GLFWAPI int glfwGetWindowAttrib(GLFWwindow* window, int attrib);
  *  @ingroup window
  */
 GLFWAPI void glfwSetWindowAttrib(GLFWwindow* window, int attrib, int value);
+GLFWAPI int glfwSetWindowBlur(GLFWwindow* window, int value);
 
 /*! @brief Sets the user pointer of the specified window.
  *
@@ -3950,7 +3981,7 @@ GLFWAPI GLFWwindowsizefun glfwSetWindowSizeCallback(GLFWwindow* window, GLFWwind
 GLFWAPI GLFWwindowclosefun glfwSetWindowCloseCallback(GLFWwindow* window, GLFWwindowclosefun callback);
 GLFWAPI GLFWapplicationclosefun glfwSetApplicationCloseCallback(GLFWapplicationclosefun callback);
 GLFWAPI GLFWsystemcolorthemechangefun glfwSetSystemColorThemeChangeCallback(GLFWsystemcolorthemechangefun callback);
-GLFWAPI int glfwGetCurrentSystemColorTheme(void);
+GLFWAPI GLFWColorScheme glfwGetCurrentSystemColorTheme(void);
 
 /*! @brief Sets the refresh callback for the specified window.
  *

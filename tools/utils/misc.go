@@ -9,10 +9,10 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strconv"
 
 	"golang.org/x/exp/constraints"
-	"golang.org/x/exp/slices"
 )
 
 var _ = fmt.Print
@@ -309,4 +309,11 @@ func FunctionName(a any) string {
 		return f.Name()
 	}
 	return ""
+}
+
+func Abs[T constraints.Integer](x T) T {
+	if x < 0 {
+		return -x
+	}
+	return x
 }

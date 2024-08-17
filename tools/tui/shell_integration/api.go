@@ -6,20 +6,27 @@ import (
 	"archive/tar"
 	"bytes"
 	"fmt"
-	"kitty"
-	"kitty/tools/utils"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 
-	"golang.org/x/exp/maps"
-	"golang.org/x/exp/slices"
+	"kitty"
+	"kitty/tools/tty"
+	"kitty/tools/utils"
 )
 
 var _ = fmt.Print
 
 type integration_setup_func = func(shell_integration_dir string, argv []string, env map[string]string) ([]string, map[string]string, error)
+
+func TerminfoData() string {
+	d := Data()
+	entry := d["terminfo/x/xterm-kitty"]
+	return utils.UnsafeBytesToString(entry.Data)
+}
 
 func extract_files(match, dest_dir string) (err error) {
 	d := Data()
@@ -43,7 +50,7 @@ func extract_files(match, dest_dir string) (err error) {
 			if existing, rerr := os.ReadFile(dest); rerr == nil && bytes.Equal(existing, entry.Data) {
 				continue
 			}
-			if err = utils.AtomicWriteFile(dest, entry.Data, 0o644); err != nil {
+			if err = utils.AtomicWriteFile(dest, bytes.NewReader(entry.Data), 0o644); err != nil {
 				return
 			}
 		}
@@ -231,6 +238,9 @@ func fish_setup_func(shell_integration_dir string, argv []string, env map[string
 	return argv, env, nil
 }
 
+var debugprintln = tty.DebugPrintln
+var _ = debugprintln
+
 func bash_setup_func(shell_integration_dir string, argv []string, env map[string]string) ([]string, map[string]string, error) {
 	inject := utils.NewSetWithItems(`1`)
 	var posix_env, rcfile string
@@ -322,9 +332,8 @@ func bash_setup_func(shell_integration_dir string, argv []string, env map[string
 	}
 	argv = slices.Insert(argv, 1, `--posix`)
 
-	if bashrc := os.Getenv(`KITTY_RUNNING_BASH_INTEGRATION_TEST`); bashrc != `` {
-		// prevent bash from source /etc/profile which is not under our control
-		os.Unsetenv(`KITTY_RUNNING_BASH_INTEGRATION_TEST`)
+	if bashrc := os.Getenv(`KITTY_RUNNING_BASH_INTEGRATION_TEST`); bashrc != `` && os.Getenv("KITTY_RUNNING_SHELL_INTEGRATION_TEST") == "1" {
+		// prevent bash from sourcing /etc/profile which is not under our control
 		env[`KITTY_BASH_INJECT`] += ` posix`
 		env[`KITTY_BASH_POSIX_ENV`] = bashrc
 	}

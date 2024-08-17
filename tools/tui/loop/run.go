@@ -4,11 +4,13 @@ package loop
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,7 +24,7 @@ var SIGNULL unix.Signal
 
 func new_loop() *Loop {
 	l := Loop{controlling_term: nil}
-	l.terminal_options.alternate_screen = true
+	l.terminal_options.Alternate_screen = true
 	l.terminal_options.restore_colors = true
 	l.terminal_options.kitty_keyboard_mode = DISAMBIGUATE_KEYS | REPORT_ALTERNATE_KEYS | REPORT_ALL_KEYS_AS_ESCAPE_CODES | REPORT_TEXT_WITH_KEYS
 	l.escape_code_parser.HandleCSI = l.handle_csi
@@ -81,8 +83,35 @@ func (self *Loop) update_screen_size() error {
 	return nil
 }
 
-func (self *Loop) handle_csi(raw []byte) error {
+func (self *Loop) handle_csi(raw []byte) (err error) {
 	csi := string(raw)
+	if strings.HasSuffix(csi, "t") && strings.HasPrefix(csi, "48;") {
+		if parts := strings.Split(csi[3:len(csi)-1], ";"); len(parts) > 3 {
+			var parsed [4]int
+			ok := true
+			for i, x := range parts {
+				x, _, _ = strings.Cut(x, ":")
+				if parsed[i], err = strconv.Atoi(x); err != nil {
+					ok = false
+					break
+				}
+			}
+			if ok {
+				self.seen_inband_resize = true
+				old_size := self.screen_size
+				s := &self.screen_size
+				s.updated = true
+				s.HeightCells, s.WidthCells = uint(parsed[0]), uint(parsed[1])
+				s.HeightPx, s.WidthPx = uint(parsed[2]), uint(parsed[3])
+				s.CellWidth = s.WidthPx / s.WidthCells
+				s.CellHeight = s.HeightPx / s.HeightCells
+				if self.OnResize != nil {
+					return self.OnResize(old_size, self.screen_size)
+				}
+				return nil
+			}
+		}
+	}
 	ke := KeyEventFromCSI(csi)
 	if ke != nil {
 		return self.handle_key_event(ke)
@@ -172,6 +201,24 @@ func (self *Loop) handle_dcs(raw []byte) error {
 	if self.OnRCResponse != nil && bytes.HasPrefix(raw, utils.UnsafeStringToBytes("@kitty-cmd")) {
 		return self.OnRCResponse(raw[len("@kitty-cmd"):])
 	}
+	if self.OnQueryResponse != nil && (bytes.HasPrefix(raw, utils.UnsafeStringToBytes("1+r")) || bytes.HasPrefix(raw, utils.UnsafeStringToBytes("0+r"))) {
+		valid := raw[0] == '1'
+		s := utils.NewSeparatorScanner(utils.UnsafeBytesToString(raw[3:]), ";")
+		for s.Scan() {
+			key, val, _ := strings.Cut(s.Text(), "=")
+			if k, err := hex.DecodeString(key); err == nil {
+				if bytes.HasPrefix(k, utils.UnsafeStringToBytes("kitty-query-")) {
+					k = k[len("kitty-query-"):]
+					if v, err := hex.DecodeString(val); err == nil {
+						if err = self.OnQueryResponse(string(k), string(v), valid); err != nil {
+							return err
+						}
+					}
+				}
+			}
+		}
+		return nil
+	}
 	if self.OnEscapeCode != nil {
 		return self.OnEscapeCode(DCS, raw)
 	}
@@ -253,6 +300,10 @@ func (self *Loop) on_SIGPIPE() error {
 }
 
 func (self *Loop) on_SIGWINCH() error {
+	self.update_screen_size()
+	if self.seen_inband_resize {
+		return nil
+	}
 	self.screen_size.updated = false
 	if self.OnResize != nil {
 		old_size := self.screen_size
@@ -294,6 +345,7 @@ func (self *Loop) run() (err error) {
 	}()
 
 	self.keep_going = true
+	self.seen_inband_resize = false
 	self.pending_mouse_events = utils.NewRingBuffer[MouseEvent](4)
 	// tty_write_channel is buffered so there is no race between initial
 	// queueing and startup of writer thread and also as a performance

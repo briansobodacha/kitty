@@ -30,7 +30,7 @@ to build kitty with your changes.
 
 .. note::
    If you plan to run kitty from source long-term, there are a couple of
-   caveats to be aware of. You should occassionally run ``./dev.sh deps``
+   caveats to be aware of. You should occasionally run ``./dev.sh deps``
    to have the dependencies re-downloaded as they are updated periodically.
    Also, the built kitty executable assumes it will find source in whatever
    directory you first ran :code:`./dev.sh build` in. If you move/rename the
@@ -90,14 +90,17 @@ Run-time dependencies:
 * ``freetype`` (not needed on macOS)
 * ``fontconfig`` (not needed on macOS)
 * ``libcanberra`` (not needed on macOS)
+* ``libsystemd`` (optional, not needed on non systemd systems)
 * ``ImageMagick`` (optional, needed to display uncommon image formats in the terminal)
 
 
 Build-time dependencies:
 
 * ``gcc`` or ``clang``
+* ``simde``
 * ``go`` >= _build_go_version (see :file:`go.mod` for go packages used during building)
 * ``pkg-config``
+* Symbols NERD Font Mono either installed system-wide or placed in :file:`fonts/SymbolsNerdFontMono-Regular.ttf`
 * For building on Linux in addition to the above dependencies you might also
   need to install the following packages, if they are not already installed by
   your distro:
@@ -115,6 +118,7 @@ Build-time dependencies:
   - ``libssl-dev``
   - ``libpython3-dev``
   - ``libxxhash-dev``
+  - ``libsimde-dev``
 
 
 Build and run from source with Nix

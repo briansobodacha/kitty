@@ -9,8 +9,8 @@ from kitty.cli_stub import HintsCLIOptions
 from kitty.clipboard import set_clipboard_string, set_primary_selection
 from kitty.constants import website_url
 from kitty.fast_data_types import get_options
-from kitty.typing import BossType
-from kitty.utils import resolve_custom_file
+from kitty.typing import BossType, WindowType
+from kitty.utils import get_editor, resolve_custom_file
 
 from ..tui.handler import result_handler
 
@@ -148,6 +148,13 @@ Comma separated list of recognized URL prefixes. Defaults to the list of
 prefixes defined by the :opt:`url_prefixes` option in :file:`kitty.conf`.
 
 
+--url-excluded-characters
+default=default
+Characters to exclude when matching URLs. Defaults to the list of characters
+defined by the :opt:`url_excluded_characters` option in :file:`kitty.conf`.
+The syntax for this option is the same as for :opt:`url_excluded_characters`.
+
+
 --word-characters
 Characters to consider as part of a word. In addition, all characters marked as
 alphanumeric in the Unicode database will be considered as word characters.
@@ -208,19 +215,25 @@ bottom.
 --hints-foreground-color
 default=black
 type=str
-The foreground color for hints.
+The foreground color for hints. You can use color names or hex values. For the eight basic
+named terminal colors you can also use the :code:`bright-` prefix to get the bright variant of the
+color.
 
 
 --hints-background-color
 default=green
 type=str
-The background color for hints.
+The background color for hints. You can use color names or hex values. For the eight basic
+named terminal colors you can also use the :code:`bright-` prefix to get the bright variant of the
+color.
 
 
 --hints-text-color
-default=gray
+default=bright-gray
 type=str
-The foreground color for text pointed to by the hints.
+The foreground color for text pointed to by the hints. You can use color names or hex values. For the eight basic
+named terminal colors you can also use the :code:`bright-` prefix to get the bright variant of the
+color.
 
 
 --customize-processing
@@ -259,7 +272,10 @@ def linenum_handle_result(args: List[str], data: Dict[str, Any], target_window_i
     if not path:
         return
 
-    cmd = [x.format(path=path, line=line) for x in extra_cli_args or ('vim', '+{line}', '{path}')]
+    if extra_cli_args:
+        cmd = [x.format(path=path, line=line) for x in extra_cli_args]
+    else:
+        cmd = get_editor(path_to_edit=path, line_number=line)
     w = boss.window_id_map.get(target_window_id)
     action = data['linenum_action']
 
@@ -296,7 +312,14 @@ def linenum_handle_result(args: List[str], data: Dict[str, Any], target_window_i
             }[action])(*cmd)
 
 
-@result_handler(type_of_input='screen-ansi', has_ready_notification=True)
+def on_mark_clicked(boss: BossType, window: WindowType, url: str, hyperlink_id: int, cwd: str) -> bool:
+    if url.startswith('mark:'):
+        window.send_cmd_response({'Type': 'mark_activated', 'Mark': int(url[5:])})
+        return True
+    return False
+
+
+@result_handler(type_of_input='screen-ansi', has_ready_notification=True, open_url_handler=on_mark_clicked)
 def handle_result(args: List[str], data: Dict[str, Any], target_window_id: int, boss: BossType) -> None:
     cp = data['customize_processing']
     if data['type'] == 'linenum':

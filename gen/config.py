@@ -6,7 +6,6 @@ import os
 import re
 import subprocess
 import sys
-from typing import List
 
 from kitty.conf.generate import write_output
 
@@ -16,7 +15,7 @@ if __name__ == '__main__' and not __package__:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-def patch_color_list(path: str, colors: List[str], name: str, spc: str = '    ') -> None:
+def patch_color_list(path: str, colors: list[str], name: str, spc: str = '    ') -> None:
     with open(path, 'r+') as f:
         raw = f.read()
         colors = sorted(colors)
@@ -40,9 +39,8 @@ def patch_color_list(path: str, colors: List[str], name: str, spc: str = '    ')
                 subprocess.check_call(['gofmt', '-w', path])
 
 
-def main(args: List[str]=sys.argv) -> None:
+def main(args: list[str]=sys.argv) -> None:
     from kitty.options.definition import definition
-    write_output('kitty', definition)
     nullable_colors = []
     all_colors = []
     for opt in definition.iter_all_options():
@@ -52,9 +50,10 @@ def main(args: List[str]=sys.argv) -> None:
                 all_colors.append(opt.name)
             elif opt.parser_func.__name__ in ('to_color', 'titlebar_color', 'macos_titlebar_color'):
                 all_colors.append(opt.name)
-    patch_color_list('kitty/rc/set_colors.py', nullable_colors, 'NULLABLE')
     patch_color_list('tools/cmd/at/set_colors.go', nullable_colors, 'NULLABLE')
     patch_color_list('tools/themes/collection.go', all_colors, 'ALL')
+    nc = '\n    '.join(f'{x!r}' for x in nullable_colors)
+    write_output('kitty', definition, f'\nnullable_colors = frozenset({{\n    {nc}\n}})')
 
 
 if __name__ == '__main__':

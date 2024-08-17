@@ -8,6 +8,7 @@
 #include "cleanup.h"
 #include "options/to-c-generated.h"
 #include <math.h>
+#include <sys/mman.h>
 
 GlobalState global_state = {{0}};
 
@@ -63,7 +64,7 @@ GlobalState global_state = {{0}};
 
 static double
 dpi_for_os_window(OSWindow *os_window) {
-    double dpi = (os_window->logical_dpi_x + os_window->logical_dpi_y) / 2.;
+    double dpi = (os_window->fonts_data->logical_dpi_x + os_window->fonts_data->logical_dpi_y) / 2.;
     if (dpi == 0) dpi = (global_state.default_dpi.x + global_state.default_dpi.y) / 2.;
     return dpi;
 }
@@ -164,6 +165,16 @@ window_for_window_id(id_type kitty_window_id) {
 }
 
 static void
+free_bgimage_bitmap(BackgroundImage *bgimage) {
+    if (!bgimage->bitmap) return;
+    if (bgimage->mmap_size) {
+        if (munmap(bgimage->bitmap, bgimage->mmap_size) != 0) log_error("Failed to unmap BackgroundImage with error: %s", strerror(errno));
+    } else free(bgimage->bitmap);
+    bgimage->bitmap = NULL;
+    bgimage->mmap_size = 0;
+}
+
+static void
 send_bgimage_to_gpu(BackgroundImageLayout layout, BackgroundImage *bgimage) {
     RepeatStrategy r = REPEAT_DEFAULT;
     switch (layout) {
@@ -178,9 +189,10 @@ send_bgimage_to_gpu(BackgroundImageLayout layout, BackgroundImage *bgimage) {
             r = REPEAT_DEFAULT; break;
     }
     bgimage->texture_id = 0;
-    send_image_to_gpu(&bgimage->texture_id, bgimage->bitmap, bgimage->width,
+    size_t delta = bgimage->mmap_size ? bgimage->mmap_size - ((size_t)4) * bgimage->width * bgimage->height : 0;
+    send_image_to_gpu(&bgimage->texture_id, bgimage->bitmap + delta, bgimage->width,
             bgimage->height, false, true, OPT(background_image_linear), r);
-    free(bgimage->bitmap); bgimage->bitmap = NULL;
+    free_bgimage_bitmap(bgimage);
 }
 
 static void
@@ -188,7 +200,7 @@ free_bgimage(BackgroundImage **bgimage, bool release_texture) {
     if (*bgimage && (*bgimage)->refcnt) {
         (*bgimage)->refcnt--;
         if ((*bgimage)->refcnt == 0) {
-            free((*bgimage)->bitmap); (*bgimage)->bitmap = NULL;
+            free_bgimage_bitmap(*bgimage);
             if (release_texture) free_texture(&(*bgimage)->texture_id);
             free(*bgimage);
         }
@@ -213,8 +225,7 @@ add_os_window(void) {
             global_state.bgimage = calloc(1, sizeof(BackgroundImage));
             if (!global_state.bgimage) fatal("Out of memory allocating the global bg image object");
             global_state.bgimage->refcnt++;
-            size_t size;
-            if (png_path_to_bitmap(OPT(background_image), &global_state.bgimage->bitmap, &global_state.bgimage->width, &global_state.bgimage->height, &size)) {
+            if (image_path_to_bitmap(OPT(background_image), &global_state.bgimage->bitmap, &global_state.bgimage->width, &global_state.bgimage->height, &global_state.bgimage->mmap_size)) {
                 send_bgimage_to_gpu(OPT(background_image_layout), global_state.bgimage);
             }
         }
@@ -224,7 +235,6 @@ add_os_window(void) {
         }
     }
 
-    ans->font_sz_in_pts = OPT(font_size);
     END_WITH_OS_WINDOW_REFS
     return ans;
 }
@@ -338,6 +348,7 @@ update_os_window_title(OSWindow *os_window) {
 
 static void
 destroy_window(Window *w) {
+    free(w->pending_clicks.clicks); w->pending_clicks.clicks = NULL; w->pending_clicks.num = 0; w->pending_clicks.capacity = 0;
     Py_CLEAR(w->render_data.screen); Py_CLEAR(w->title);
     Py_CLEAR(w->title_bar_data.last_drawn_title_object_id);
     free(w->title_bar_data.buf); w->title_bar_data.buf = NULL;
@@ -612,21 +623,27 @@ make_window_context_current(id_type window_id) {
 }
 
 void
-send_pending_click_to_window_id(id_type timer_id UNUSED, void *data) {
-    id_type window_id = *((id_type*)data);
-    for (size_t o = 0; o < global_state.num_os_windows; o++) {
-        OSWindow *osw = global_state.os_windows + o;
-        for (size_t t = 0; t < osw->num_tabs; t++) {
-            Tab *qtab = osw->tabs + t;
-            for (size_t w = 0; w < qtab->num_windows; w++) {
-                Window *window = qtab->windows + w;
-                if (window->id == window_id) {
-                    send_pending_click_to_window(window, data);
-                    return;
+dispatch_pending_clicks(id_type timer_id UNUSED, void *data UNUSED) {
+    bool dispatched = false;
+    do {  // dispatching a click can cause windows/tabs/etc to close so do it one at a time.
+        const monotonic_t now = monotonic();
+        dispatched = false;
+        for (size_t o = 0; o < global_state.num_os_windows && !dispatched; o++) {
+            OSWindow *osw = global_state.os_windows + o;
+            for (size_t t = 0; t < osw->num_tabs && !dispatched; t++) {
+                Tab *qtab = osw->tabs + t;
+                for (size_t w = 0; w < qtab->num_windows && !dispatched; w++) {
+                    Window *window = qtab->windows + w;
+                    for (size_t i = 0; i < window->pending_clicks.num && !dispatched; i++) {
+                        if (now - window->pending_clicks.clicks[i].at >= OPT(click_interval)) {
+                            dispatched = true;
+                            send_pending_click_to_window(window, i);
+                        }
+                    }
                 }
             }
         }
-    }
+    } while (dispatched);
 }
 
 bool
@@ -713,15 +730,14 @@ PYWRAP1(handle_for_window_id) {
     return NULL;
 }
 
-static PyObject* options_object = NULL;
 
 PYWRAP0(get_options) {
-    if (!options_object) {
+    if (!global_state.options_object) {
         PyErr_SetString(PyExc_RuntimeError, "Must call set_options() before using get_options()");
         return NULL;
     }
-    Py_INCREF(options_object);
-    return options_object;
+    Py_INCREF(global_state.options_object);
+    return global_state.options_object;
 }
 
 PYWRAP1(set_options) {
@@ -729,7 +745,7 @@ PYWRAP1(set_options) {
     int is_wayland = 0, debug_rendering = 0, debug_font_fallback = 0;
     PA("O|ppp", &opts, &is_wayland, &debug_rendering, &debug_font_fallback);
     if (opts == Py_None) {
-        Py_CLEAR(options_object);
+        Py_CLEAR(global_state.options_object);
         Py_RETURN_NONE;
     }
     global_state.is_wayland = is_wayland ? true : false;
@@ -740,8 +756,8 @@ PYWRAP1(set_options) {
     global_state.debug_rendering = debug_rendering ? true : false;
     global_state.debug_font_fallback = debug_font_fallback ? true : false;
     if (!convert_opts_from_python_opts(opts, &global_state.opts)) return NULL;
-    options_object = opts;
-    Py_INCREF(options_object);
+    global_state.options_object = opts;
+    Py_INCREF(global_state.options_object);
     Py_RETURN_NONE;
 }
 
@@ -751,7 +767,7 @@ PYWRAP1(set_ignore_os_keyboard_processing) {
 }
 
 static void
-init_screen_render_data(OSWindow *osw, const WindowGeometry *g, ScreenRenderData *d) {
+init_window_render_data(OSWindow *osw, const WindowGeometry *g, WindowRenderData *d) {
     d->dx = gl_size(osw->fonts_data->cell_width, osw->viewport_width);
     d->dy = gl_size(osw->fonts_data->cell_height, osw->viewport_height);
     d->xstart = gl_pos_x(g->left, osw->viewport_width);
@@ -759,14 +775,14 @@ init_screen_render_data(OSWindow *osw, const WindowGeometry *g, ScreenRenderData
 }
 
 PYWRAP1(set_tab_bar_render_data) {
-    ScreenRenderData d = {0};
+    WindowRenderData d = {0};
     WindowGeometry g = {0};
     id_type os_window_id;
     PA("KOIIII", &os_window_id, &d.screen, &g.left, &g.top, &g.right, &g.bottom);
     WITH_OS_WINDOW(os_window_id)
         Py_CLEAR(os_window->tab_bar_render_data.screen);
         d.vao_idx = os_window->tab_bar_render_data.vao_idx;
-        init_screen_render_data(os_window, &g, &d);
+        init_window_render_data(os_window, &g, &d);
         os_window->tab_bar_render_data = d;
         Py_INCREF(os_window->tab_bar_render_data.screen);
     END_WITH_OS_WINDOW
@@ -872,10 +888,22 @@ PYWRAP1(run_with_activation_token) {
         OSWindow *os_window = global_state.os_windows + o;
         if (os_window->is_focused) {
             run_with_activation_token_in_os_window(os_window, args);
-            break;
+            Py_RETURN_TRUE;
         }
     }
-    Py_RETURN_NONE;
+    id_type os_window_id = last_focused_os_window_id();
+    if (!os_window_id) {
+        if (!global_state.num_os_windows) Py_RETURN_FALSE;
+        os_window_id = global_state.os_windows[0].id;
+    }
+    for (size_t o = 0; o < global_state.num_os_windows; o++) {
+        OSWindow *os_window = global_state.os_windows + o;
+        if (os_window->id == os_window_id) {
+            run_with_activation_token_in_os_window(os_window, args);
+            Py_RETURN_TRUE;
+        }
+    }
+    Py_RETURN_FALSE;
 }
 
 PYWRAP1(set_os_window_chrome) {
@@ -902,7 +930,7 @@ PYWRAP1(change_background_opacity) {
     PA("Kf", &os_window_id, &opacity);
     WITH_OS_WINDOW(os_window_id)
         os_window->background_opacity = opacity;
-        os_window->is_damaged = true;
+        if (!os_window->redraw_count) os_window->redraw_count++;
         Py_RETURN_TRUE;
     END_WITH_OS_WINDOW
     Py_RETURN_FALSE;
@@ -930,14 +958,14 @@ PYWRAP1(set_window_render_data) {
 #define A(name) &(d.name)
 #define B(name) &(g.name)
     id_type os_window_id, tab_id, window_id;
-    ScreenRenderData d = {0};
+    WindowRenderData d = {0};
     WindowGeometry g = {0};
     PA("KKKOIIII", &os_window_id, &tab_id, &window_id, A(screen), B(left), B(top), B(right), B(bottom));
 
     WITH_WINDOW(os_window_id, tab_id, window_id);
         Py_CLEAR(window->render_data.screen);
         d.vao_idx = window->render_data.vao_idx;
-        init_screen_render_data(osw, &g, &d);
+        init_window_render_data(osw, &g, &d);
         window->render_data = d;
         window->geometry = g;
         Py_INCREF(window->render_data.screen);
@@ -974,6 +1002,7 @@ PYWRAP1(set_os_window_title) {
     PyObject *title;
     PA("KU", &os_window_id, &title);
     WITH_OS_WINDOW(os_window_id)
+        if (os_window->disallow_title_changes) break;
         if (PyUnicode_GetLength(title)) {
             os_window->title_is_overriden = true;
             Py_XDECREF(os_window->window_title);
@@ -1020,10 +1049,10 @@ PYWRAP1(os_window_font_size) {
     double new_sz = -1;
     PA("K|dp", &os_window_id, &new_sz, &force);
     WITH_OS_WINDOW(os_window_id)
-        if (new_sz > 0 && (force || new_sz != os_window->font_sz_in_pts)) {
-            os_window->font_sz_in_pts = new_sz;
-            os_window->fonts_data = NULL;
-            os_window->fonts_data = load_fonts_data(os_window->font_sz_in_pts, os_window->logical_dpi_x, os_window->logical_dpi_y);
+        if (new_sz > 0 && (force || new_sz != os_window->fonts_data->font_sz_in_pts)) {
+            double xdpi, ydpi; float xscale, yscale;
+            get_os_window_content_scale(os_window, &xdpi, &ydpi, &xscale, &yscale);
+            os_window->fonts_data = load_fonts_data(new_sz, xdpi, ydpi);
             send_prerendered_sprites_for_window(os_window);
             resize_screen(os_window, os_window->tab_bar_render_data.screen, false);
             for (size_t ti = 0; ti < os_window->num_tabs; ti++) {
@@ -1037,7 +1066,7 @@ PYWRAP1(os_window_font_size) {
             // On Wayland with CSD title needs to be re-rendered in a different font size
             if (os_window->window_title && global_state.is_wayland) set_os_window_title(os_window, NULL);
         }
-        return Py_BuildValue("d", os_window->font_sz_in_pts);
+        return Py_BuildValue("d", os_window->fonts_data->font_sz_in_pts);
     END_WITH_OS_WINDOW
     return Py_BuildValue("d", 0.0);
 }
@@ -1112,7 +1141,7 @@ PYWRAP0(apply_options_update) {
         OSWindow *os_window = global_state.os_windows + o;
         get_platform_dependent_config_values(os_window->handle);
         os_window->background_opacity = OPT(background_opacity);
-        os_window->is_damaged = true;
+        if (!os_window->redraw_count) os_window->redraw_count++;
         for (size_t t = 0; t < os_window->num_tabs; t++) {
             Tab *tab = os_window->tabs + t;
             for (size_t w = 0; w < tab->num_windows; w++) {
@@ -1140,8 +1169,6 @@ PYWRAP1(patch_global_colors) {
     P(active_border_color); P(inactive_border_color); P(bell_border_color); P(tab_bar_background); P(tab_bar_margin_color);
     if (configured) {
         P(background); P(url_color);
-        P(mark1_background); P(mark1_foreground); P(mark2_background); P(mark2_foreground);
-        P(mark3_background); P(mark3_foreground);
     }
     if (PyErr_Occurred()) return NULL;
     Py_RETURN_NONE;
@@ -1176,7 +1203,7 @@ pyset_background_image(PyObject *self UNUSED, PyObject *args) {
         if (png_data && png_data_size) {
             ok = png_from_data(png_data, png_data_size, path, &bgimage->bitmap, &bgimage->width, &bgimage->height, &size);
         } else {
-            ok = png_path_to_bitmap(path, &bgimage->bitmap, &bgimage->width, &bgimage->height, &size);
+            ok = image_path_to_bitmap(path, &bgimage->bitmap, &bgimage->width, &bgimage->height, &bgimage->mmap_size);
         }
         if (!ok) {
             PyErr_Format(PyExc_ValueError, "Failed to load image from: %s", path);
@@ -1360,11 +1387,23 @@ os_window_focus_counters(PyObject *self UNUSED, PyObject *args UNUSED) {
     return ans;
 }
 
+static PyObject*
+get_mouse_data_for_window(PyObject *self UNUSED, PyObject *args) {
+    id_type os_window_id, tab_id, window_id;
+    PA("KKK", &os_window_id, &tab_id, &window_id);
+    WITH_WINDOW(os_window_id, tab_id, window_id)
+        return Py_BuildValue("{sI sI sO}", "cell_x", window->mouse_pos.cell_x, "cell_y", window->mouse_pos.cell_y,
+                "in_left_half_of_cell", window->mouse_pos.in_left_half_of_cell ? Py_True: Py_False);
+    END_WITH_WINDOW
+    Py_RETURN_NONE;
+}
+
 #define M(name, arg_type) {#name, (PyCFunction)name, arg_type, NULL}
 #define MW(name, arg_type) {#name, (PyCFunction)py##name, arg_type, NULL}
 
 static PyMethodDef module_methods[] = {
     M(os_window_focus_counters, METH_NOARGS),
+    M(get_mouse_data_for_window, METH_VARARGS),
     MW(update_pointer_shape, METH_VARARGS),
     MW(current_os_window, METH_NOARGS),
     MW(next_window_id, METH_NOARGS),
@@ -1442,6 +1481,9 @@ finalize(void) {
 #define F(x) free(OPT(x)); OPT(x) = NULL;
     F(background_image); F(bell_path); F(bell_theme); F(default_window_logo);
 #undef F
+    Py_CLEAR(global_state.options_object);
+    free_animation(OPT(animation.cursor));
+    free_animation(OPT(animation.visual_bell));
     // we leak the texture here since it is not guaranteed
     // that freeing the texture will work during shutdown and
     // the GPU driver should take care of it when the OpenGL context is

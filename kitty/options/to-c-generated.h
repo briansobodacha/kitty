@@ -45,6 +45,19 @@ convert_from_opts_disable_ligatures(PyObject *py_opts, Options *opts) {
 }
 
 static void
+convert_from_python_font_features(PyObject *val, Options *opts) {
+    font_features(val, opts);
+}
+
+static void
+convert_from_opts_font_features(PyObject *py_opts, Options *opts) {
+    PyObject *ret = PyObject_GetAttrString(py_opts, "font_features");
+    if (ret == NULL) return;
+    convert_from_python_font_features(ret, opts);
+    Py_DECREF(ret);
+}
+
+static void
 convert_from_python_modify_font(PyObject *val, Options *opts) {
     modify_font(val, opts);
 }
@@ -84,6 +97,19 @@ convert_from_opts_cursor_shape(PyObject *py_opts, Options *opts) {
 }
 
 static void
+convert_from_python_cursor_shape_unfocused(PyObject *val, Options *opts) {
+    opts->cursor_shape_unfocused = PyLong_AsLong(val);
+}
+
+static void
+convert_from_opts_cursor_shape_unfocused(PyObject *py_opts, Options *opts) {
+    PyObject *ret = PyObject_GetAttrString(py_opts, "cursor_shape_unfocused");
+    if (ret == NULL) return;
+    convert_from_python_cursor_shape_unfocused(ret, opts);
+    Py_DECREF(ret);
+}
+
+static void
 convert_from_python_cursor_beam_thickness(PyObject *val, Options *opts) {
     opts->cursor_beam_thickness = PyFloat_AsFloat(val);
 }
@@ -111,7 +137,7 @@ convert_from_opts_cursor_underline_thickness(PyObject *py_opts, Options *opts) {
 
 static void
 convert_from_python_cursor_blink_interval(PyObject *val, Options *opts) {
-    opts->cursor_blink_interval = parse_s_double_to_monotonic_t(val);
+    cursor_blink_interval(val, opts);
 }
 
 static void
@@ -132,6 +158,19 @@ convert_from_opts_cursor_stop_blinking_after(PyObject *py_opts, Options *opts) {
     PyObject *ret = PyObject_GetAttrString(py_opts, "cursor_stop_blinking_after");
     if (ret == NULL) return;
     convert_from_python_cursor_stop_blinking_after(ret, opts);
+    Py_DECREF(ret);
+}
+
+static void
+convert_from_python_scrollback_indicator_opacity(PyObject *val, Options *opts) {
+    opts->scrollback_indicator_opacity = PyFloat_AsFloat(val);
+}
+
+static void
+convert_from_opts_scrollback_indicator_opacity(PyObject *py_opts, Options *opts) {
+    PyObject *ret = PyObject_GetAttrString(py_opts, "scrollback_indicator_opacity");
+    if (ret == NULL) return;
+    convert_from_python_scrollback_indicator_opacity(ret, opts);
     Py_DECREF(ret);
 }
 
@@ -449,7 +488,7 @@ convert_from_opts_enable_audio_bell(PyObject *py_opts, Options *opts) {
 
 static void
 convert_from_python_visual_bell_duration(PyObject *val, Options *opts) {
-    opts->visual_bell_duration = parse_s_double_to_monotonic_t(val);
+    visual_bell_duration(val, opts);
 }
 
 static void
@@ -600,6 +639,19 @@ convert_from_opts_window_logo_alpha(PyObject *py_opts, Options *opts) {
     PyObject *ret = PyObject_GetAttrString(py_opts, "window_logo_alpha");
     if (ret == NULL) return;
     convert_from_python_window_logo_alpha(ret, opts);
+    Py_DECREF(ret);
+}
+
+static void
+convert_from_python_window_logo_scale(PyObject *val, Options *opts) {
+    window_logo_scale(val, opts);
+}
+
+static void
+convert_from_opts_window_logo_scale(PyObject *py_opts, Options *opts) {
+    PyObject *ret = PyObject_GetAttrString(py_opts, "window_logo_scale");
+    if (ret == NULL) return;
+    convert_from_python_window_logo_scale(ret, opts);
     Py_DECREF(ret);
 }
 
@@ -851,84 +903,6 @@ convert_from_opts_dim_opacity(PyObject *py_opts, Options *opts) {
 }
 
 static void
-convert_from_python_mark1_foreground(PyObject *val, Options *opts) {
-    opts->mark1_foreground = color_as_int(val);
-}
-
-static void
-convert_from_opts_mark1_foreground(PyObject *py_opts, Options *opts) {
-    PyObject *ret = PyObject_GetAttrString(py_opts, "mark1_foreground");
-    if (ret == NULL) return;
-    convert_from_python_mark1_foreground(ret, opts);
-    Py_DECREF(ret);
-}
-
-static void
-convert_from_python_mark1_background(PyObject *val, Options *opts) {
-    opts->mark1_background = color_as_int(val);
-}
-
-static void
-convert_from_opts_mark1_background(PyObject *py_opts, Options *opts) {
-    PyObject *ret = PyObject_GetAttrString(py_opts, "mark1_background");
-    if (ret == NULL) return;
-    convert_from_python_mark1_background(ret, opts);
-    Py_DECREF(ret);
-}
-
-static void
-convert_from_python_mark2_foreground(PyObject *val, Options *opts) {
-    opts->mark2_foreground = color_as_int(val);
-}
-
-static void
-convert_from_opts_mark2_foreground(PyObject *py_opts, Options *opts) {
-    PyObject *ret = PyObject_GetAttrString(py_opts, "mark2_foreground");
-    if (ret == NULL) return;
-    convert_from_python_mark2_foreground(ret, opts);
-    Py_DECREF(ret);
-}
-
-static void
-convert_from_python_mark2_background(PyObject *val, Options *opts) {
-    opts->mark2_background = color_as_int(val);
-}
-
-static void
-convert_from_opts_mark2_background(PyObject *py_opts, Options *opts) {
-    PyObject *ret = PyObject_GetAttrString(py_opts, "mark2_background");
-    if (ret == NULL) return;
-    convert_from_python_mark2_background(ret, opts);
-    Py_DECREF(ret);
-}
-
-static void
-convert_from_python_mark3_foreground(PyObject *val, Options *opts) {
-    opts->mark3_foreground = color_as_int(val);
-}
-
-static void
-convert_from_opts_mark3_foreground(PyObject *py_opts, Options *opts) {
-    PyObject *ret = PyObject_GetAttrString(py_opts, "mark3_foreground");
-    if (ret == NULL) return;
-    convert_from_python_mark3_foreground(ret, opts);
-    Py_DECREF(ret);
-}
-
-static void
-convert_from_python_mark3_background(PyObject *val, Options *opts) {
-    opts->mark3_background = color_as_int(val);
-}
-
-static void
-convert_from_opts_mark3_background(PyObject *py_opts, Options *opts) {
-    PyObject *ret = PyObject_GetAttrString(py_opts, "mark3_background");
-    if (ret == NULL) return;
-    convert_from_python_mark3_background(ret, opts);
-    Py_DECREF(ret);
-}
-
-static void
 convert_from_python_close_on_child_death(PyObject *val, Options *opts) {
     opts->close_on_child_death = PyObject_IsTrue(val);
 }
@@ -1110,6 +1084,19 @@ convert_from_opts_macos_colorspace(PyObject *py_opts, Options *opts) {
     Py_DECREF(ret);
 }
 
+static void
+convert_from_python_wayland_enable_ime(PyObject *val, Options *opts) {
+    opts->wayland_enable_ime = PyObject_IsTrue(val);
+}
+
+static void
+convert_from_opts_wayland_enable_ime(PyObject *py_opts, Options *opts) {
+    PyObject *ret = PyObject_GetAttrString(py_opts, "wayland_enable_ime");
+    if (ret == NULL) return;
+    convert_from_python_wayland_enable_ime(ret, opts);
+    Py_DECREF(ret);
+}
+
 static bool
 convert_opts_from_python_opts(PyObject *py_opts, Options *opts) {
     convert_from_opts_font_size(py_opts, opts);
@@ -1118,11 +1105,15 @@ convert_opts_from_python_opts(PyObject *py_opts, Options *opts) {
     if (PyErr_Occurred()) return false;
     convert_from_opts_disable_ligatures(py_opts, opts);
     if (PyErr_Occurred()) return false;
+    convert_from_opts_font_features(py_opts, opts);
+    if (PyErr_Occurred()) return false;
     convert_from_opts_modify_font(py_opts, opts);
     if (PyErr_Occurred()) return false;
     convert_from_opts_text_composition_strategy(py_opts, opts);
     if (PyErr_Occurred()) return false;
     convert_from_opts_cursor_shape(py_opts, opts);
+    if (PyErr_Occurred()) return false;
+    convert_from_opts_cursor_shape_unfocused(py_opts, opts);
     if (PyErr_Occurred()) return false;
     convert_from_opts_cursor_beam_thickness(py_opts, opts);
     if (PyErr_Occurred()) return false;
@@ -1131,6 +1122,8 @@ convert_opts_from_python_opts(PyObject *py_opts, Options *opts) {
     convert_from_opts_cursor_blink_interval(py_opts, opts);
     if (PyErr_Occurred()) return false;
     convert_from_opts_cursor_stop_blinking_after(py_opts, opts);
+    if (PyErr_Occurred()) return false;
+    convert_from_opts_scrollback_indicator_opacity(py_opts, opts);
     if (PyErr_Occurred()) return false;
     convert_from_opts_scrollback_pager_history_size(py_opts, opts);
     if (PyErr_Occurred()) return false;
@@ -1204,6 +1197,8 @@ convert_opts_from_python_opts(PyObject *py_opts, Options *opts) {
     if (PyErr_Occurred()) return false;
     convert_from_opts_window_logo_alpha(py_opts, opts);
     if (PyErr_Occurred()) return false;
+    convert_from_opts_window_logo_scale(py_opts, opts);
+    if (PyErr_Occurred()) return false;
     convert_from_opts_resize_debounce_time(py_opts, opts);
     if (PyErr_Occurred()) return false;
     convert_from_opts_resize_in_steps(py_opts, opts);
@@ -1242,18 +1237,6 @@ convert_opts_from_python_opts(PyObject *py_opts, Options *opts) {
     if (PyErr_Occurred()) return false;
     convert_from_opts_dim_opacity(py_opts, opts);
     if (PyErr_Occurred()) return false;
-    convert_from_opts_mark1_foreground(py_opts, opts);
-    if (PyErr_Occurred()) return false;
-    convert_from_opts_mark1_background(py_opts, opts);
-    if (PyErr_Occurred()) return false;
-    convert_from_opts_mark2_foreground(py_opts, opts);
-    if (PyErr_Occurred()) return false;
-    convert_from_opts_mark2_background(py_opts, opts);
-    if (PyErr_Occurred()) return false;
-    convert_from_opts_mark3_foreground(py_opts, opts);
-    if (PyErr_Occurred()) return false;
-    convert_from_opts_mark3_background(py_opts, opts);
-    if (PyErr_Occurred()) return false;
     convert_from_opts_close_on_child_death(py_opts, opts);
     if (PyErr_Occurred()) return false;
     convert_from_opts_allow_hyperlinks(py_opts, opts);
@@ -1281,6 +1264,8 @@ convert_opts_from_python_opts(PyObject *py_opts, Options *opts) {
     convert_from_opts_macos_menubar_title_max_length(py_opts, opts);
     if (PyErr_Occurred()) return false;
     convert_from_opts_macos_colorspace(py_opts, opts);
+    if (PyErr_Occurred()) return false;
+    convert_from_opts_wayland_enable_ime(py_opts, opts);
     if (PyErr_Occurred()) return false;
     return true;
 }

@@ -3,7 +3,8 @@
 
 import re
 from binascii import hexlify, unhexlify
-from typing import Dict, Generator, Optional, cast
+from collections.abc import Generator
+from typing import Optional, cast
 
 from kitty.options.types import Options
 
@@ -181,7 +182,14 @@ string_capabilities = {
     'kbs': r'\177',
     # Mouse event has occurred
     'kmous': r'\E[M',
+
+    # These break mouse events in htop so they are disabled
+    # Turn on mouse reporting
+    # 'XM': '\E[?1006;1004;1000%?%p1%{1}%=%th%el%;',
+    # Expected format for mouse reporting escape codes
+    # 'xm': r'\E[<%i%p3%d;%p1%d;%p2%d;%?%p4%tM%em%;',
     # Scroll backwards (reverse index)
+
     'kri': r'\E[1;2A',
     # scroll forwards (index)
     'kind': r'\E[1;2B',
@@ -276,7 +284,7 @@ string_capabilities = {
     'Cr': r'\E]112\007',
     # Indicates support for styled and colored underlines (non-standard) as
     # described at: https://sw.kovidgoyal.net/kitty/underlines/
-    # 'Setulc' is quivalent to the 'Su' boolean capability. Until
+    # 'Setulc' is equivalent to the 'Su' boolean capability. Until
     # standardized, specify both for application compatibility.
     'Setulc': r'\E[58:2:%p1%{65536}%/%d:%p1%{256}%/%{255}%&%d:%p1%{255}%&%d%;m',
 
@@ -477,11 +485,11 @@ termcap_aliases.update({
         'FV FW FX FY FZ Fa Fb Fc Fd Fe Ff Fg Fh Fi Fj Fk Fl Fm Fn Fo '
         'Fp Fq Fr'.split(), 1)})
 
-queryable_capabilities = cast(Dict[str, str], numeric_capabilities.copy())
+queryable_capabilities = cast(dict[str, str], numeric_capabilities.copy())
 queryable_capabilities.update(string_capabilities)
 extra = (bool_capabilities | numeric_capabilities.keys() | string_capabilities.keys()) - set(termcap_aliases.values())
 no_termcap_for = frozenset(
-    'XR Ms RV kxIN kxOUT Cr Cs Se Ss Setulc Su Smulx Sync Tc PS PE BE BD setrgbf setrgbb fullkbd kUP kDN kbeg kBEG fe fd XF'.split() + [
+    'XR XM xm Ms RV kxIN kxOUT Cr Cs Se Ss Setulc Su Smulx Sync Tc PS PE BE BD setrgbf setrgbb fullkbd kUP kDN kbeg kBEG fe fd XF'.split() + [
         f'k{key}{mod}'
         for key in 'UP DN RIT LFT BEG END HOM IC DC PRV NXT'.split()
         for mod in range(3, 8)])
@@ -510,12 +518,13 @@ def key_as_bytes(name: str) -> bytes:
     return ans.encode('ascii')
 
 
-def get_capabilities(query_string: str, opts: 'Options') -> Generator[str, None, None]:
+def get_capabilities(query_string: str, opts: 'Options', window_id: int = 0, os_window_id: int = 0) -> Generator[str, None, None]:
     from .fast_data_types import ERROR_PREFIX
 
     def result(encoded_query_name: str, x: Optional[str] = None) -> str:
-        if x is None:
-            return f'0+r{encoded_query_name}'
+        if not x:
+            valid = 0 if x is None else 1
+            return f'{valid}+r{encoded_query_name}'
         return f'1+r{encoded_query_name}={hexlify(str(x).encode("utf-8")).decode("ascii")}'
 
     for encoded_query_name in query_string.split(';'):
@@ -525,7 +534,7 @@ def get_capabilities(query_string: str, opts: 'Options') -> Generator[str, None,
         elif name.startswith('kitty-query-'):
             from kittens.query_terminal.main import get_result
             name = name[len('kitty-query-'):]
-            rval = get_result(name)
+            rval = get_result(name, window_id, os_window_id)
             if rval is None:
                 from .utils import log_error
                 log_error('Unknown kitty terminfo query:', name)
@@ -533,6 +542,9 @@ def get_capabilities(query_string: str, opts: 'Options') -> Generator[str, None,
             else:
                 yield result(encoded_query_name, rval)
         else:
+            if name in bool_capabilities:
+                yield result(encoded_query_name, '')
+                continue
             try:
                 val = queryable_capabilities[name]
             except KeyError:

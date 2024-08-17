@@ -7,6 +7,7 @@ from kitty.constants import is_macos
 import kitty.constants
 from kitty.fast_data_types import Color, SingleKey
 import kitty.fast_data_types
+from kitty.fonts import FontSpec
 import kitty.fonts
 from kitty.options.utils import (
     AliasMap, KeyDefinition, KeyboardModeMap, MouseMap, MouseMapping, NotifyOnCmdFinish,
@@ -23,7 +24,7 @@ choices_for_default_pointer_shape = typing.Literal['arrow', 'beam', 'text', 'poi
 choices_for_linux_display_server = typing.Literal['auto', 'wayland', 'x11']
 choices_for_macos_colorspace = typing.Literal['srgb', 'default', 'displayp3']
 choices_for_macos_show_window_title_in = typing.Literal['all', 'menubar', 'none', 'window']
-choices_for_placement_strategy = typing.Literal['center', 'top-left']
+choices_for_placement_strategy = typing.Literal['top-left', 'top', 'top-right', 'left', 'center', 'right', 'bottom-left', 'bottom', 'bottom-right']
 choices_for_pointer_shape_when_dragging = choices_for_default_pointer_shape
 choices_for_pointer_shape_when_grabbed = choices_for_default_pointer_shape
 choices_for_strip_trailing_spaces = typing.Literal['always', 'never', 'smart']
@@ -31,9 +32,10 @@ choices_for_tab_bar_align = typing.Literal['left', 'center', 'right']
 choices_for_tab_bar_style = typing.Literal['fade', 'hidden', 'powerline', 'separator', 'slant', 'custom']
 choices_for_tab_powerline_style = typing.Literal['angled', 'round', 'slanted']
 choices_for_tab_switch_strategy = typing.Literal['last', 'left', 'previous', 'right']
+choices_for_terminfo_type = typing.Literal['path', 'direct', 'none']
 choices_for_undercurl_style = typing.Literal['thin-sparse', 'thin-dense', 'thick-sparse', 'thick-dense']
 choices_for_underline_hyperlinks = typing.Literal['hover', 'always', 'never']
-choices_for_window_logo_position = typing.Literal['top-left', 'top', 'top-right', 'left', 'center', 'right', 'bottom-left', 'bottom', 'bottom-right']
+choices_for_window_logo_position = choices_for_placement_strategy
 
 option_names = (  # {{{
  'action_alias',
@@ -329,6 +331,7 @@ option_names = (  # {{{
  'cursor_beam_thickness',
  'cursor_blink_interval',
  'cursor_shape',
+ 'cursor_shape_unfocused',
  'cursor_stop_blinking_after',
  'cursor_text_color',
  'cursor_underline_thickness',
@@ -344,6 +347,7 @@ option_names = (  # {{{
  'env',
  'exe_search_path',
  'file_transfer_confirmation_bypass',
+ 'filter_notification',
  'focus_follows_mouse',
  'font_family',
  'font_features',
@@ -401,9 +405,11 @@ option_names = (  # {{{
  'resize_debounce_time',
  'resize_in_steps',
  'scrollback_fill_enlarged_window',
+ 'scrollback_indicator_opacity',
  'scrollback_lines',
  'scrollback_pager',
  'scrollback_pager_history_size',
+ 'second_transparent_bg',
  'select_by_word_characters',
  'select_by_word_characters_forward',
  'selection_background',
@@ -433,6 +439,7 @@ option_names = (  # {{{
  'tab_title_max_length',
  'tab_title_template',
  'term',
+ 'terminfo_type',
  'text_composition_strategy',
  'text_fg_override_threshold',
  'touch_scroll_multiplier',
@@ -447,6 +454,7 @@ option_names = (  # {{{
  'visual_bell_duration',
  'visual_window_select_characters',
  'watcher',
+ 'wayland_enable_ime',
  'wayland_titlebar_color',
  'wheel_scroll_min_lines',
  'wheel_scroll_multiplier',
@@ -455,6 +463,7 @@ option_names = (  # {{{
  'window_logo_alpha',
  'window_logo_path',
  'window_logo_position',
+ 'window_logo_scale',
  'window_margin_width',
  'window_padding_width',
  'window_resize_step_cells',
@@ -481,8 +490,8 @@ class Options:
     bell_border_color: Color = Color(255, 90, 0)
     bell_on_tab: str = '🔔 '
     bell_path: typing.Optional[str] = None
-    bold_font: str = 'auto'
-    bold_italic_font: str = 'auto'
+    bold_font: FontSpec = FontSpec(family=None, style=None, postscript_name=None, full_name=None, system='auto', axes=(), variable_name=None, features=(), created_from_string='auto')
+    bold_italic_font: FontSpec = FontSpec(family=None, style=None, postscript_name=None, full_name=None, system='auto', axes=(), variable_name=None, features=(), created_from_string='auto')
     box_drawing_scale: typing.Tuple[float, float, float, float] = (0.001, 1.0, 1.5, 2.0)
     clear_all_mouse_actions: bool = False
     clear_all_shortcuts: bool = False
@@ -496,8 +505,9 @@ class Options:
     copy_on_select: str = ''
     cursor: typing.Optional[kitty.fast_data_types.Color] = Color(204, 204, 204)
     cursor_beam_thickness: float = 1.5
-    cursor_blink_interval: float = -1.0
+    cursor_blink_interval: typing.Tuple[float, kitty.options.utils.EasingFunction, kitty.options.utils.EasingFunction] = (-1.0, kitty.options.utils.EasingFunction(), kitty.options.utils.EasingFunction())
     cursor_shape: int = 1
+    cursor_shape_unfocused: int = 4
     cursor_stop_blinking_after: float = 15.0
     cursor_text_color: typing.Optional[kitty.fast_data_types.Color] = Color(17, 17, 17)
     cursor_underline_thickness: float = 2.0
@@ -512,7 +522,7 @@ class Options:
     enabled_layouts: typing.List[str] = ['fat', 'grid', 'horizontal', 'splits', 'stack', 'tall', 'vertical']
     file_transfer_confirmation_bypass: str = ''
     focus_follows_mouse: bool = False
-    font_family: str = 'monospace'
+    font_family: FontSpec = FontSpec(family=None, style=None, postscript_name=None, full_name=None, system='monospace', axes=(), variable_name=None, features=(), created_from_string='monospace')
     font_size: float = 11.0
     force_ltr: bool = False
     foreground: Color = Color(221, 221, 221)
@@ -526,7 +536,7 @@ class Options:
     initial_window_height: typing.Tuple[int, str] = (400, 'px')
     initial_window_width: typing.Tuple[int, str] = (640, 'px')
     input_delay: int = 3
-    italic_font: str = 'auto'
+    italic_font: FontSpec = FontSpec(family=None, style=None, postscript_name=None, full_name=None, system='auto', axes=(), variable_name=None, features=(), created_from_string='auto')
     kitty_mod: int = 5
     linux_bell_theme: str = '__custom'
     linux_display_server: choices_for_linux_display_server = 'auto'
@@ -560,9 +570,11 @@ class Options:
     resize_debounce_time: typing.Tuple[float, float] = (0.1, 0.5)
     resize_in_steps: bool = False
     scrollback_fill_enlarged_window: bool = False
+    scrollback_indicator_opacity: float = 1.0
     scrollback_lines: int = 2000
     scrollback_pager: typing.List[str] = ['less', '--chop-long-lines', '--RAW-CONTROL-CHARS', '+INPUT_LINE_NUMBER']
     scrollback_pager_history_size: int = 0
+    second_transparent_bg: typing.Optional[kitty.fast_data_types.Color] = None
     select_by_word_characters: str = '@-./_~?&=%+#'
     select_by_word_characters_forward: str = ''
     selection_background: typing.Optional[kitty.fast_data_types.Color] = Color(255, 250, 205)
@@ -591,6 +603,7 @@ class Options:
     tab_title_max_length: int = 0
     tab_title_template: str = '{fmt.fg.red}{bell_symbol}{activity_symbol}{fmt.fg.tab}{title}'
     term: str = 'xterm-kitty'
+    terminfo_type: choices_for_terminfo_type = 'path'
     text_composition_strategy: str = 'platform'
     text_fg_override_threshold: float = 0.0
     touch_scroll_multiplier: float = 1.0
@@ -602,8 +615,9 @@ class Options:
     url_prefixes: typing.Tuple[str, ...] = ('file', 'ftp', 'ftps', 'gemini', 'git', 'gopher', 'http', 'https', 'irc', 'ircs', 'kitty', 'mailto', 'news', 'sftp', 'ssh')
     url_style: int = 3
     visual_bell_color: typing.Optional[kitty.fast_data_types.Color] = None
-    visual_bell_duration: float = 0
+    visual_bell_duration: typing.Tuple[float, kitty.options.utils.EasingFunction, kitty.options.utils.EasingFunction] = (0.0, kitty.options.utils.EasingFunction(), kitty.options.utils.EasingFunction())
     visual_window_select_characters: str = '1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+    wayland_enable_ime: bool = True
     wayland_titlebar_color: int = 0
     wheel_scroll_min_lines: int = 1
     wheel_scroll_multiplier: float = 5.0
@@ -612,6 +626,7 @@ class Options:
     window_logo_alpha: float = 0.5
     window_logo_path: typing.Optional[str] = None
     window_logo_position: choices_for_window_logo_position = 'bottom-right'
+    window_logo_scale: typing.Tuple[float, float] = (0, -1.0)
     window_margin_width: FloatEdges = FloatEdges(left=0, top=0, right=0, bottom=0)
     window_padding_width: FloatEdges = FloatEdges(left=0, top=0, right=0, bottom=0)
     window_resize_step_cells: int = 2
@@ -619,7 +634,8 @@ class Options:
     action_alias: typing.Dict[str, str] = {}
     env: typing.Dict[str, str] = {}
     exe_search_path: typing.Dict[str, str] = {}
-    font_features: typing.Dict[str, typing.Tuple[kitty.fonts.FontFeature, ...]] = {}
+    filter_notification: typing.Dict[str, str] = {}
+    font_features: typing.Dict[str, typing.Tuple[kitty.fast_data_types.ParsedFontFeature, ...]] = {}
     kitten_alias: typing.Dict[str, str] = {}
     menu_map: typing.Dict[typing.Tuple[str, ...], str] = {}
     modify_font: typing.Dict[str, kitty.fonts.FontModification] = {}
@@ -741,6 +757,7 @@ defaults = Options()
 defaults.action_alias = {}
 defaults.env = {}
 defaults.exe_search_path = {}
+defaults.filter_notification = {}
 defaults.font_features = {}
 defaults.kitten_alias = {}
 defaults.menu_map = {}
@@ -1010,3 +1027,15 @@ defaults.mouse_map = [
     # show_clicked_cmd_output_ungrabbed
     MouseMapping(button=1, mods=5, definition='mouse_show_command_output'), 
 ]
+
+nullable_colors = frozenset({
+    'cursor'
+    'cursor_text_color'
+    'visual_bell_color'
+    'active_border_color'
+    'tab_bar_background'
+    'tab_bar_margin_color'
+    'second_transparent_bg'
+    'selection_foreground'
+    'selection_background'
+})

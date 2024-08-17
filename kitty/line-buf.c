@@ -71,7 +71,7 @@ clear(LineBuf *self, PyObject *a UNUSED) {
 }
 
 static PyObject *
-new(PyTypeObject *type, PyObject *args, PyObject UNUSED *kwds) {
+new_linebuf_object(PyTypeObject *type, PyObject *args, PyObject UNUSED *kwds) {
     LineBuf *self;
     unsigned int xnum = 1, ynum = 1;
 
@@ -124,6 +124,13 @@ dealloc(LineBuf* self) {
     Py_TYPE(self)->tp_free((PyObject*)self);
 }
 
+void
+linebuf_init_cells(LineBuf *lb, index_type idx, CPUCell **c, GPUCell **g) {
+    const index_type ynum = lb->line_map[idx];
+    *c = cpu_lineptr(lb, ynum);
+    *g = gpu_lineptr(lb, ynum);
+}
+
 static void
 init_line(LineBuf *lb, Line *l, index_type ynum) {
     l->cpu_cells = cpu_lineptr(lb, ynum);
@@ -137,6 +144,27 @@ linebuf_init_line(LineBuf *self, index_type idx) {
     self->line->attrs = self->line_attrs[idx];
     self->line->attrs.is_continued = idx > 0 ? gpu_lineptr(self, self->line_map[idx - 1])[self->xnum - 1].attrs.next_char_was_wrapped : false;
     init_line(self, self->line, self->line_map[idx]);
+}
+
+void
+linebuf_clear_lines(LineBuf *self, const Cursor *cursor, index_type start, index_type end) {
+#if BLANK_CHAR != 0
+#error This implementation is incorrect for BLANK_CHAR != 0
+#endif
+#define lineptr(which, i) which##_lineptr(self, self->line_map[i])
+    GPUCell *first_gpu_line = lineptr(gpu, start);
+    const GPUCell gc = cursor_as_gpu_cell(cursor);
+    memset_array(first_gpu_line, gc, self->xnum);
+    const size_t cpu_stride = sizeof(CPUCell) * self->xnum;
+    memset(lineptr(cpu, start), 0, cpu_stride);
+    const size_t gpu_stride = sizeof(GPUCell) * self->xnum;
+    linebuf_clear_attrs_and_dirty(self, start);
+    for (index_type i = start + 1; i < end; i++) {
+        memset(lineptr(cpu, i), 0, cpu_stride);
+        memcpy(lineptr(gpu, i), first_gpu_line, gpu_stride);
+        linebuf_clear_attrs_and_dirty(self, i);
+    }
+#undef lineptr
 }
 
 static PyObject*
@@ -527,7 +555,7 @@ PyTypeObject LineBuf_Type = {
     .tp_methods = methods,
     .tp_members = members,
     .tp_str = (reprfunc)__str__,
-    .tp_new = new
+    .tp_new = new_linebuf_object
 };
 
 INIT_TYPE(LineBuf)
@@ -609,5 +637,5 @@ rewrap(LineBuf *self, PyObject *args) {
 }
 
 LineBuf *alloc_linebuf(unsigned int lines, unsigned int columns) {
-    return (LineBuf*)new(&LineBuf_Type, Py_BuildValue("II", lines, columns), NULL);
+    return (LineBuf*)new_linebuf_object(&LineBuf_Type, Py_BuildValue("II", lines, columns), NULL);
 }

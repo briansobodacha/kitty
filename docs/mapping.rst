@@ -81,7 +81,7 @@ control scripts. To run a kitten on a key press::
 
     map f1 kitten mykitten.py
 
-Many of kitty;s features are themselves implemented as kittens, for example,
+Many of kitty's features are themselves implemented as kittens, for example,
 :doc:`/kittens/unicode_input`, :doc:`/kittens/hints` and
 :doc:`/kittens/themes`. To learn about writing your own kittens, see
 :doc:`/kittens/custom`.
@@ -189,9 +189,10 @@ has :code:`keyboard protocol` in its title. Run the show-key kitten as::
 Press :kbd:`ctrl+shift+t` and instead of a new tab opening, you will
 see the key press being reported by the kitten. :code:`--when-focus-on` can test
 the focused window using very powerful criteria, see :ref:`search_syntax` for
-details. A more practical example unmaps the key when the focused window is running vim::
+details. A more practical example unmaps the key when the focused window is
+running an editor::
 
-    map --when-focus-on var:in_editor
+    map --when-focus-on var:in_editor kitty_mod+c
 
 In order to make this work, you need to configure your editor as show below:
 
@@ -209,14 +210,14 @@ In order to make this work, you need to configure your editor as show below:
 
     .. code-block:: lua
 
-        vim.api.nvim_create_autocmd({ "VimEnter" }, {
+        vim.api.nvim_create_autocmd({ "VimEnter", "VimResume" }, {
             group = vim.api.nvim_create_augroup("KittySetVarVimEnter", { clear = true }),
             callback = function()
                 io.stdout:write("\x1b]1337;SetUserVar=in_editor=MQo\007")
             end,
         })
 
-        vim.api.nvim_create_autocmd({ "VimLeave" }, {
+        vim.api.nvim_create_autocmd({ "VimLeave", "VimSuspend" }, {
             group = vim.api.nvim_create_augroup("KittyUnsetVarVimLeave", { clear = true }),
             callback = function()
                 io.stdout:write("\x1b]1337;SetUserVar=in_editor\007")
@@ -224,6 +225,10 @@ In order to make this work, you need to configure your editor as show below:
         })
 
 These cause the editor to set the :code:`in_editor` variable in kitty and unset it when exiting.
+As a result, the :kbd:`ctrl+shift+c` key will be passed to the editor instead of
+copying to clipboard. In the editor, you can map it to copy to the clipboard,
+thereby allowing use of a common shortcut both inside and outside the editor
+for copying to clipboard.
 
 Sending arbitrary text or keys to the program running in kitty
 --------------------------------------------------------------------------------

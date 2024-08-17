@@ -4,12 +4,12 @@
 import importlib
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
 import time
 import unittest
+from collections.abc import Generator, Iterator, Sequence
 from contextlib import contextmanager
 from functools import lru_cache
 from tempfile import TemporaryDirectory
@@ -17,16 +17,11 @@ from threading import Thread
 from typing import (
     Any,
     Callable,
-    Dict,
-    Generator,
-    Iterator,
-    List,
     NoReturn,
     Optional,
-    Sequence,
-    Set,
-    Tuple,
 )
+
+from . import BaseTest
 
 
 def contents(package: str) -> Iterator[str]:
@@ -67,7 +62,7 @@ def find_all_tests(package: str = '', excludes: Sequence[str] = ('main', 'gr')) 
 
 def filter_tests(suite: unittest.TestSuite, test_ok: Callable[[unittest.TestCase], bool]) -> unittest.TestSuite:
     ans = unittest.TestSuite()
-    added: Set[unittest.TestCase] = set()
+    added: set[unittest.TestCase] = set()
     for test in itertests(suite):
         if test_ok(test) and test not in added:
             ans.addTest(test)
@@ -123,8 +118,8 @@ def run_cli(suite: unittest.TestSuite, verbosity: int = 4) -> bool:
     return result.wasSuccessful()
 
 
-def find_testable_go_packages() -> Tuple[Set[str], Dict[str, List[str]]]:
-    test_functions: Dict[str, List[str]] = {}
+def find_testable_go_packages() -> tuple[set[str], dict[str, list[str]]]:
+    test_functions: dict[str, list[str]] = {}
     ans = set()
     base = os.getcwd()
     pat = re.compile(r'^func Test([A-Z]\w+)', re.MULTILINE)
@@ -147,7 +142,7 @@ def go_exe() -> str:
 
 class GoProc(Thread):
 
-    def __init__(self, cmd: List[str]):
+    def __init__(self, cmd: list[str]):
         super().__init__(name='GoProc')
         from kitty.constants import kitty_exe
         env = os.environ.copy()
@@ -181,19 +176,18 @@ class GoProc(Thread):
         return self.stdout.decode('utf-8', 'replace'), self.proc.returncode
 
 
-def run_go(packages: Set[str], names: str) -> GoProc:
+def run_go(packages: set[str], names: str) -> GoProc:
     go = go_exe()
     go_pkg_args = [f'kitty/{x}' for x in packages]
     cmd = [go, 'test', '-v']
     for name in names:
         cmd.extend(('-run', name))
     cmd += go_pkg_args
-    print(shlex.join(cmd), flush=True)
     return GoProc(cmd)
 
 
 
-def reduce_go_pkgs(module: str, names: Sequence[str]) -> Set[str]:
+def reduce_go_pkgs(module: str, names: Sequence[str]) -> set[str]:
     if not go_exe():
         raise SystemExit('go executable not found, current path: ' + repr(os.environ.get('PATH', '')))
     go_packages, go_functions = find_testable_go_packages()
@@ -244,6 +238,7 @@ def run_python_tests(args: Any, go_proc: 'Optional[GoProc]' = None) -> None:
 
 
 def run_tests(report_env: bool = False) -> None:
+    report_env = report_env or BaseTest.is_ci
     import argparse
 
     parser = argparse.ArgumentParser()
@@ -264,11 +259,17 @@ def run_tests(report_env: bool = False) -> None:
     if args.name and args.name[0] in ('type-check', 'type_check', 'mypy'):
         type_check()
     go_pkgs = reduce_go_pkgs(args.module, args.name)
+    os.environ['ASAN_OPTIONS'] = 'detect_leaks=0'  # ensure subprocesses dont fail because of leak detection
     if go_pkgs:
         go_proc: 'Optional[GoProc]' = run_go(go_pkgs, args.name)
     else:
         go_proc = None
     with env_for_python_tests(report_env):
+        if go_pkgs:
+            if report_env:
+                print('Go executable:', go_exe())
+            print('Go packages being tested:', ' '.join(go_pkgs))
+        sys.stdout.flush()
         run_python_tests(args, go_proc)
 
 
@@ -295,12 +296,20 @@ def env_for_python_tests(report_env: bool = False) -> Iterator[None]:
     launcher_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'kitty', 'launcher')
     path = f'{launcher_dir}{os.pathsep}{path}'
     python_for_type_check()
-    if os.environ.get('CI') == 'true' or report_env:
+    print('Running under CI:', BaseTest.is_ci)
+    if report_env:
         print('Using PATH in test environment:', path)
         print('Python:', python_for_type_check())
+        from kitty.fast_data_types import has_avx2, has_sse4_2
+        print(f'Intrinsics: {has_avx2=} {has_sse4_2=}')
+    # we need fonts installed in the user home directory as well, so initialize
+    # fontconfig before nuking $HOME and friends
+    from kitty.fonts.common import all_fonts_map
+    all_fonts_map(True)
 
     with TemporaryDirectory() as tdir, env_vars(
         HOME=tdir,
+        KT_ORIGINAL_HOME=os.path.expanduser('~'),
         USERPROFILE=tdir,
         PATH=path,
         TERM='xterm-kitty',

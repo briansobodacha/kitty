@@ -4,9 +4,10 @@
 import os
 import shlex
 import sys
+from collections.abc import Generator, Iterator, Mapping
 from contextlib import suppress
 from functools import partial
-from typing import TYPE_CHECKING, Callable, Generator, Iterator, List, Mapping, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Optional, Union
 
 from .cli_stub import CLIOptions
 from .layout.interface import all_layouts
@@ -31,7 +32,7 @@ def get_os_window_sizing_data(opts: Options, session: Optional['Session'] = None
         opts.single_window_padding_width, opts.window_padding_width)
 
 
-ResizeSpec = Tuple[str, int]
+ResizeSpec = tuple[str, int]
 
 
 class WindowSpec:
@@ -39,13 +40,20 @@ class WindowSpec:
     def __init__(self, launch_spec: Union['LaunchSpec', 'SpecialWindowInstance']):
         self.launch_spec = launch_spec
         self.resize_spec: Optional[ResizeSpec] = None
+        self.focus_matching_window_spec: str = ''
+        self.is_background_process = False
+        if hasattr(launch_spec, 'opts'):  # LaunchSpec
+            from .launch import LaunchSpec
+            assert isinstance(launch_spec, LaunchSpec)
+            self.is_background_process = launch_spec.opts.type == 'background'
 
 
 class Tab:
 
     def __init__(self, opts: Options, name: str):
-        self.windows: List[WindowSpec] = []
+        self.windows: list[WindowSpec] = []
         self.pending_resize_spec: Optional[ResizeSpec] = None
+        self.pending_focus_matching_window: str = ''
         self.name = name.strip()
         self.active_window_idx = 0
         self.enabled_layouts = opts.enabled_layouts
@@ -53,17 +61,31 @@ class Tab:
         self.cwd: Optional[str] = None
         self.next_title: Optional[str] = None
 
+    @property
+    def has_non_background_processes(self) -> bool:
+        for w in self.windows:
+            if not w.is_background_process:
+                return True
+        return False
+
 
 class Session:
 
     def __init__(self, default_title: Optional[str] = None):
-        self.tabs: List[Tab] = []
+        self.tabs: list[Tab] = []
         self.active_tab_idx = 0
         self.default_title = default_title
         self.os_window_size: Optional[WindowSizes] = None
         self.os_window_class: Optional[str] = None
         self.os_window_state: Optional[str] = None
         self.focus_os_window: bool = False
+
+    @property
+    def has_non_background_processes(self) -> bool:
+        for t in self.tabs:
+            if t.has_non_background_processes:
+                return True
+        return False
 
     def add_tab(self, opts: Options, name: str = '') -> None:
         if self.tabs and not self.tabs[-1].windows:
@@ -78,7 +100,7 @@ class Session:
             raise ValueError(f'{val} is not a valid layout')
         self.tabs[-1].layout = val
 
-    def add_window(self, cmd: Union[None, str, List[str]], expand: Callable[[str], str] = lambda x: x) -> None:
+    def add_window(self, cmd: Union[None, str, list[str]], expand: Callable[[str], str] = lambda x: x) -> None:
         from .launch import parse_launch_args
         needs_expandvars = False
         if isinstance(cmd, str):
@@ -103,8 +125,11 @@ class Session:
         if t.pending_resize_spec is not None:
             t.windows[-1].resize_spec = t.pending_resize_spec
             t.pending_resize_spec = None
+        if t.pending_focus_matching_window:
+            t.windows[-1].focus_matching_window_spec = t.pending_focus_matching_window
+            t.pending_focus_matching_window = ''
 
-    def resize_window(self, args: List[str]) -> None:
+    def resize_window(self, args: list[str]) -> None:
         s = resize_window('resize_window', shlex.join(args))[1]
         spec: ResizeSpec = s[0], s[1]
         t = self.tabs[-1]
@@ -112,6 +137,13 @@ class Session:
             t.windows[-1].resize_spec = spec
         else:
             t.pending_resize_spec = spec
+
+    def focus_matching_window(self, spec: str) -> None:
+        t = self.tabs[-1]
+        if t.windows:
+            t.windows[-1].focus_matching_window_spec = spec
+        else:
+            t.pending_focus_matching_window = spec
 
     def add_special_window(self, sw: 'SpecialWindowInstance') -> None:
         self.tabs[-1].windows.append(WindowSpec(sw))
@@ -183,6 +215,8 @@ def parse_session(raw: str, opts: Options, environ: Optional[Mapping[str, str]] 
                 ans.os_window_state = rest
             elif cmd == 'resize_window':
                 ans.resize_window(rest.split())
+            elif cmd == 'focus_matching_window':
+                ans.focus_matching_window(rest)
             else:
                 raise ValueError(f'Unknown command in session file: {cmd}')
     yield finalize_session(ans)
@@ -222,7 +256,7 @@ def create_sessions(
                     session_data = f.read()
             yield from parse_session(session_data, opts, environ=environ)
             return
-    if default_session and default_session != 'none':
+    if default_session and default_session != 'none' and not getattr(args, 'args', None):
         try:
             with open(default_session) as f:
                 session_data = f.read()

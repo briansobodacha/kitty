@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"kitty/tools/tui/loop"
+	"kitty/tools/utils"
 )
 
 type stream_response struct {
@@ -26,9 +27,11 @@ func is_stream_response(serialized_response []byte) bool {
 
 func do_chunked_io(io_data *rc_io_data) (serialized_response []byte, err error) {
 	serialized_response = make([]byte, 0)
-	lp, err := loop.New(loop.NoAlternateScreen, loop.NoRestoreColors, loop.OnlyDisambiguateKeys)
+	lp, err := loop.New(loop.NoAlternateScreen, loop.NoRestoreColors)
 	if io_data.on_key_event != nil {
 		lp.FullKeyboardProtocol()
+	} else {
+		lp.NoKeyboardStateChange()
 	}
 	if err != nil {
 		return
@@ -45,19 +48,19 @@ func do_chunked_io(io_data *rc_io_data) (serialized_response []byte, err error) 
 	var check_for_timeout func(timer_id loop.IdType) error
 	wants_streaming := false
 
-	check_for_timeout = func(timer_id loop.IdType) error {
+	check_for_timeout = func(timer_id loop.IdType) (err error) {
 		if state != WAITING_FOR_RESPONSE && state != WAITING_FOR_STREAMING_RESPONSE {
-			return nil
+			return
 		}
 		if io_data.on_key_event != nil {
-			return nil
+			return
 		}
-		time_since_last_received_data := time.Now().Sub(last_received_data_at)
+		time_since_last_received_data := time.Since(last_received_data_at)
 		if time_since_last_received_data >= io_data.timeout {
 			return os.ErrDeadlineExceeded
 		}
-		lp.AddTimer(io_data.timeout-time_since_last_received_data, false, check_for_timeout)
-		return nil
+		_, err = lp.AddTimer(io_data.timeout-time_since_last_received_data, false, check_for_timeout)
+		return
 	}
 
 	transition_to_read := func() {
@@ -65,7 +68,7 @@ func do_chunked_io(io_data *rc_io_data) (serialized_response []byte, err error) 
 			lp.Quit(0)
 		}
 		last_received_data_at = time.Now()
-		lp.AddTimer(io_data.timeout, false, check_for_timeout)
+		_, _ = lp.AddTimer(io_data.timeout, false, check_for_timeout)
 	}
 
 	lp.OnReceivedData = func(data []byte) error {
@@ -109,7 +112,7 @@ func do_chunked_io(io_data *rc_io_data) (serialized_response []byte, err error) 
 			return err
 		}
 		if len(chunk) == 0 {
-			state = WAITING_FOR_RESPONSE
+			state = utils.IfElse(state == BEFORE_FIRST_ESCAPE_CODE_SENT && wants_streaming, WAITING_FOR_STREAMING_RESPONSE, WAITING_FOR_RESPONSE)
 			transition_to_read()
 		} else {
 			queue_escape_code(chunk)

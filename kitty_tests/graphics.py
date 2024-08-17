@@ -7,15 +7,13 @@ import tempfile
 import time
 import unittest
 import zlib
-from base64 import standard_b64decode, standard_b64encode
 from contextlib import suppress
 from dataclasses import dataclass
 from io import BytesIO
-from itertools import cycle
 
-from kitty.fast_data_types import load_png_data, parse_bytes, shm_unlink, shm_write, xor_data
+from kitty.fast_data_types import base64_decode, base64_encode, has_avx2, has_sse4_2, load_png_data, shm_unlink, shm_write, test_xor64
 
-from . import BaseTest
+from . import BaseTest, parse_bytes
 
 try:
     from PIL import Image
@@ -28,7 +26,7 @@ def send_command(screen, cmd, payload=b''):
     if payload:
         if isinstance(payload, str):
             payload = payload.encode('utf-8')
-        payload = standard_b64encode(payload).decode('ascii')
+        payload = base64_encode(payload).decode('ascii')
         cmd += ';' + payload
     cmd += '\033\\'
     c = screen.callbacks
@@ -185,21 +183,33 @@ def make_send_command(screen):
 class TestGraphics(BaseTest):
 
     def test_xor_data(self):
+        base_data = b'\x01' * 64
+        key = b'\x02' * 64
+        sizes = []
+        if has_sse4_2:
+            sizes.append(2)
+        if has_avx2:
+            sizes.append(3)
+        sizes.append(0)
 
-        def xor(skey, data):
-            ckey = cycle(bytearray(skey))
-            return bytes(bytearray(k ^ d for k, d in zip(ckey, bytearray(data))))
+        def t(key, data, align_offset=0):
+            expected = test_xor64(key, data, 1, 0)
+            for which_function in sizes:
+                actual = test_xor64(key, data, which_function, align_offset)
+                self.ae(expected, actual, f'{align_offset=} {len(data)=}')
 
-        base_data = os.urandom(64)
-        key = os.urandom(len(base_data))
-        for base in (b'', base_data):
+        t(key, b'')
+
+        for base in (b'abc', base_data):
             for extra in range(len(base_data)):
-                data = base + base_data[:extra]
-                self.assertEqual(xor_data(key, data), xor(key, data))
+                for align_offset in range(64):
+                    data = base + base_data[:extra]
+                    t(key, data, align_offset)
 
     def test_disk_cache(self):
         s = self.create_screen()
         dc = s.grman.disk_cache
+        dc.small_hole_threshold = 0
         data = {}
 
         def key_as_bytes(key):
@@ -223,24 +233,46 @@ class TestGraphics(BaseTest):
             for key, val in data.items():
                 self.ae(dc.get(key_as_bytes(key)), val)
 
+        def reset(small_hole_threshold=0, defrag_factor=2):
+            nonlocal dc, data, s
+            s = self.create_screen()
+            dc = s.grman.disk_cache
+            dc.small_hole_threshold = small_hole_threshold
+            dc.defrag_factor = defrag_factor
+            data = {}
+
+        holes_to_create = 2, 4, 6, 8
         for i in range(25):
             self.assertIsNone(add(i, f'{i}' * i))
+            if i <= max(holes_to_create):
+                # We wait here to ensure data is written in order, otherwise the
+                # holes test below can fail
+                self.assertTrue(dc.wait_for_write())
 
         self.assertEqual(dc.total_size, sum(map(len, data.values())))
         self.assertTrue(dc.wait_for_write())
         check_data()
         sz = dc.size_on_disk()
         self.assertEqual(sz, sum(map(len, data.values())))
-        for x in (2, 4, 6, 8):
+        self.assertFalse(dc.holes())
+        holes = set()
+        for x in holes_to_create:
             remove(x)
+            holes.add(x)
             check_data()
             self.assertRaises(KeyError, dc.get, key_as_bytes(x))
             self.assertEqual(sz, dc.size_on_disk())
-        for x in ('xy', 'C'*4, 'B'*6, 'A'*8):
+            self.assertEqual(holes, {x[1] for x in dc.holes()})
+        self.assertEqual(sz, dc.size_on_disk())
+        # fill holes largest first to ensure small one doesn't go into large accidentally causing fragmentation
+        for i, x in enumerate(sorted(holes, reverse=True)):
+            x = 'ABCDEFGH'[i] * x
             add(x, x)
             self.assertTrue(dc.wait_for_write())
-            self.assertEqual(sz, dc.size_on_disk())
             check_data()
+            holes.discard(len(x))
+            self.assertEqual(holes, {x[1] for x in dc.holes()})
+            self.assertEqual(sz, dc.size_on_disk(), f'Disk cache has unexpectedly grown from {sz} to {dc.size_on_disk} with data: {x!r}')
         check_data()
         dc.clear()
         st = time.monotonic()
@@ -288,6 +320,42 @@ class TestGraphics(BaseTest):
 
         dc.remove_from_ram(clear_predicate)
         self.assertEqual(dc.num_cached_in_ram(), 0)
+
+        reset(small_hole_threshold=512, defrag_factor=20)
+        self.assertIsNone(add(1, '1' * 1024))
+        self.assertIsNone(add(2, '2' * 1024))
+        dc.wait_for_write()
+        sz = dc.size_on_disk()
+        remove(1)
+        self.ae(sz, dc.size_on_disk())
+        self.ae({x[1] for x in dc.holes()}, {1024})
+        self.assertIsNone(add(3, '3' * 800))
+        dc.wait_for_write()
+        self.assertFalse(dc.holes())
+        self.ae(sz, dc.size_on_disk())
+        self.assertIsNone(add(4, '4' * 100))
+        sz += 100
+        dc.wait_for_write()
+        self.ae(sz, dc.size_on_disk())
+        check_data()
+        self.assertFalse(dc.holes())
+        remove(4)
+        self.assertFalse(dc.holes())
+        self.assertIsNone(add(5, '5' * 10))
+        sz += 10
+        dc.wait_for_write()
+        self.ae(sz, dc.size_on_disk())
+
+        # test hole coalescing
+        reset(defrag_factor=20)
+        for i in range(1, 6):
+            self.assertIsNone(add(i, str(i)*i))
+            dc.wait_for_write()
+        remove(2)
+        remove(4)
+        self.assertEqual(dc.holes(), {(1, 2), (6, 4)})
+        remove(3)
+        self.assertEqual(dc.holes(), {(1, 9)})
 
     def test_suppressing_gr_command_responses(self):
         s, g, pl, sl = load_helpers(self)
@@ -342,20 +410,27 @@ class TestGraphics(BaseTest):
         img = g.image_for_client_id(1)
         self.ae(img['data'], b'abcdefghijklmnop')
 
+        random_data = byte_block(32 * 1024)
+        sl(
+            random_data,
+            s=1024,
+            v=8,
+            expecting_data=random_data
+        )
+
         # Test compression
-        random_data = byte_block(3 * 1024)
         compressed_random_data = zlib.compress(random_data)
         sl(
             compressed_random_data,
-            s=24,
-            v=32,
+            s=1024,
+            v=8,
             o='z',
             expecting_data=random_data
         )
 
         # Test chunked + compressed
         b = len(compressed_random_data) // 2
-        self.assertIsNone(pl(compressed_random_data[:b], s=24, v=32, o='z', m=1))
+        self.assertIsNone(pl(compressed_random_data[:b], s=1024, v=8, o='z', m=1))
         self.ae(pl(compressed_random_data[b:], m=0), 'OK')
         img = g.image_for_client_id(1)
         self.ae(img['data'], random_data)
@@ -364,10 +439,10 @@ class TestGraphics(BaseTest):
         def load_temp(prefix='tty-graphics-protocol-'):
             f = tempfile.NamedTemporaryFile(prefix=prefix)
             f.write(random_data), f.flush()
-            sl(f.name, s=24, v=32, t='f', expecting_data=random_data)
+            sl(f.name, s=1024, v=8, t='f', expecting_data=random_data)
             self.assertTrue(os.path.exists(f.name))
             f.seek(0), f.truncate(), f.write(compressed_random_data), f.flush()
-            sl(f.name, s=24, v=32, t='t', o='z', expecting_data=random_data)
+            sl(f.name, s=1024, v=8, t='t', o='z', expecting_data=random_data)
             return f
 
         f = load_temp()
@@ -381,7 +456,7 @@ class TestGraphics(BaseTest):
         # Test loading from POSIX SHM
         name = '/kitty-test-shm'
         shm_write(name, random_data)
-        sl(name, s=24, v=32, t='s', expecting_data=random_data)
+        sl(name, s=1024, v=8, t='s', expecting_data=random_data)
         self.assertRaises(
             FileNotFoundError, shm_unlink, name
         )  # check that file was deleted
@@ -421,7 +496,7 @@ class TestGraphics(BaseTest):
 
     def test_load_png_simple(self):
         # 1x1 transparent PNG
-        png_data = standard_b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+P+/HgAFhAJ/wlseKgAAAABJRU5ErkJggg==')
+        png_data = base64_decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+P+/HgAFhAJ/wlseKgAAAABJRU5ErkJggg==')
         expected = b'\x00\xff\xff\x7f'
         self.ae(load_png_data(png_data), (expected, 1, 1))
         s, g, pl, sl = load_helpers(self)
@@ -502,29 +577,34 @@ class TestGraphics(BaseTest):
     def test_image_put(self):
         cw, ch = 10, 20
         s, dx, dy, put_image, put_ref, layers, rect_eq = put_helpers(self, cw, ch)
-        self.ae(put_image(s, 10, 20)[1], 'OK')
+        self.ae(put_image(s, cw, ch)[1], 'OK')
         l0 = layers(s)
         self.ae(len(l0), 1)
         rect_eq(l0[0]['src_rect'], 0, 0, 1, 1)
         rect_eq(l0[0]['dest_rect'], -1, 1, -1 + dx, 1 - dy)
         self.ae(l0[0]['group_count'], 1)
         self.ae(s.cursor.x, 1), self.ae(s.cursor.y, 0)
-        iid, (code, idstr) = put_ref(s, num_cols=s.columns, x_off=2, y_off=1, width=3, height=5, cell_x_off=3, cell_y_off=1, z=-1, placement_id=17)
+        src_width, src_height = 3, 5
+        iid, (code, idstr) = put_ref(s, num_cols=s.columns, num_lines=1, x_off=2, y_off=1, width=src_width, height=src_height,
+                                     cell_x_off=3, cell_y_off=1, z=-1, placement_id=17)
         self.ae(idstr, f'i={iid},p=17')
         l2 = layers(s)
         self.ae(len(l2), 2)
+        self.ae(l2[1], l0[0])
         rect_eq(l2[0]['src_rect'], 2 / 10, 1 / 20, (2 + 3) / 10, (1 + 5)/20)
-        left, top = -1 + dx + 3 * dx / cw, 1 - 1 * dy / ch
-        rect_eq(l2[0]['dest_rect'], left, top, -1 + (1 + s.columns) * dx, top - dy * 5 / ch)
-        rect_eq(l2[1]['src_rect'], 0, 0, 1, 1)
-        rect_eq(l2[1]['dest_rect'], -1, 1, -1 + dx, 1 - dy)
         self.ae(l2[0]['group_count'], 2)
-        self.ae(l2[1]['group_count'], 1)
+        left, top = -1 + dx + 3 * dx / cw, 1 - 1 * dy / ch
+        right = -1 + (1 + s.columns) * dx
+        bottom = 1 - dy
+        rect_eq(l2[0]['dest_rect'], left, top, right, bottom)
         self.ae(s.cursor.x, 0), self.ae(s.cursor.y, 1)
         self.ae(put_image(s, 10, 20, cursor_movement=1)[1], 'OK')
         self.ae(s.cursor.x, 0), self.ae(s.cursor.y, 1)
         s.reset()
         self.assertEqual(s.grman.disk_cache.total_size, 0)
+        self.ae(put_image(s, 2*cw, 2*ch, num_cols=3)[1], 'OK')
+        self.ae((s.cursor.x, s.cursor.y), (3, 2))
+        rect_eq(layers(s)[0]['dest_rect'], -1, 1, -1 + 3 * dx, 1 - 3*dy)
 
     def test_image_layer_grouping(self):
         cw, ch = 10, 20
@@ -952,7 +1032,9 @@ class TestGraphics(BaseTest):
 
         put_image(s, cw, ch)
         delete()
-        self.ae(len(layers(s)), 0), self.ae(s.grman.image_count, 1)
+        self.ae(s.grman.image_count, 1)
+        self.ae(len(layers(s)), 0)
+        self.ae(s.grman.image_count, 1)
         delete('A')
         self.ae(s.grman.image_count, 0)
         self.assertEqual(s.grman.disk_cache.total_size, 0)
@@ -979,6 +1061,13 @@ class TestGraphics(BaseTest):
         self.assertEqual(s.grman.disk_cache.total_size, 0)
         put_image(s, cw, ch, z=9)
         delete('Z', z=9)
+        self.ae(s.grman.image_count, 0)
+        put_image(s, cw, ch, id=1)
+        put_image(s, cw, ch, id=2)
+        put_image(s, cw, ch, id=3)
+        delete('R', y=2)
+        self.ae(s.grman.image_count, 1)
+        delete('R', x=3, y=3)
         self.ae(s.grman.image_count, 0)
         self.assertEqual(s.grman.disk_cache.total_size, 0)
 
@@ -1151,3 +1240,40 @@ class TestGraphics(BaseTest):
         s.reset()
         self.ae(g.image_count, 0)
         self.assertEqual(g.disk_cache.total_size, 0)
+
+    @unittest.skipIf(Image is None, 'PIL not available, skipping PNG tests')
+    def test_cached_rgba_conversion(self):
+        from kitty.render_cache import ImageRenderCacheForTesting
+        w, h = 5, 3
+        rgba_data = byte_block(w * h * 4)
+        img = Image.frombytes('RGBA', (w, h), rgba_data)
+        buf = BytesIO()
+        img.save(buf, 'PNG')
+        png_data = buf.getvalue()
+        with tempfile.TemporaryDirectory() as cache_path:
+            irc = ImageRenderCacheForTesting(cache_path)
+            srcs, outputs = [], []
+            for i in range(2 * irc.max_entries):
+                with open(os.path.join(cache_path, f'{i}.png'), 'wb') as f:
+                    f.write(png_data)
+                srcs.append(f.name)
+                outputs.append(irc.render(f.name))
+                entries = list(irc.entries())
+                self.assertLessEqual(len(entries), irc.max_entries)
+            self.ae(irc.num_of_renders, len(outputs))
+            remaining_outputs = outputs[-irc.max_entries:]
+            for x in remaining_outputs:
+                self.assertTrue(os.path.exists(x))
+            for x in outputs[:-irc.max_entries]:
+                self.assertFalse(os.path.exists(x))
+            self.assertLess(os.path.getmtime(remaining_outputs[0]), os.path.getmtime(remaining_outputs[1]))
+            remaining_srcs = srcs[-irc.max_entries:]
+            self.ae(irc.render(remaining_srcs[0]), remaining_outputs[0])
+            self.ae(irc.num_of_renders, len(outputs))
+            self.assertGreater(os.path.getmtime(remaining_outputs[0]), os.path.getmtime(remaining_outputs[1]))
+
+            width, height, fd = irc(remaining_srcs[-1])
+            with open(fd, 'rb') as f:
+                self.ae((width, height), (w, h))
+                f.seek(8)
+                self.ae(rgba_data, f.read())

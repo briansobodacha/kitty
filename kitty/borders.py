@@ -1,12 +1,14 @@
 #!/usr/bin/env python
 # License: GPL v3 Copyright: 2016, Kovid Goyal <kovid at kovidgoyal.net>
 
+from collections.abc import Iterable, Sequence
 from enum import IntFlag
-from typing import Iterable, NamedTuple, Sequence
+from typing import NamedTuple
 
 from .fast_data_types import BORDERS_PROGRAM, add_borders_rect, get_options, init_borders_program, os_window_has_background_image
 from .shaders import program_for
 from .typing import LayoutType
+from .utils import color_as_int
 from .window_list import WindowGroup, WindowList
 
 
@@ -96,7 +98,7 @@ class Borders:
         active_group = all_windows.active_group
 
         for i, wg in enumerate(groups):
-            window_bg = wg.default_bg
+            window_bg = color_as_int(wg.default_bg)
             window_bg = (window_bg << 8) | BorderColor.window_bg
             if draw_borders and not draw_minimal_borders:
                 # Draw the border rectangles

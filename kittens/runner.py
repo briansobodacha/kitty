@@ -7,10 +7,11 @@ import os
 import sys
 from contextlib import contextmanager
 from functools import partial
-from typing import TYPE_CHECKING, Any, Dict, FrozenSet, Generator, List, Optional, cast
+from typing import TYPE_CHECKING, Any, Callable, Dict, FrozenSet, Generator, List, NamedTuple, Optional, cast
 
 from kitty.constants import list_kitty_resources
 from kitty.types import run_once
+from kitty.typing import BossType, WindowType
 from kitty.utils import resolve_abs_or_config_path
 
 aliases = {'url_hints': 'hints'}
@@ -43,6 +44,11 @@ def preserve_sys_path() -> Generator[None, None, None]:
             sys.path.extend(orig)
 
 
+class CLIOnlyKitten(TypeError):
+    def __init__(self, kitten: str):
+        super().__init__(f'The {kitten} kitten must be run only at the commandline, as: kitten {kitten}')
+
+
 def import_kitten_main_module(config_dir: str, kitten: str) -> Dict[str, Any]:
     if kitten.endswith('.py'):
         with preserve_sys_path():
@@ -59,18 +65,35 @@ def import_kitten_main_module(config_dir: str, kitten: str) -> Dict[str, Any]:
 
     kitten = resolved_kitten(kitten)
     m = importlib.import_module(f'kittens.{kitten}.main')
-    return {'start': getattr(m, 'main'), 'end': getattr(m, 'handle_result', lambda *a, **k: None)}
+    if not hasattr(m, 'main'):
+        raise CLIOnlyKitten(kitten)
+    return {
+        'start': getattr(m, 'main'),
+        'end': getattr(m, 'handle_result', lambda *a, **k: None),
+    }
 
 
-def create_kitten_handler(kitten: str, orig_args: List[str]) -> Any:
+class KittenMetadata(NamedTuple):
+    handle_result: Callable[[Any, int, BossType], None] = lambda *a: None
+
+    type_of_input: Optional[str] = None
+    no_ui: bool = False
+    has_ready_notification: bool = False
+    open_url_handler: Optional[Callable[[BossType, WindowType, str, int, str], bool]] = None
+
+
+
+def create_kitten_handler(kitten: str, orig_args: List[str]) -> KittenMetadata:
     from kitty.constants import config_dir
     kitten = resolved_kitten(kitten)
     m = import_kitten_main_module(config_dir, kitten)
-    ans = partial(m['end'], [kitten] + orig_args)
-    setattr(ans, 'type_of_input', getattr(m['end'], 'type_of_input', None))
-    setattr(ans, 'no_ui', getattr(m['end'], 'no_ui', False))
-    setattr(ans, 'has_ready_notification', getattr(m['end'], 'has_ready_notification', False))
-    return ans
+    handle_result = m['end']
+    return KittenMetadata(
+        handle_result=partial(handle_result, [kitten] + orig_args),
+        type_of_input=getattr(handle_result, 'type_of_input', None),
+        no_ui=getattr(handle_result, 'no_ui', False),
+        has_ready_notification=getattr(handle_result, 'has_ready_notification', False),
+        open_url_handler=getattr(handle_result, 'open_url_handler', None))
 
 
 def set_debug(kitten: str) -> None:

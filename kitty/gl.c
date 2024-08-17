@@ -38,16 +38,22 @@ check_for_gl_error(void UNUSED *ret, const char *name, GLADapiproc UNUSED funcpt
     }
 }
 
-static bool is_nvidia = false;
-
-bool is_nvidia_gpu_driver(void) { return is_nvidia; }
+const char*
+gl_version_string(void) {
+    static char buf[256];
+    int gl_major = GLAD_VERSION_MAJOR(global_state.gl_version);
+    int gl_minor = GLAD_VERSION_MINOR(global_state.gl_version);
+    const char *gvs = (const char*)glGetString(GL_VERSION);
+    snprintf(buf, sizeof(buf), "'%s' Detected version: %d.%d", gvs, gl_major, gl_minor);
+    return buf;
+}
 
 void
 gl_init(void) {
     static bool glad_loaded = false;
     if (!glad_loaded) {
-        int gl_version = gladLoadGL(glfwGetProcAddress);
-        if (!gl_version) {
+        global_state.gl_version = gladLoadGL(glfwGetProcAddress);
+        if (!global_state.gl_version) {
             fatal("Loading the OpenGL library failed");
         }
         if (!global_state.debug_rendering) {
@@ -61,13 +67,11 @@ gl_init(void) {
         ARB_TEST(texture_storage);
 #undef ARB_TEST
         glad_loaded = true;
-        int gl_major = GLAD_VERSION_MAJOR(gl_version);
-        int gl_minor = GLAD_VERSION_MINOR(gl_version);
-        const char *gvs = (const char*)glGetString(GL_VERSION);
-        if (strstr(gvs, "NVIDIA")) is_nvidia = true;
-        if (global_state.debug_rendering) printf("GL version string: '%s' Detected version: %d.%d\n", gvs, gl_major, gl_minor);
+        int gl_major = GLAD_VERSION_MAJOR(global_state.gl_version);
+        int gl_minor = GLAD_VERSION_MINOR(global_state.gl_version);
+        if (global_state.debug_rendering) printf("[%.3f] GL version string: %s\n", monotonic_t_to_s_double(monotonic()), gl_version_string());
         if (gl_major < OPENGL_REQUIRED_VERSION_MAJOR || (gl_major == OPENGL_REQUIRED_VERSION_MAJOR && gl_minor < OPENGL_REQUIRED_VERSION_MINOR)) {
-            fatal("OpenGL version is %d.%d, version >= 3.3 required for kitty", gl_major, gl_minor);
+            fatal("OpenGL version is %d.%d, version >= %d.%d required for kitty", gl_major, gl_minor, OPENGL_REQUIRED_VERSION_MAJOR, OPENGL_REQUIRED_VERSION_MINOR);
         }
     }
 }

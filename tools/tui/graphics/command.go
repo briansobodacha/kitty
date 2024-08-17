@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"kitty/tools/tty"
 	"kitty/tools/tui/loop"
 	"kitty/tools/utils"
 )
@@ -115,6 +116,9 @@ const (
 	GRT_delete_by_cell_zindex // q
 	GRT_free_by_cell_zindex   // Q
 
+	GRT_delete_by_range // r
+	GRT_free_by_range   // R
+
 	GRT_delete_by_column // x
 	GRT_free_by_column   // X
 
@@ -144,6 +148,7 @@ type GraphicsCommand struct {
 
 	z int32
 
+	DisableCompression       bool
 	WrapPrefix, WrapSuffix   string
 	EncodeSerializedDataFunc func(string) string
 
@@ -198,6 +203,9 @@ func (self GraphicsCommand) String() string {
 	}
 	return ans + ")"
 }
+
+var debugprintln = tty.DebugPrintln
+var _ = debugprintln
 
 func (self *GraphicsCommand) serialize_to(buf io.StringWriter, chunk string) (err error) {
 	var ws func(string)
@@ -264,22 +272,23 @@ func (self *GraphicsCommand) WriteWithPayloadTo(o io.StringWriter, payload []byt
 		return self.serialize_to(o, "")
 	}
 	if len(payload) <= compression_threshold {
-		return self.serialize_to(o, base64.StdEncoding.EncodeToString(payload))
+		return self.serialize_to(o, base64.RawStdEncoding.EncodeToString(payload))
 	}
 	gc := *self
-	if self.Format() != GRT_format_png {
+	if !self.DisableCompression && self.Format() != GRT_format_png {
 		compressed := compress_with_zlib(payload)
 		if len(compressed) < len(payload) {
 			gc.SetCompression(GRT_compression_zlib)
 			payload = compressed
 		}
 	}
-	data := base64.StdEncoding.EncodeToString(payload)
+	const chunk_size = 128 * 1024
+	data := base64.RawStdEncoding.EncodeToString(payload)
 	for len(data) > 0 && err == nil {
 		chunk := data
-		if len(data) > 4096 {
-			chunk = data[:4096]
-			data = data[4096:]
+		if len(data) > chunk_size {
+			chunk = data[:chunk_size]
+			data = data[chunk_size:]
 		} else {
 			data = ""
 		}

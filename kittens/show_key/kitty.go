@@ -16,7 +16,7 @@ func csi(csi string) string {
 	return "CSI " + strings.NewReplacer(":", " : ", ";", " ; ").Replace(csi[:len(csi)-1]) + " " + csi[len(csi)-1:]
 }
 
-func run_kitty_loop(opts *Options) (err error) {
+func run_kitty_loop(_ *Options) (err error) {
 	lp, err := loop.New(loop.FullKeyboardProtocol)
 	if err != nil {
 		return err
@@ -61,6 +61,13 @@ func run_kitty_loop(opts *Options) (err error) {
 		}
 		lp.Println()
 		return
+	}
+	lp.OnText = func(text string, from_key_event bool, in_bracketed_paste bool) error {
+		if from_key_event {
+			return nil
+		}
+		lp.Printf("%s: %s\n\n", ctx.Green("Text"), text)
+		return nil
 	}
 
 	err = lp.Run()

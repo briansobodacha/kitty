@@ -126,7 +126,7 @@ receiving::
     ...
 
 The client must then wait for responses from the terminal emulator. It
-is an error to send anymore commands to to the terminal until an ``OK``
+is an error to send anymore commands to the terminal until an ``OK``
 response is received from the terminal. The terminal wait for the user to accept
 the request. If accepted, it sends::
 
@@ -245,7 +245,7 @@ File paths
     path must be no longer than 255 UTF-8 bytes. Total path length must be no
     more than 4096 bytes. Paths from Windows systems must use the forward slash
     as the separator, the first path component must be the drive letter with a
-    colon. For example: :file:`C:\some\file.txt` is represented as
+    colon. For example: :file:`C:\\some\\file.txt` is represented as
     :file:`/C:/some/file.txt`. For maximum portability, the following
     characters *should* be omitted from paths (however implementations are free
     to try to support them returning errors for non-representable paths)::

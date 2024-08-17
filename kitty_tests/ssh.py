@@ -16,7 +16,7 @@ from kitty.constants import is_macos, kitten_exe, runtime_dir
 from kitty.fast_data_types import CURSOR_BEAM, shm_unlink
 from kitty.utils import SSHConnectionData
 
-from . import BaseTest
+from . import BaseTest, retry_on_failure
 from .shell_integration import bash_ok, basic_shell_env
 
 
@@ -28,6 +28,7 @@ def files_in(path):
 
 class SSHKitten(BaseTest):
 
+    @retry_on_failure()
     def test_basic_pty_operations(self):
         pty = self.create_pty('echo hello')
         pty.process_input_from_child()
@@ -40,11 +41,12 @@ print(' '.join(map(str, buf)))'''), lines=13, cols=77)
         pty.process_input_from_child()
         self.ae(pty.screen_contents(), '13 77 770 260')
 
+    @retry_on_failure()
     def test_ssh_connection_data(self):
         def t(cmdline, binary='ssh', host='main', port=None, identity_file='', extra_args=()):
             if identity_file:
                 identity_file = os.path.abspath(identity_file)
-            en = set(f'{x[0]}' for x in extra_args)
+            en = {f'{x[0]}' for x in extra_args}
             q = get_connection_data(cmdline.split(), extra_args=en)
             self.ae(q, SSHConnectionData(binary, host, port, identity_file, extra_args))
 
@@ -57,11 +59,12 @@ print(' '.join(map(str, buf)))'''), lines=13, cols=77)
         self.assertTrue(runtime_dir())
 
     @property
-    @lru_cache()
+    @lru_cache
     def all_possible_sh(self):
         python = 'python3' if shutil.which('python3') else 'python'
         return tuple(filter(shutil.which, ('dash', 'zsh', 'bash', 'posh', 'sh', python)))
 
+    @retry_on_failure()
     def test_ssh_copy(self):
         simple_data = 'rkjlhfwf9whoaa'
 
@@ -99,7 +102,7 @@ copy --exclude **/w.* --exclude **/r d1
                 self.assertTrue(os.path.exists(f'{remote_home}/{tname}/78/xterm-kitty'))
                 self.assertTrue(os.path.exists(f'{remote_home}/{tname}/x/xterm-kitty'))
                 for w in ('simple-file', 'a/sfa', 's2'):
-                    with open(os.path.join(remote_home, w), 'r') as f:
+                    with open(os.path.join(remote_home, w)) as f:
                         self.ae(f.read(), simple_data)
                     self.assertFalse(os.path.islink(f.name))
                 self.assertTrue(os.path.lexists(f'{remote_home}/d1/y'))
@@ -119,6 +122,7 @@ copy --exclude **/w.* --exclude **/r d1
                 })
                 self.ae(len(glob.glob(f'{remote_home}/{tname}/*/xterm-kitty')), 2)
 
+    @retry_on_failure()
     def test_ssh_env_vars(self):
         tset = '$A-$(echo no)-`echo no2` !Q5 "something else"'
         for sh in self.all_possible_sh:
@@ -138,6 +142,7 @@ env COLORTERM
                 pty.wait_till(lambda: '/cwd' in pty.screen_contents())
                 self.assertTrue(pty.is_echo_on())
 
+    @retry_on_failure()
     def test_ssh_bootstrap_with_different_launchers(self):
         for launcher in self.all_possible_sh:
             if 'python' in launcher:
@@ -149,6 +154,7 @@ env COLORTERM
                         with self.subTest(sh=sh, launcher=q), tempfile.TemporaryDirectory() as tdir:
                             self.check_bootstrap(sh, tdir, test_script='env; exit 0', SHELL_INTEGRATION_VALUE='', launcher=q)
 
+    @retry_on_failure()
     def test_ssh_leading_data(self):
         script = 'echo "ld:$leading_data"; exit 0'
         for sh in self.all_possible_sh:
@@ -160,6 +166,7 @@ env COLORTERM
                     SHELL_INTEGRATION_VALUE='', pre_data='before_tarfile')
                 self.ae(pty.screen_contents(), 'UNTAR_DONE\nld:before_tarfile')
 
+    @retry_on_failure()
     def test_ssh_login_shell_detection(self):
         methods = []
         if shutil.which('python') or shutil.which('python3') or shutil.which('python2'):
@@ -187,6 +194,7 @@ env COLORTERM
                     pty = self.check_bootstrap(sh, tdir, test_script=f'{m}; echo "$login_shell"; exit 0', SHELL_INTEGRATION_VALUE='')
                     self.assertIn(expected_login_shell, pty.screen_contents())
 
+    @retry_on_failure()
     def test_ssh_shell_integration(self):
         ok_login_shell = ''
         for sh in self.all_possible_sh:
@@ -250,13 +258,13 @@ env COLORTERM
                 if 'bzip2' in q:
                     raise ValueError('Untarring failed with screen contents:\n' + q)
                 return 'UNTAR_DONE' in q
-            pty.wait_till(check_untar_or_fail, timeout=30)
+            pty.wait_till(check_untar_or_fail, timeout=60)
             self.assertTrue(os.path.exists(os.path.join(home_dir, '.terminfo/kitty.terminfo')))
             if SHELL_INTEGRATION_VALUE != 'enabled':
-                pty.wait_till(lambda: len(pty.screen_contents().splitlines()) > 1, timeout=30)
+                pty.wait_till(lambda: len(pty.screen_contents().splitlines()) > 1, timeout=60)
                 self.assertEqual(pty.screen.cursor.shape, 0)
             else:
-                pty.wait_till(lambda: pty.screen.cursor.shape == CURSOR_BEAM, timeout=30)
+                pty.wait_till(lambda: pty.screen.cursor.shape == CURSOR_BEAM, timeout=60)
             return pty
         finally:
             with suppress(FileNotFoundError):

@@ -1,8 +1,9 @@
 #!/usr/bin/env python
 # License: GPL v3 Copyright: 2016, Kovid Goyal <kovid at kovidgoyal.net>
 
+from collections.abc import Iterable, Iterator
 from gettext import gettext as _
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from .constants import is_macos
 from .fast_data_types import (
@@ -37,7 +38,7 @@ def keyboard_mode_name(screen: ScreenType) -> str:
     return 'application' if screen.cursor_key_mode else 'normal'
 
 
-def get_shortcut(keymap: KeyMap, ev: KeyEvent) -> Optional[List[KeyDefinition]]:
+def get_shortcut(keymap: KeyMap, ev: KeyEvent) -> Optional[list[KeyDefinition]]:
     mods = ev.mods & mod_mask
     ans = keymap.get(SingleKey(mods, False, ev.key))
     if ans is None and ev.shifted_key and mods & GLFW_MOD_SHIFT:
@@ -63,11 +64,16 @@ class Mappings:
 
     ' Manage all keyboard mappings '
 
-    def __init__(self, global_shortcuts:Optional[Dict[str, SingleKey]] = None) -> None:
-        self.keyboard_mode_stack: List[KeyboardMode] = []
+    def __init__(self, global_shortcuts:Optional[dict[str, SingleKey]] = None, callback_on_mode_change: Callable[[], Any] = lambda: None) -> None:
+        self.keyboard_mode_stack: list[KeyboardMode] = []
         self.update_keymap(global_shortcuts)
+        self.callback_on_mode_change = callback_on_mode_change
 
-    def update_keymap(self, global_shortcuts:Optional[Dict[str, SingleKey]] = None) -> None:
+    @property
+    def current_keyboard_mode_name(self) -> str:
+        return self.keyboard_mode_stack[-1].name if self.keyboard_mode_stack else ''
+
+    def update_keymap(self, global_shortcuts:Optional[dict[str, SingleKey]] = None) -> None:
         if global_shortcuts is None:
             global_shortcuts = self.set_cocoa_global_shortcuts(self.get_options()) if is_macos else {}
         self.global_shortcuts_map: KeyMap = {v: [KeyDefinition(definition=k)] for k, v in global_shortcuts.items()}
@@ -79,8 +85,11 @@ class Mappings:
             km.pop(sc, None)
 
     def clear_keyboard_modes(self) -> None:
+        had_mode = bool(self.keyboard_mode_stack)
         self.keyboard_mode_stack = []
         self.set_ignore_os_keyboard_processing(False)
+        if had_mode:
+            self.callback_on_mode_change()
 
     def pop_keyboard_mode(self) -> bool:
         passthrough = True
@@ -89,17 +98,24 @@ class Mappings:
             if not self.keyboard_mode_stack:
                 self.set_ignore_os_keyboard_processing(False)
             passthrough = False
+            self.callback_on_mode_change()
         return passthrough
+
+    def pop_keyboard_mode_if_is(self, name: str) -> bool:
+        if self.keyboard_mode_stack and self.keyboard_mode_stack[-1].name == name:
+            return self.pop_keyboard_mode()
+        return False
 
     def _push_keyboard_mode(self, mode: KeyboardMode) -> None:
         self.keyboard_mode_stack.append(mode)
         self.set_ignore_os_keyboard_processing(True)
+        self.callback_on_mode_change()
 
     def push_keyboard_mode(self, new_mode: str) -> None:
         mode = self.keyboard_modes[new_mode]
         self._push_keyboard_mode(mode)
 
-    def matching_key_actions(self, candidates: Iterable[KeyDefinition]) -> List[KeyDefinition]:
+    def matching_key_actions(self, candidates: Iterable[KeyDefinition]) -> list[KeyDefinition]:
         w = self.get_active_window()
         matches = []
         has_sequence_match = False
@@ -195,6 +211,7 @@ class Mappings:
                 if consumed and not is_root_mode and mode.on_action == 'end':
                     if mode_pos < len(self.keyboard_mode_stack) and self.keyboard_mode_stack[mode_pos] is mode:
                         del self.keyboard_mode_stack[mode_pos]
+                        self.callback_on_mode_change()
                         if not self.keyboard_mode_stack:
                             self.set_ignore_os_keyboard_processing(False)
                 return consumed
@@ -228,7 +245,7 @@ class Mappings:
         if b.args.debug_keyboard:
             print(*args, end=end, flush=True)
 
-    def set_cocoa_global_shortcuts(self, opts: Options) -> Dict[str, SingleKey]:
+    def set_cocoa_global_shortcuts(self, opts: Options) -> dict[str, SingleKey]:
         from .main import set_cocoa_global_shortcuts
         return set_cocoa_global_shortcuts(opts)
     # }}}

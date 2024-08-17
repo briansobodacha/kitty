@@ -4,9 +4,13 @@ package tui
 
 import (
 	"fmt"
+	"path/filepath"
 	"time"
 
+	"kitty"
+	"kitty/tools/config"
 	"kitty/tools/tui/loop"
+	"kitty/tools/utils"
 )
 
 var _ = fmt.Print
@@ -200,4 +204,151 @@ func (ms *MouseSelection) DragScroll(ev *loop.MouseEvent, lp *loop.Loop, callbac
 		ms.drag_scroll.timer_id, _ = lp.AddTimer(50*time.Millisecond, false, callback)
 	}
 	ms.drag_scroll.mouse_event = *ev
+}
+
+type CellRegion struct {
+	TopLeft, BottomRight struct{ X, Y int }
+	Id                   string
+	OnClick              []func(id string) error
+}
+
+func (c CellRegion) Contains(x, y int) bool { // 0-based
+	if c.TopLeft.Y > y || c.BottomRight.Y < y {
+		return false
+	}
+	return (y > c.TopLeft.Y || (y == c.TopLeft.Y && x >= c.TopLeft.X)) && (y < c.BottomRight.Y || (y == c.BottomRight.Y && x <= c.BottomRight.X))
+}
+
+type MouseState struct {
+	Cell, Pixel struct{ X, Y int }
+	Pressed     struct{ Left, Right, Middle, Fourth, Fifth, Sixth, Seventh bool }
+
+	regions           []*CellRegion
+	region_id_map     map[string][]*CellRegion
+	hovered_ids       *utils.Set[string]
+	default_url_style struct {
+		value  string
+		loaded bool
+	}
+}
+
+func (m *MouseState) AddCellRegion(id string, start_x, start_y, end_x, end_y int, on_click ...func(id string) error) *CellRegion {
+	cr := CellRegion{TopLeft: struct{ X, Y int }{start_x, start_y}, BottomRight: struct{ X, Y int }{end_x, end_y}, Id: id, OnClick: on_click}
+	m.regions = append(m.regions, &cr)
+	if m.region_id_map == nil {
+		m.region_id_map = make(map[string][]*CellRegion)
+	}
+	m.region_id_map[id] = append(m.region_id_map[id], &cr)
+	return &cr
+}
+
+func (m *MouseState) ClearCellRegions() {
+	m.regions = nil
+	m.region_id_map = nil
+	m.hovered_ids = nil
+}
+
+func (m *MouseState) UpdateHoveredIds() (changed bool) {
+	h := utils.NewSet[string]()
+	for _, r := range m.regions {
+		if r.Contains(m.Cell.X, m.Cell.Y) {
+			h.Add(r.Id)
+		}
+	}
+	changed = !h.Equal(m.hovered_ids)
+	m.hovered_ids = h
+	return
+}
+
+func (m *MouseState) ApplyHoverStyles(lp *loop.Loop, style ...string) {
+	if m.hovered_ids == nil {
+		return
+	}
+	hs := ""
+	if len(style) == 0 {
+		if !m.default_url_style.loaded {
+			m.default_url_style.loaded = true
+			conf := filepath.Join(utils.ConfigDir(), "kitty.conf")
+			color, style := kitty.DefaultUrlColor, kitty.DefaultUrlStyle
+			cp := config.ConfigParser{LineHandler: func(key, val string) error {
+				switch key {
+				case "url_color":
+					color = val
+				case "url_style":
+					style = val
+				}
+				return nil
+			},
+			}
+			_ = cp.ParseFiles(conf) // ignore errors and use defaults
+			if style != "none" && style != "" {
+				m.default_url_style.value = fmt.Sprintf("u=%s uc=%s", style, color)
+			}
+		}
+		hs = m.default_url_style.value
+	} else {
+		hs = style[0]
+	}
+	is_hovered := false
+	for id := range m.hovered_ids.Iterable() {
+		for _, r := range m.region_id_map[id] {
+			lp.StyleRegion(hs, r.TopLeft.X, r.TopLeft.Y, r.BottomRight.X, r.BottomRight.Y)
+			is_hovered = true
+		}
+	}
+	if is_hovered {
+		if s, has := lp.CurrentPointerShape(); !has || s != loop.POINTER_POINTER {
+			lp.PushPointerShape(loop.POINTER_POINTER)
+		}
+	} else {
+		lp.ClearPointerShapes()
+	}
+}
+
+func (m *MouseState) ClickHoveredRegions() error {
+	seen := utils.NewSet[string]()
+	for id := range m.hovered_ids.Iterable() {
+		for _, r := range m.region_id_map[id] {
+			if seen.Has(r.Id) {
+				continue
+			}
+			seen.Add(r.Id)
+			for _, f := range r.OnClick {
+				if err := f(r.Id); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (m *MouseState) UpdateState(ev *loop.MouseEvent) (hovered_ids_changed bool) {
+	m.Cell = ev.Cell
+	m.Pixel = ev.Pixel
+	if ev.Event_type == loop.MOUSE_PRESS || ev.Event_type == loop.MOUSE_RELEASE {
+		pressed := ev.Event_type == loop.MOUSE_PRESS
+		if ev.Buttons&loop.LEFT_MOUSE_BUTTON != 0 {
+			m.Pressed.Left = pressed
+		}
+		if ev.Buttons&loop.RIGHT_MOUSE_BUTTON != 0 {
+			m.Pressed.Right = pressed
+		}
+		if ev.Buttons&loop.MIDDLE_MOUSE_BUTTON != 0 {
+			m.Pressed.Middle = pressed
+		}
+		if ev.Buttons&loop.FOURTH_MOUSE_BUTTON != 0 {
+			m.Pressed.Fourth = pressed
+		}
+		if ev.Buttons&loop.FIFTH_MOUSE_BUTTON != 0 {
+			m.Pressed.Fifth = pressed
+		}
+		if ev.Buttons&loop.SIXTH_MOUSE_BUTTON != 0 {
+			m.Pressed.Sixth = pressed
+		}
+		if ev.Buttons&loop.SEVENTH_MOUSE_BUTTON != 0 {
+			m.Pressed.Seventh = pressed
+		}
+	}
+	return m.UpdateHoveredIds()
 }

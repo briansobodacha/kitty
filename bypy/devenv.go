@@ -21,14 +21,24 @@ import (
 
 const (
 	folder                     = "dependencies"
+	fonts_folder               = "fonts"
 	macos_prefix               = "/Users/Shared/kitty-build/sw/sw"
 	macos_python               = "python/Python.framework/Versions/Current/bin/python3"
 	macos_python_framework     = "python/Python.framework/Versions/Current/Python"
 	macos_python_framework_exe = "python/Python.framework/Versions/Current/Resources/Python.app/Contents/MacOS/Python"
+	NERD_URL                   = "https://github.com/ryanoasis/nerd-fonts/releases/latest/download/NerdFontsSymbolsOnly.tar.xz"
 )
 
 func root_dir() string {
 	f, e := filepath.Abs(filepath.Join(folder, runtime.GOOS+"-"+runtime.GOARCH))
+	if e != nil {
+		exit(e)
+	}
+	return f
+}
+
+func fonts_dir() string {
+	f, e := filepath.Abs(fonts_folder)
 	if e != nil {
 		exit(e)
 	}
@@ -242,7 +252,9 @@ func dependencies(args []string) {
 	chdir_to_base()
 	nf := flag.NewFlagSet("deps", flag.ExitOnError)
 	docsptr := nf.Bool("for-docs", false, "download the dependencies needed to build the documentation")
-	nf.Parse(args)
+	if err := nf.Parse(args); err != nil {
+		exit(err)
+	}
 	if *docsptr {
 		dependencies_for_docs()
 		fmt.Println("Dependencies needed to generate documentation have been installed. Build docs with ./dev.sh docs")
@@ -323,7 +335,20 @@ func dependencies(args []string) {
 	}); err != nil {
 		exit(err)
 	}
-	fmt.Println(`Dependencies downloaded. Now build kitty with: make develop`)
+	tarfile, _ = filepath.Abs(cached_download(NERD_URL))
+	root = fonts_dir()
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		exit(err)
+	}
+	cmd = exec.Command("tar", "xf", tarfile, "SymbolsNerdFontMono-Regular.ttf")
+	cmd.Dir = root
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err = cmd.Run(); err != nil {
+		exit(err)
+	}
+
+	fmt.Println(`Dependencies downloaded. Now build kitty with: ./dev.sh build`)
 }
 
 // }}}
@@ -384,7 +409,9 @@ func docs(args []string) {
 	nf := flag.NewFlagSet("deps", flag.ExitOnError)
 	livereload := nf.Bool("live-reload", false, "build the docs and make them available via s local server with live reloading for ease of development")
 	failwarn := nf.Bool("fail-warn", false, "make warnings fatal when building the docs")
-	nf.Parse(args)
+	if err := nf.Parse(args); err != nil {
+		exit(err)
+	}
 	exe := filepath.Join(root_dir(), "bin", "sphinx-build")
 	aexe := filepath.Join(root_dir(), "bin", "sphinx-autobuild")
 	target := "docs"

@@ -50,6 +50,18 @@ Glossary
       inside kitty windows and provide it with lots of powerful and flexible
       features such as viewing images, connecting conveniently to remote
       computers, transferring files, inputting unicode characters, etc.
+      They can also be written by users in Python and used to customize and
+      extend kitty functionality, see :doc:`kittens_intro` for details.
+
+   easing function
+      A function that controls how an animation progresses over time. kitty
+      support the `CSS syntax for easing functions
+      <https://developer.mozilla.org/en-US/docs/Web/CSS/easing-function>`__.
+      Commonly used easing functions are :code:`linear` for a constant rate
+      animation and :code:`ease-in-out` for an animation that starts slow,
+      becomes fast in the middle and ends slowly. These are used to control
+      various animations in kitty, such as :opt:`cursor_blink_interval` and
+      :opt:`visual_bell_duration`.
 
 .. _env_vars:
 
@@ -85,6 +97,11 @@ Variables that influence kitty behavior
 .. envvar:: EDITOR
 
    Same as :envvar:`VISUAL`. Used if :envvar:`VISUAL` is not set.
+
+.. envvar:: SHELL
+
+   Specifies the default shell kitty will run when :opt:`shell` is set to
+   :code:`.`.
 
 .. envvar:: GLFW_IM_MODULE
 
@@ -164,7 +181,8 @@ Variables that kitty sets when running child programs
 
 .. envvar:: TERMINFO
 
-   Path to a directory containing the kitty terminfo database.
+   Path to a directory containing the kitty terminfo database. Or the terminfo
+   database itself encoded in base64. See :opt:`terminfo_type`.
 
 .. envvar:: KITTY_INSTALLATION_DIR
 
@@ -230,3 +248,11 @@ Variables that kitty sets when running child programs
 
    Set to ``1`` when kitty is running a shell because of the ``--hold`` flag. Can
    be used to specialize shell behavior in the shell rc files as desired.
+
+.. envvar:: KITTY_SIMD
+
+   Set it to ``128`` to use 128 bit vector registers, ``256`` to use 256 bit
+   vector registers or any other value to prevent kitty from using SIMD CPU
+   vector instructions. Warning, this overrides CPU capability detection so
+   will cause kitty to crash with SIGILL if your CPU does not support the
+   necessary SIMD extensions.

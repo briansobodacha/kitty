@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"kitty/tools/simdstring"
 )
 
 var _ = fmt.Print
@@ -33,7 +35,7 @@ func wait_for_file_to_grow(file_name string, limit int64) (err error) {
 
 func read_input(input_file *os.File, input_file_name string, input_channel chan<- input_line_struct, follow bool, count_carriage_returns bool) {
 	const buf_capacity = 8192
-	var buf_array [buf_capacity]byte
+	buf := make([]byte, buf_capacity)
 	output_buf := strings.Builder{}
 	output_buf.Grow(buf_capacity)
 	var err error
@@ -57,13 +59,16 @@ func read_input(input_file *os.File, input_file_name string, input_channel chan<
 
 	if count_carriage_returns {
 		process_chunk = func(chunk []byte) {
-			for _, ch := range chunk {
-				switch ch {
+			for len(chunk) > 0 {
+				idx := simdstring.IndexByte2(chunk, '\n', '\r')
+				if idx == -1 {
+					_, _ = output_buf.Write(chunk)
+					chunk = nil
+				}
+				switch chunk[idx] {
 				case '\r':
 					num_carriage_returns += 1
 				default:
-					_ = output_buf.WriteByte(ch)
-				case '\n':
 					input_channel <- input_line_struct{line: output_buf.String(), num_carriage_returns: num_carriage_returns, is_a_complete_line: true}
 					num_carriage_returns = 0
 					output_buf.Reset()
@@ -92,10 +97,10 @@ func read_input(input_file *os.File, input_file_name string, input_channel chan<
 
 	for {
 		for err != nil {
-			n, err = input_file.Read(buf_array[:])
+			n, err = input_file.Read(buf)
 			if n > 0 {
 				total_read += int64(n)
-				process_chunk(buf_array[:n])
+				process_chunk(buf)
 			}
 			if err == unix.EAGAIN || err == unix.EINTR {
 				err = nil

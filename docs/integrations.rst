@@ -20,6 +20,12 @@ images and other types of documents directly in your terminal, even over SSH.
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 A terminal PDF/DJVU/CBR viewer
 
+.. _tool_tdf:
+
+`tdf <https://github.com/itsjunetime/tdf>`_
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+A terminal PDF viewer
+
 .. _tool_mdcat:
 
 `mdcat <https://github.com/lunaryorn/mdcat>`_
@@ -39,6 +45,13 @@ graphics protocol.
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 Another terminal file manager, with previews of file contents powered by kitty's
 graphics protocol.
+
+.. _tool_yazi:
+
+`Yazi <https://github.com/sxyazi/yazi>`_
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Blazing fast terminal file manager, with built-in kitty graphics protocol support
+(implemented both Classic protocol and Unicode placeholders).
 
 .. _tool_hunter:
 
@@ -164,6 +177,12 @@ Add this to bashrc and then to plot a function, simply do:
 
     iplot 'sin(x*3)*exp(x*.2)'
 
+.. tool_tgutui:
+
+`tgutui <https://github.com/tgu-ltd/tgutui>`_
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+A Terminal Operating Test hardware equipment
+
 .. tool_onefetch:
 
 `onefetch <https://github.com/o2sh/onefetch>`_
@@ -221,13 +240,14 @@ consistent set of hotkeys.
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 Allows easily running tests in a terminal window
 
-.. tool_hologram:
+.. tool_nvim_image_viewers:
 
-`hologram.nvim <https://github.com/edluffy/hologram.nvim>`_
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-Terminal image viewer for Neovim. For a bit of fun, you can even have `cats
-running around inside nvim <https://github.com/giusgad/pets.nvim>`__.
+Various image viewing plugins for editors
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+* `image.nvim <https://github.com/3rd/image.nvim>`_ - Bringing images to neovim
+* `image_preview.nvim <https://github.com/adelarsq/image_preview.nvim/>`_ - Image preview for neovim
+* `hologram.nvim <https://github.com/edluffy/hologram.nvim>`_  - view images inside nvim
 
 Scrollback manipulation
 -------------------------

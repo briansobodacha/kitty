@@ -78,13 +78,13 @@ def run_build(args: Any) -> None:
             needs_retry = 'arm64' in cmd or building_nightly
             if not needs_retry:
                 raise
-            print('Build failed, retrying in a few seconds...', file=sys.stderr)
+            print('Build failed, retrying in a minute seconds...', file=sys.stderr)
             if 'macos' in cmd:
                 call('python ../bypy macos shutdown')
-            time.sleep(25)
+            time.sleep(60)
             call(cmd, echo=True)
 
-    for x in ('64', '32', 'arm64'):
+    for x in ('64', 'arm64'):
         prefix = f'python ../bypy linux --arch {x} '
         run_with_retry(prefix + f'program --non-interactive --extra-program-data "{vcs_rev}"')
         call(prefix + 'shutdown', echo=True)
@@ -305,6 +305,7 @@ class GitHub:  # {{{
         failure_callback: Callable[[HTTPResponse], None] = lambda r: None,
     ) -> Any:
         for i in range(num_tries):
+            is_last_try = i == num_tries - 1
             try:
                 if upload_path:
                     conn = self.make_request(url, method='POST', upload_data=ReadFileWithProgressReporting(upload_path), params=params)
@@ -314,7 +315,7 @@ class GitHub:  # {{{
                     r = conn.getresponse()
                     if r.status in success_codes:
                         return json.loads(r.read()) if return_data else None
-                    if i == num_tries -1 :
+                    if is_last_try:
                         self.fail(r, failure_msg)
                     else:
                         self.print_failed_response_details(r, failure_msg)
@@ -322,6 +323,8 @@ class GitHub:  # {{{
             except Exception as e:
                 self.error(failure_msg, 'with error:', e)
             self.error(f'Retrying after {sleep_between_tries} seconds')
+            if is_last_try:
+                break
             time.sleep(sleep_between_tries)
         raise SystemExit('All retries failed, giving up')
 
@@ -330,7 +333,7 @@ class GitHub:  # {{{
 
     def update_nightly_description(self, release_id: int) -> None:
         url = f'{self.url_base}/{release_id}'
-        now = str(datetime.datetime.utcnow()).split('.')[0] + ' UTC'
+        now = str(datetime.datetime.now(datetime.timezone.utc)).split('.')[0] + ' UTC'
         commit = subprocess.check_output(['git', 'rev-parse', '--verify', '--end-of-options', 'master^{commit}']).decode('utf-8').strip()
         self.patch(
             url, 'Failed to update nightly release description',
@@ -351,7 +354,7 @@ class GitHub:  # {{{
                 success_codes.append(404)
             self.make_request_with_retries(
                 asset['url'], method='DELETE', num_tries=5, sleep_between_tries=2, success_codes=tuple(success_codes),
-                failure_msg=f'Failed to delete {fname} from GitHub')
+                failure_msg='Failed to delete asset from GitHub')
 
         def upload_with_retries(path: str, desc: str, num_tries: int = 8, sleep_time: float = 60.0) -> None:
             fname = os.path.basename(path)
@@ -370,7 +373,7 @@ class GitHub:  # {{{
         if self.is_nightly:
             for fname in tuple(assets_by_fname):
                 self.info(f'Deleting {fname} from GitHub with id: {assets_by_fname[fname]["id"]}')
-                delete_asset(assets_by_fname.pop(fname), allow_not_found=False)
+                delete_asset(assets_by_fname.pop(fname))
         for path, desc in self.files.items():
             self.info('')
             upload_with_retries(path, desc)
@@ -439,7 +442,6 @@ def files_for_upload() -> Dict[str, str]:
     for f, desc in {
         'macos/dist/kitty-{}.dmg': 'macOS dmg',
         'linux/64/dist/kitty-{}-x86_64.txz': 'Linux amd64 binary bundle',
-        'linux/32/dist/kitty-{}-i686.txz': 'Linux x86 binary bundle',
         'linux/arm64/dist/kitty-{}-arm64.txz': 'Linux arm64 binary bundle',
     }.items():
         path = os.path.join('bypy', 'b', f.format(version))
@@ -501,6 +503,15 @@ def safe_read(path: str) -> str:
     return ''
 
 
+def remove_pycache_only_folders() -> None:
+    folders_to_remove = []
+    for dirpath, folders, files in os.walk('.'):
+        if not files and folders == ['__pycache__']:
+            folders_to_remove.append(dirpath)
+    for x in folders_to_remove:
+        shutil.rmtree(x)
+
+
 @contextmanager
 def change_to_git_master() -> Generator[None, None, None]:
     stash_ref_before = safe_read('.git/refs/stash')
@@ -509,13 +520,14 @@ def change_to_git_master() -> Generator[None, None, None]:
         branch_before = current_branch()
         if branch_before != 'master':
             subprocess.check_call(['git', 'switch', 'master'])
-            subprocess.check_call(['make', 'debug'])
+            remove_pycache_only_folders()
+            subprocess.check_call(['make', 'clean', 'debug'])
         try:
             yield
         finally:
             if branch_before != 'master':
                 subprocess.check_call(['git', 'switch', branch_before])
-                subprocess.check_call(['make', 'debug'])
+                subprocess.check_call(['make', 'clean', 'debug'])
     finally:
         if stash_ref_before != safe_read('.git/refs/stash'):
             subprocess.check_call(['git', 'stash', 'pop'])
@@ -559,7 +571,7 @@ def main() -> None:
         with change_to_git_master():
             building_nightly = True
             exec_actions(NIGHTLY_ACTIONS, args)
-            subprocess.run(['make', 'debug'])
+            subprocess.run(['make', 'clean', 'debug'])
         return
     require_git_master()
     if args.action == 'all':

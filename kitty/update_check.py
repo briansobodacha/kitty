@@ -5,13 +5,12 @@ import os
 import subprocess
 import time
 from contextlib import suppress
-from typing import Dict, NamedTuple, Optional, Tuple
+from typing import NamedTuple, Optional
 from urllib.request import urlopen
 
 from .config import atomic_save
 from .constants import Version, cache_dir, clear_handled_signals, kitty_exe, version, website_url
 from .fast_data_types import add_timer, get_boss, monitor_pid
-from .notify import notify
 from .utils import log_error, open_url
 
 CHANGELOG_URL = website_url('changelog')
@@ -37,11 +36,7 @@ def version_notification_log() -> str:
 
 
 def notify_new_version(release_version: Version) -> None:
-    notify(
-            'kitty update available!',
-            'kitty version {} released'.format('.'.join(map(str, release_version))),
-            identifier='new-version',
-    )
+    get_boss().notification_manager.send_new_version_notification('.'.join(map(str, release_version)))
 
 
 def get_released_version() -> str:
@@ -60,7 +55,7 @@ def parse_line(line: str) -> Notification:
     return Notification(v, float(timestamp), int(count))
 
 
-def read_cache() -> Dict[Version, Notification]:
+def read_cache() -> dict[Version, Notification]:
     notified_versions = {}
     with suppress(FileNotFoundError):
         with open(version_notification_log()) as f:
@@ -73,7 +68,7 @@ def read_cache() -> Dict[Version, Notification]:
     return notified_versions
 
 
-def already_notified(version: Tuple[int, int, int]) -> bool:
+def already_notified(version: tuple[int, int, int]) -> bool:
     notified_versions = read_cache()
     return version in notified_versions
 
@@ -116,7 +111,7 @@ def update_check() -> bool:
             kitty_exe(), '+runpy',
             'from kitty.update_check import run_worker; run_worker()'
         ], stdout=subprocess.PIPE, preexec_fn=clear_handled_signals)
-    except OSError as e:
+    except Exception as e:
         log_error(f'Failed to run kitty for update check, with error: {e}')
         return False
     monitor_pid(p.pid)

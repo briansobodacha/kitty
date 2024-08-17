@@ -44,26 +44,37 @@ func write_many_to_conn(conn *net.Conn, datums ...[]byte) error {
 	return nil
 }
 
-func read_response_from_conn(conn *net.Conn, timeout time.Duration) (serialized_response []byte, err error) {
-	p := wcswidth.EscapeCodeParser{}
+type response_reader struct {
+	parser            wcswidth.EscapeCodeParser
+	storage           [utils.DEFAULT_IO_BUFFER_SIZE]byte
+	pending_responses [][]byte
+}
+
+func (r *response_reader) read_response_from_conn(conn *net.Conn, timeout time.Duration) (serialized_response []byte, err error) {
 	keep_going := true
-	p.HandleDCS = func(data []byte) error {
-		if bytes.HasPrefix(data, []byte("@kitty-cmd")) {
-			serialized_response = data[len("@kitty-cmd"):]
-			keep_going = false
+	if len(r.pending_responses) == 0 {
+		r.parser.HandleDCS = func(data []byte) error {
+			if bytes.HasPrefix(data, []byte("@kitty-cmd")) {
+				r.pending_responses = append(r.pending_responses, append([]byte{}, data[len("@kitty-cmd"):]...))
+				keep_going = false
+			}
+			return nil
 		}
-		return nil
+		buf := r.storage[:]
+		for keep_going {
+			var n int
+			(*conn).SetDeadline(time.Now().Add(timeout))
+			n, err = (*conn).Read(buf)
+			if err != nil {
+				keep_going = false
+				break
+			}
+			r.parser.Parse(buf[:n])
+		}
 	}
-	buf := make([]byte, utils.DEFAULT_IO_BUFFER_SIZE)
-	for keep_going {
-		var n int
-		(*conn).SetDeadline(time.Now().Add(timeout))
-		n, err = (*conn).Read(buf)
-		if err != nil {
-			keep_going = false
-			break
-		}
-		p.Parse(buf[:n])
+	if len(r.pending_responses) > 0 {
+		serialized_response = r.pending_responses[0]
+		r.pending_responses = r.pending_responses[1:]
 	}
 	return
 }
@@ -107,12 +118,9 @@ func run_stdin_echo_loop(conn *net.Conn, io_data *rc_io_data) (err error) {
 }
 
 func simple_socket_io(conn *net.Conn, io_data *rc_io_data) (serialized_response []byte, err error) {
-	const (
-		BEFORE_FIRST_ESCAPE_CODE_SENT = iota
-		SENDING
-	)
-	state := BEFORE_FIRST_ESCAPE_CODE_SENT
-
+	r := response_reader{}
+	r.pending_responses = make([][]byte, 0, 2) // we read at most two responses
+	first_escape_code_sent := false
 	wants_streaming := io_data.rc.Stream
 	for {
 		var chunk []byte
@@ -131,10 +139,11 @@ func simple_socket_io(conn *net.Conn, io_data *rc_io_data) (serialized_response 
 		if err != nil {
 			return
 		}
-		if state == BEFORE_FIRST_ESCAPE_CODE_SENT {
+		if !first_escape_code_sent {
+			first_escape_code_sent = true
 			if wants_streaming {
 				var streaming_response []byte
-				streaming_response, err = read_response_from_conn(conn, io_data.timeout)
+				streaming_response, err = r.read_response_from_conn(conn, io_data.timeout)
 				if err != nil {
 					return
 				}
@@ -143,13 +152,12 @@ func simple_socket_io(conn *net.Conn, io_data *rc_io_data) (serialized_response 
 					return
 				}
 			}
-			state = SENDING
 		}
 	}
 	if io_data.rc.NoResponse {
 		return
 	}
-	return read_response_from_conn(conn, io_data.timeout)
+	return r.read_response_from_conn(conn, io_data.timeout)
 }
 
 func do_socket_io(io_data *rc_io_data) (serialized_response []byte, err error) {

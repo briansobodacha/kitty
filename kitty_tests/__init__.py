@@ -6,22 +6,35 @@ import io
 import os
 import select
 import shlex
+import shutil
 import signal
 import struct
 import sys
 import termios
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
+from functools import wraps
 from pty import CHILD, STDIN_FILENO, STDOUT_FILENO, fork
+from typing import Optional
 from unittest import TestCase
 
 from kitty.config import finalize_keys, finalize_mouse_mappings
-from kitty.fast_data_types import Cursor, HistoryBuf, LineBuf, Screen, get_options, parse_bytes, set_options
+from kitty.fast_data_types import Cursor, HistoryBuf, LineBuf, Screen, get_options, monotonic, set_options
 from kitty.options.parse import merge_result_dicts
 from kitty.options.types import Options, defaults
+from kitty.rgb import to_color
 from kitty.types import MouseEvent
 from kitty.utils import read_screen_size
-from kitty.window import process_remote_print, process_title_from_child
+from kitty.window import decode_cmdline, process_remote_print, process_title_from_child
+
+
+def parse_bytes(screen, data, dump_callback=None):
+    data = memoryview(data)
+    while data:
+        dest = screen.test_create_write_buffer()
+        s = screen.test_commit_write_buffer(data, dest)
+        data = data[s:]
+        screen.test_parse_written_data(dump_callback)
 
 
 class Callbacks:
@@ -31,59 +44,86 @@ class Callbacks:
         self.pty = pty
         self.ftc = None
         self.set_pointer_shape = lambda data: None
+        self.last_cmd_at = 0
+        self.last_cmd_cmdline = ''
+        self.last_cmd_exit_status = sys.maxsize
 
     def write(self, data) -> None:
-        self.wtcbuf += data
+        self.wtcbuf += bytes(data)
+
+    def notify_child_of_resize(self):
+        self.num_of_resize_events += 1
+
+    def color_control(self, code, data) -> None:
+        from kitty.window import color_control
+        response = color_control(self.color_profile, code, data)
+        if response:
+            def p(x):
+                ans = to_color(x)
+                if ans is None:
+                    ans = x
+                return ans
+            parts = {x.partition('=')[0]:p(x.partition('=')[2]) for x in response.split(';')[1:]}
+            self.color_control_responses.append(parts)
 
     def title_changed(self, data, is_base64=False) -> None:
-        self.titlebuf.append(process_title_from_child(data, is_base64))
+        self.titlebuf.append(process_title_from_child(data, is_base64, ''))
 
     def icon_changed(self, data) -> None:
-        self.iconbuf += data
+        self.iconbuf += str(data, 'utf-8')
 
-    def set_dynamic_color(self, code, data) -> None:
+    def set_dynamic_color(self, code, data='') -> None:
         if code == 22:
             self.set_pointer_shape(data)
         else:
-            self.colorbuf += data or ''
+            self.colorbuf += str(data or b'', 'utf-8')
 
-    def set_color_table_color(self, code, data) -> None:
+    def set_color_table_color(self, code, data='') -> None:
         self.ctbuf += ''
 
     def color_profile_popped(self, x) -> None:
         pass
 
-    def cmd_output_marking(self, is_start: bool) -> None:
-        pass
+    def cmd_output_marking(self, is_start: Optional[bool], data: str = '') -> None:
+        if is_start:
+            self.last_cmd_at = monotonic()
+            self.last_cmd_cmdline = decode_cmdline(data) if data else data
+        else:
+            if self.last_cmd_at != 0:
+                self.last_cmd_at = 0
+                with suppress(Exception):
+                    self.last_cmd_exit_status = int(data)
 
     def request_capabilities(self, q) -> None:
         from kitty.terminfo import get_capabilities
         for c in get_capabilities(q, None):
             self.write(c.encode('ascii'))
 
-    def use_utf8(self, on) -> None:
-        self.iutf8 = on
-
-    def desktop_notify(self, osc_code: int, raw_data: str) -> None:
-        self.notifications.append((osc_code, raw_data))
+    def desktop_notify(self, osc_code: int, raw_data: memoryview) -> None:
+        self.notifications.append((osc_code, str(raw_data, 'utf-8')))
 
     def open_url(self, url: str, hyperlink_id: int) -> None:
         self.open_urls.append((url, hyperlink_id))
 
-    def clipboard_control(self, data: str, is_partial: bool = False) -> None:
-        self.cc_buf.append((data, is_partial))
+    def clipboard_control(self, data: memoryview, is_partial: bool = False) -> None:
+        self.cc_buf.append((str(data, 'utf-8'), is_partial))
 
     def clear(self) -> None:
         self.wtcbuf = b''
         self.iconbuf = self.colorbuf = self.ctbuf = ''
         self.titlebuf = []
-        self.iutf8 = True
+        self.printbuf = []
+        self.color_control_responses = []
         self.notifications = []
         self.open_urls = []
         self.cc_buf = []
         self.bell_count = 0
         self.clone_cmds = []
         self.current_clone_data = ''
+        self.last_cmd_exit_status = sys.maxsize
+        self.last_cmd_cmdline = ''
+        self.last_cmd_at = 0
+        self.num_of_resize_events = 0
 
     def on_bell(self) -> None:
         self.bell_count += 1
@@ -105,9 +145,13 @@ class Callbacks:
 
     def handle_remote_print(self, msg):
         text = process_remote_print(msg)
-        print(text, file=sys.__stdout__, end='', flush=True)
+        self.printbuf.append(text)
+
+    def handle_remote_cmd(self, msg):
+        pass
 
     def handle_remote_clone(self, msg):
+        msg = str(msg, 'utf-8')
         if not msg:
             if self.current_clone_data:
                 cdata, self.current_clone_data = self.current_clone_data, ''
@@ -163,11 +207,33 @@ def filled_history_buf(ynum=5, xnum=5, cursor=Cursor()):
     return ans
 
 
+def retry_on_failure(max_attempts=2, sleep_duration=2):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_attempts):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if attempt < max_attempts - 1: # Don't sleep on the last attempt
+                        time.sleep(sleep_duration)
+                    else:
+                        raise e # Re-raise the last exception
+        return wrapper
+    return decorator
+
+
 class BaseTest(TestCase):
 
     ae = TestCase.assertEqual
     maxDiff = 2048
     is_ci = os.environ.get('CI') == 'true'
+
+    def rmtree_ignoring_errors(self, tdir):
+        try:
+            shutil.rmtree(tdir)
+        except FileNotFoundError as err:
+            print('Failed to delete the directory:', tdir, 'with error:', err, file=sys.stderr)
 
     def tearDown(self):
         set_options(None)
@@ -190,6 +256,7 @@ class BaseTest(TestCase):
         self.set_options(options)
         c = Callbacks()
         s = Screen(c, lines, cols, scrollback, cell_width, cell_height, 0, c)
+        c.color_profile = s.color_profile
         return s
 
     def create_pty(
@@ -239,6 +306,7 @@ class PTY:
         if argv is None:
             from kitty.child import openpty
             self.master_fd, self.slave_fd = openpty()
+            self.child_pid = 0
         else:
             self.child_pid, self.master_fd = fork()
             self.is_child = self.child_pid == CHILD
@@ -300,38 +368,33 @@ class PTY:
             self.process_input_from_child(0)
 
     def send_cmd_to_child(self, cmd, flush=False):
+        self.callbacks.last_cmd_exit_status = sys.maxsize
+        self.last_cmd = cmd
         self.write_to_child(cmd + '\r', flush=flush)
 
     def process_input_from_child(self, timeout=10):
-        rd, wd, err = select.select([self.master_fd], [self.master_fd] if self.write_buf else [], [], timeout)
-        while wd:
-            try:
-                n = os.write(self.master_fd, self.write_buf)
-            except (BlockingIOError, OSError):
-                n = 0
-            if not n:
-                break
+        rd, wd, _ = select.select([self.master_fd], [self.master_fd] if self.write_buf else [], [], max(0, timeout))
+        if wd:
+            n = os.write(self.master_fd, self.write_buf)
             self.write_buf = self.write_buf[n:]
 
         bytes_read = 0
-        while rd:
-            try:
-                data = os.read(self.master_fd, io.DEFAULT_BUFFER_SIZE)
-            except (BlockingIOError, OSError):
-                data = b''
-            if not data:
-                break
+        if rd:
+            data = os.read(self.master_fd, io.DEFAULT_BUFFER_SIZE)
             bytes_read += len(data)
             self.received_bytes += data
             parse_bytes(self.screen, data)
         return bytes_read
 
-    def wait_till(self, q, timeout=10):
+    def wait_till(self, q, timeout=10, timeout_msg=None):
         end_time = time.monotonic() + timeout
         while not q() and time.monotonic() <= end_time:
-            self.process_input_from_child(timeout=max(0, end_time - time.monotonic()))
+            self.process_input_from_child(timeout=end_time - time.monotonic())
         if not q():
-            raise TimeoutError(f'The condition was not met. Screen contents: \n {repr(self.screen_contents())}')
+            msg = 'The condition was not met'
+            if timeout_msg is not None:
+                msg = timeout_msg()
+            raise TimeoutError(f'Timed out: {msg}. Screen contents: \n {repr(self.screen_contents())}')
 
     def wait_till_child_exits(self, timeout=30 if BaseTest.is_ci else 10, require_exit_code=None):
         end_time = time.monotonic() + timeout
@@ -345,7 +408,8 @@ class PTY:
                         f'Child exited with exit status: {status} code: {ec} != {require_exit_code}.'
                         f' Screen contents:\n{self.screen_contents()}')
                 return status
-            self.process_input_from_child(timeout=0.02)
+            with suppress(OSError):
+                self.process_input_from_child(timeout=0.02)
         raise AssertionError(f'Child did not exit in {timeout} seconds. Screen contents:\n{self.screen_contents()}')
 
     def set_window_size(self, rows=25, columns=80, send_signal=True):

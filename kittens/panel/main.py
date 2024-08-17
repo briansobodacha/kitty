@@ -1,34 +1,42 @@
 #!/usr/bin/env python
 # License: GPL v3 Copyright: 2018, Kovid Goyal <kovid at kovidgoyal.net>
 
-import os
 import sys
 from typing import Any, Callable, Dict, List, Tuple
 
 from kitty.cli import parse_args
 from kitty.cli_stub import PanelCLIOptions
 from kitty.constants import appname, is_macos, is_wayland
-from kitty.fast_data_types import make_x11_window_a_dock_window
-from kitty.os_window_size import WindowSizeData
+from kitty.fast_data_types import (
+    GLFW_EDGE_BOTTOM,
+    GLFW_EDGE_LEFT,
+    GLFW_EDGE_RIGHT,
+    GLFW_EDGE_TOP,
+    GLFW_LAYER_SHELL_BACKGROUND,
+    GLFW_LAYER_SHELL_PANEL,
+    glfw_primary_monitor_size,
+    make_x11_window_a_dock_window,
+)
+from kitty.os_window_size import WindowSizeData, edge_spacing
+from kitty.types import LayerShellConfig
+from kitty.typing import EdgeLiteral
 
 OPTIONS = r'''
---lines
+--lines --columns
 type=int
 default=1
-The number of lines shown in the panel (the height of the panel). Applies to horizontal panels.
-
-
---columns
-type=int
-default=20
-The number of columns shown in the panel (the width of the panel). Applies to vertical panels.
+The number of lines shown in the panel if horizontal otherwise the number of columns shown in the panel. Ignored for background panels.
 
 
 --edge
-choices=top,bottom,left,right
+choices=top,bottom,left,right,background
 default=top
 Which edge of the screen to place the panel on. Note that some window managers
 (such as i3) do not support placing docked windows on the left and right edges.
+The value :code:`background` means make the panel the "desktop wallpaper". This
+is only supported on Wayland, not X11 and note that when using sway if you set
+a background in your sway config it will cover the background drawn using this
+kitten.
 
 
 --config -c
@@ -42,6 +50,12 @@ Override individual kitty configuration options, can be specified multiple times
 Syntax: :italic:`name=value`. For example: :option:`kitty +kitten panel -o` font_size=20
 
 
+--output-name
+On Wayland, the panel can only be displayed on a single monitor (output) at a time. This allows
+you to specify which output is used, by name. If not specified the compositor will choose an
+output automatically, typically the last output the user interacted with or the primary monitor.
+
+
 --class
 dest=cls
 default={appname}-panel
@@ -52,6 +66,11 @@ Set the class part of the :italic:`WM_CLASS` window property. On Wayland, it set
 --name
 condition=not is_macos
 Set the name part of the :italic:`WM_CLASS` property (defaults to using the value from :option:`{appname} --class`)
+
+
+--debug-rendering
+type=bool-set
+For internal debugging use.
 '''.format(appname=appname).format
 
 
@@ -96,26 +115,17 @@ window_width = window_height = 0
 
 
 def setup_x11_window(win_id: int) -> None:
+    if is_wayland():
+        return
     func = globals()[f'create_{args.edge}_strut']
     strut = func(win_id, window_width, window_height)
     make_x11_window_a_dock_window(win_id, strut)
 
 
 def initial_window_size_func(opts: WindowSizeData, cached_values: Dict[str, Any]) -> Callable[[int, int, float, float, float, float], Tuple[int, int]]:
-    from kitty.fast_data_types import glfw_primary_monitor_size
-    from kitty.typing import EdgeLiteral
 
-    def effective_margin(which: EdgeLiteral) -> float:
-        ans: float = getattr(opts.single_window_margin_width, which)
-        if ans < 0:
-            ans = getattr(opts.window_margin_width, which)
-        return ans
-
-    def effective_padding(which: EdgeLiteral) -> float:
-        ans: float = getattr(opts.single_window_padding_width, which)
-        if ans < 0:
-            ans = getattr(opts.window_padding_width, which)
-        return ans
+    def es(which: EdgeLiteral) -> float:
+        return edge_spacing(which, opts)
 
     def initial_window_size(cell_width: int, cell_height: int, dpi_x: float, dpi_y: float, xscale: float, yscale: float) -> Tuple[int, int]:
         if not is_macos and not is_wayland():
@@ -125,28 +135,36 @@ def initial_window_size_func(opts: WindowSizeData, cached_values: Dict[str, Any]
         monitor_width, monitor_height = glfw_primary_monitor_size()
 
         if args.edge in {'top', 'bottom'}:
-            spacing = effective_margin('top') + effective_margin('bottom')
-            spacing += effective_padding('top') + effective_padding('bottom')
+            spacing = es('top') + es('bottom')
             window_height = int(cell_height * args.lines / yscale + (dpi_y / 72) * spacing + 1)
             window_width = monitor_width
+        elif args.edge == 'background':
+            window_width, window_height = monitor_width, monitor_height
         else:
-            spacing = effective_margin('left') + effective_margin('right')
-            spacing += effective_padding('left') + effective_padding('right')
-            window_width = int(cell_width * args.columns / xscale + (dpi_x / 72) * spacing + 1)
+            spacing = es('left') + es('right')
+            window_width = int(cell_width * args.lines / xscale + (dpi_x / 72) * spacing + 1)
             window_height = monitor_height
         return window_width, window_height
 
     return initial_window_size
 
 
+def layer_shell_config(opts: PanelCLIOptions) -> LayerShellConfig:
+    ltype = GLFW_LAYER_SHELL_BACKGROUND if opts.edge == 'background' else GLFW_LAYER_SHELL_PANEL
+    edge = {'top': GLFW_EDGE_TOP, 'bottom': GLFW_EDGE_BOTTOM, 'left': GLFW_EDGE_LEFT, 'right': GLFW_EDGE_RIGHT}.get(opts.edge, GLFW_EDGE_TOP)
+    return LayerShellConfig(type=ltype, edge=edge, size_in_cells=max(1, opts.lines), output_name=opts.output_name or '')
+
+
 def main(sys_args: List[str]) -> None:
     global args
-    if is_macos or not os.environ.get('DISPLAY'):
-        raise SystemExit('Currently the panel kitten is supported only on X11 desktops')
+    if is_macos:
+        raise SystemExit('Currently the panel kitten is not supported on macOS')
     args, items = parse_panel_args(sys_args[1:])
     if not items:
         raise SystemExit('You must specify the program to run')
     sys.argv = ['kitty']
+    if args.debug_rendering:
+        sys.argv.append('--debug-rendering')
     for config in args.config:
         sys.argv.extend(('--config', config))
     sys.argv.extend(('--class', args.cls))
@@ -154,10 +172,12 @@ def main(sys_args: List[str]) -> None:
         sys.argv.extend(('--name', args.name))
     for override in args.override:
         sys.argv.extend(('--override', override))
+    sys.argv.append('--override=linux_display_server=auto')
     sys.argv.extend(items)
     from kitty.main import main as real_main
     from kitty.main import run_app
     run_app.cached_values_name = 'panel'
+    run_app.layer_shell_config = layer_shell_config(args)
     run_app.first_window_callback = setup_x11_window
     run_app.initial_window_size_func = initial_window_size_func
     real_main()

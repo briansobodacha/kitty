@@ -12,18 +12,19 @@ import (
 type KeyboardStateBits uint8
 
 const (
-	DISAMBIGUATE_KEYS KeyboardStateBits = 1 << iota
-	REPORT_KEY_EVENT_TYPES
-	REPORT_ALTERNATE_KEYS
-	REPORT_ALL_KEYS_AS_ESCAPE_CODES
-	REPORT_TEXT_WITH_KEYS
-	FULL_KEYBOARD_PROTOCOL = DISAMBIGUATE_KEYS | REPORT_ALTERNATE_KEYS | REPORT_ALL_KEYS_AS_ESCAPE_CODES | REPORT_TEXT_WITH_KEYS | REPORT_KEY_EVENT_TYPES
+	LEGACY_KEYS                     KeyboardStateBits = 0
+	DISAMBIGUATE_KEYS                                 = 1
+	REPORT_KEY_EVENT_TYPES                            = 2
+	REPORT_ALTERNATE_KEYS                             = 4
+	REPORT_ALL_KEYS_AS_ESCAPE_CODES                   = 8
+	REPORT_TEXT_WITH_KEYS                             = 16
+	FULL_KEYBOARD_PROTOCOL                            = DISAMBIGUATE_KEYS | REPORT_ALTERNATE_KEYS | REPORT_ALL_KEYS_AS_ESCAPE_CODES | REPORT_TEXT_WITH_KEYS | REPORT_KEY_EVENT_TYPES
+	NO_KEYBOARD_STATE_CHANGE                          = 32
 )
 
 const (
 	SAVE_CURSOR                   = "\0337"
 	RESTORE_CURSOR                = "\0338"
-	S7C1T                         = "\033 F"
 	SAVE_PRIVATE_MODE_VALUES      = "\033[?s"
 	RESTORE_PRIVATE_MODE_VALUES   = "\033[?r"
 	SAVE_COLORS                   = "\033[#P"
@@ -45,26 +46,27 @@ type Mode uint32
 const private Mode = 1 << 31
 
 const (
-	LNM                    Mode = 20
-	IRM                    Mode = 4
-	DECKM                  Mode = 1 | private
-	DECSCNM                Mode = 5 | private
-	DECOM                  Mode = 6 | private
-	DECAWM                 Mode = 7 | private
-	DECARM                 Mode = 8 | private
-	DECTCEM                Mode = 25 | private
-	MOUSE_BUTTON_TRACKING  Mode = 1000 | private
-	MOUSE_MOTION_TRACKING  Mode = 1002 | private
-	MOUSE_MOVE_TRACKING    Mode = 1003 | private
-	FOCUS_TRACKING         Mode = 1004 | private
-	MOUSE_UTF8_MODE        Mode = 1005 | private
-	MOUSE_SGR_MODE         Mode = 1006 | private
-	MOUSE_URXVT_MODE       Mode = 1015 | private
-	MOUSE_SGR_PIXEL_MODE   Mode = 1016 | private
-	ALTERNATE_SCREEN       Mode = 1049 | private
-	BRACKETED_PASTE        Mode = 2004 | private
-	PENDING_UPDATE         Mode = 2026 | private
-	HANDLE_TERMIOS_SIGNALS Mode = kitty.HandleTermiosSignals | private
+	LNM                        Mode = 20
+	IRM                        Mode = 4
+	DECKM                      Mode = 1 | private
+	DECSCNM                    Mode = 5 | private
+	DECOM                      Mode = 6 | private
+	DECAWM                     Mode = 7 | private
+	DECARM                     Mode = 8 | private
+	DECTCEM                    Mode = 25 | private
+	MOUSE_BUTTON_TRACKING      Mode = 1000 | private
+	MOUSE_MOTION_TRACKING      Mode = 1002 | private
+	MOUSE_MOVE_TRACKING        Mode = 1003 | private
+	FOCUS_TRACKING             Mode = 1004 | private
+	MOUSE_UTF8_MODE            Mode = 1005 | private
+	MOUSE_SGR_MODE             Mode = 1006 | private
+	MOUSE_URXVT_MODE           Mode = 1015 | private
+	MOUSE_SGR_PIXEL_MODE       Mode = 1016 | private
+	ALTERNATE_SCREEN           Mode = 1049 | private
+	BRACKETED_PASTE            Mode = 2004 | private
+	PENDING_UPDATE             Mode = 2026 | private
+	INBAND_RESIZE_NOTIFICATION Mode = 2048 | private
+	HANDLE_TERMIOS_SIGNALS     Mode = kitty.HandleTermiosSignals | private
 )
 
 func (self Mode) escape_code(which string) string {
@@ -95,7 +97,7 @@ const (
 )
 
 type TerminalStateOptions struct {
-	alternate_screen, restore_colors bool
+	Alternate_screen, restore_colors bool
 	mouse_tracking                   MouseTracking
 	kitty_keyboard_mode              KeyboardStateBits
 }
@@ -115,8 +117,7 @@ func reset_modes(sb *strings.Builder, modes ...Mode) {
 func (self *TerminalStateOptions) SetStateEscapeCodes() string {
 	var sb strings.Builder
 	sb.Grow(256)
-	sb.WriteString(S7C1T)
-	if self.alternate_screen {
+	if self.Alternate_screen {
 		sb.WriteString(SAVE_CURSOR)
 	}
 	sb.WriteString(SAVE_PRIVATE_MODE_VALUES)
@@ -127,15 +128,17 @@ func (self *TerminalStateOptions) SetStateEscapeCodes() string {
 	reset_modes(&sb,
 		IRM, DECKM, DECSCNM, BRACKETED_PASTE, FOCUS_TRACKING,
 		MOUSE_BUTTON_TRACKING, MOUSE_MOTION_TRACKING, MOUSE_MOVE_TRACKING, MOUSE_UTF8_MODE, MOUSE_SGR_MODE)
-	set_modes(&sb, DECARM, DECAWM, DECTCEM)
-	if self.alternate_screen {
+	set_modes(&sb, DECARM, DECAWM, DECTCEM, INBAND_RESIZE_NOTIFICATION)
+	if self.Alternate_screen {
 		set_modes(&sb, ALTERNATE_SCREEN)
 		sb.WriteString(CLEAR_SCREEN)
 	}
-	if self.kitty_keyboard_mode > 0 {
-		sb.WriteString(fmt.Sprintf("\033[>%du", self.kitty_keyboard_mode))
-	} else {
+	switch self.kitty_keyboard_mode {
+	case LEGACY_KEYS:
 		sb.WriteString("\033[>u")
+	case NO_KEYBOARD_STATE_CHANGE:
+	default:
+		sb.WriteString(fmt.Sprintf("\033[>%du", self.kitty_keyboard_mode))
 	}
 	if self.mouse_tracking != NO_MOUSE_TRACKING {
 		sb.WriteString(MOUSE_SGR_PIXEL_MODE.EscapeCodeToSet())
@@ -154,8 +157,10 @@ func (self *TerminalStateOptions) SetStateEscapeCodes() string {
 func (self *TerminalStateOptions) ResetStateEscapeCodes() string {
 	var sb strings.Builder
 	sb.Grow(64)
-	sb.WriteString("\033[<u")
-	if self.alternate_screen {
+	if self.kitty_keyboard_mode != NO_KEYBOARD_STATE_CHANGE {
+		sb.WriteString("\033[<u")
+	}
+	if self.Alternate_screen {
 		sb.WriteString(ALTERNATE_SCREEN.EscapeCodeToReset())
 	} else {
 		sb.WriteString(SAVE_CURSOR)

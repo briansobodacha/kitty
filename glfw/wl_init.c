@@ -29,19 +29,23 @@
 #define _GNU_SOURCE
 #include "internal.h"
 #include "backend_utils.h"
+#include "wl_client_side_decorations.h"
 #include "linux_desktop_settings.h"
 #include "../kitty/monotonic.h"
+#include "wl_text_input.h"
+#include "wayland-text-input-unstable-v3-client-protocol.h"
 
-#include <assert.h>
-#include <errno.h>
-#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/socket.h>
 #include <wayland-client.h>
+#include <stdio.h>
+// errno.h needed for BSD code paths
+#include <errno.h>
 // Needed for the BTN_* defines
 #ifdef __has_include
 #if __has_include(<linux/input.h>)
@@ -53,179 +57,76 @@
 #include <linux/input.h>
 #endif
 
-
-#define debug(...) if (_glfw.hints.init.debugRendering) fprintf(stderr, __VA_ARGS__);
-
-static int min(int n1, int n2)
-{
-    return n1 < n2 ? n1 : n2;
-}
-
-static _GLFWwindow*
-findWindowFromDecorationSurface(struct wl_surface* surface, _GLFWdecorationSideWayland* which)
-{
-    _GLFWdecorationSideWayland focus;
-    if (!which) which = &focus;
-    _GLFWwindow* window = _glfw.windowListHead;
-#define q(edge, result) if (surface == window->wl.decorations.edge.surface) { *which = result; break; }
-    while (window) {
-        q(top, TOP_DECORATION);
-        q(left, LEFT_DECORATION);
-        q(right, RIGHT_DECORATION);
-        q(bottom, BOTTOM_DECORATION);
-        window = window->next;
-    }
-#undef q
-    return window;
-}
-
-static void pointerHandleEnter(void* data UNUSED,
-                               struct wl_pointer* pointer UNUSED,
-                               uint32_t serial,
-                               struct wl_surface* surface,
-                               wl_fixed_t sx UNUSED,
-                               wl_fixed_t sy UNUSED)
-{
-    // Happens in the case we just destroyed the surface.
-    if (!surface)
-        return;
-
-    _GLFWdecorationSideWayland focus = CENTRAL_WINDOW;
-    _GLFWwindow* window = wl_surface_get_user_data(surface);
-    if (!window)
-    {
-        window = findWindowFromDecorationSurface(surface, &focus);
-        if (!window)
-            return;
-    }
-    window->wl.decorations.focus = focus;
-    _glfw.wl.serial = serial; _glfw.wl.input_serial = serial; _glfw.wl.pointer_serial = serial; _glfw.wl.pointer_enter_serial = serial;
-    _glfw.wl.pointerFocus = window;
-
-    window->wl.hovered = true;
-
-    _glfwPlatformSetCursor(window, window->wl.currentCursor);
-    _glfwInputCursorEnter(window, true);
-}
-
-static void pointerHandleLeave(void* data UNUSED,
-                               struct wl_pointer* pointer UNUSED,
-                               uint32_t serial,
-                               struct wl_surface* surface UNUSED)
-{
-    _GLFWwindow* window = _glfw.wl.pointerFocus;
-
-    if (!window)
-        return;
-
-    window->wl.hovered = false;
-
-    _glfw.wl.serial = serial;
-    _glfw.wl.pointerFocus = NULL;
-    _glfwInputCursorEnter(window, false);
-    _glfw.wl.cursorPreviousShape = GLFW_INVALID_CURSOR;
-}
-
-static void setCursor(GLFWCursorShape shape, _GLFWwindow* window)
-{
-    struct wl_buffer* buffer;
-    struct wl_cursor* cursor;
-    struct wl_cursor_image* image;
-    struct wl_surface* surface = _glfw.wl.cursorSurface;
-    const int scale = window->wl.scale;
-
-    struct wl_cursor_theme *theme = glfw_wlc_theme_for_scale(scale);
-    if (!theme) return;
-    cursor = _glfwLoadCursor(shape, theme);
-    if (!cursor) return;
-    // TODO: handle animated cursors too.
-    image = cursor->images[0];
-
-    if (!image)
-        return;
-    if (image->width % scale || image->height % scale) {
-        static uint32_t warned_width = 0, warned_height = 0;
-        if (warned_width != image->width || warned_height != image->height) {
-            _glfwInputError(GLFW_PLATFORM_ERROR, "WARNING: Cursor image size: %dx%d is not a multiple of window scale: %d. This will"
-                    " cause some compositors such as GNOME to crash. See https://github.com/kovidgoyal/kitty/issues/4878", image->width, image->height, scale);
-            warned_width = image->width; warned_height = image->height;
-        }
-    }
-
-    buffer = wl_cursor_image_get_buffer(image);
-    if (!buffer)
-        return;
-    debug("Calling wl_pointer_set_cursor in setCursor with surface: %p\n", (void*)surface);
-    wl_pointer_set_cursor(_glfw.wl.pointer, _glfw.wl.serial,
-                          surface,
-                          image->hotspot_x / scale,
-                          image->hotspot_y / scale);
-    wl_surface_set_buffer_scale(surface, scale);
-    wl_surface_attach(surface, buffer, 0, 0);
-    wl_surface_damage(surface, 0, 0,
-                      image->width, image->height);
-    wl_surface_commit(surface);
-    _glfw.wl.cursorPreviousShape = shape;
-}
+#define debug debug_rendering
 
 #define x window->wl.allCursorPosX
 #define y window->wl.allCursorPosY
-static void pointerHandleMotion(void* data UNUSED,
-                                struct wl_pointer* pointer UNUSED,
-                                uint32_t time UNUSED,
-                                wl_fixed_t sx,
-                                wl_fixed_t sy)
-{
-    _GLFWwindow* window = _glfw.wl.pointerFocus;
-    GLFWCursorShape cursorShape = GLFW_DEFAULT_CURSOR;
 
-    if (!window)
-        return;
+static _GLFWwindow*
+get_window_from_surface(struct wl_surface* surface) {
+    if (!surface) return NULL;
+    _GLFWwindow *ans = wl_surface_get_user_data(surface);
+    if (ans) {
+        const _GLFWwindow *w = _glfw.windowListHead;
+        while (w) {
+            if (w == ans) return ans;
+            w = w->next;
+        }
+    }
+    return NULL;
+}
 
-    if (window->cursorMode == GLFW_CURSOR_DISABLED)
-        return;
+static void
+pointerHandleEnter(
+        void* data UNUSED, struct wl_pointer* pointer UNUSED, uint32_t serial, struct wl_surface* surface,
+        wl_fixed_t sx, wl_fixed_t sy
+) {
+    _GLFWwindow* window = get_window_from_surface(surface);
+    if (!window) return;
+    _glfw.wl.serial = serial; _glfw.wl.input_serial = serial; _glfw.wl.pointer_serial = serial; _glfw.wl.pointer_enter_serial = serial;
+    _glfw.wl.pointerFocus = window;
     window->wl.allCursorPosX = wl_fixed_to_double(sx);
     window->wl.allCursorPosY = wl_fixed_to_double(sy);
+    if (surface != window->wl.surface) {
+        csd_handle_pointer_event(window, -2, -2, surface);
+    } else {
+        window->wl.decorations.focus = CENTRAL_WINDOW;
+        window->wl.hovered = true;
+        window->wl.cursorPosX = x;
+        window->wl.cursorPosY = y;
 
-    switch (window->wl.decorations.focus)
-    {
-        case CENTRAL_WINDOW:
-            window->wl.cursorPosX = x;
-            window->wl.cursorPosY = y;
-            _glfwInputCursorPos(window, x, y);
-            _glfw.wl.cursorPreviousShape = GLFW_INVALID_CURSOR;
-            return;
-        case TOP_DECORATION:
-            if (y < window->wl.decorations.metrics.width)
-                cursorShape = GLFW_N_RESIZE_CURSOR;
-            else
-                cursorShape = GLFW_DEFAULT_CURSOR;
-            break;
-        case LEFT_DECORATION:
-            if (y < window->wl.decorations.metrics.width)
-                cursorShape = GLFW_NW_RESIZE_CURSOR;
-            else
-                cursorShape = GLFW_W_RESIZE_CURSOR;
-            break;
-        case RIGHT_DECORATION:
-            if (y < window->wl.decorations.metrics.width)
-                cursorShape = GLFW_NE_RESIZE_CURSOR;
-            else
-                cursorShape = GLFW_E_RESIZE_CURSOR;
-            break;
-        case BOTTOM_DECORATION:
-            if (x < window->wl.decorations.metrics.width)
-                cursorShape = GLFW_SW_RESIZE_CURSOR;
-            else if (x > window->wl.width + window->wl.decorations.metrics.width)
-                cursorShape = GLFW_SE_RESIZE_CURSOR;
-            else
-                cursorShape = GLFW_S_RESIZE_CURSOR;
-            break;
-        default:
-            assert(0);
+        _glfwPlatformSetCursor(window, window->wl.currentCursor);
+        _glfwInputCursorEnter(window, true);
     }
-    if (_glfw.wl.cursorPreviousShape != cursorShape)
-        setCursor(cursorShape, window);
+}
+
+static void
+pointerHandleLeave(void* data UNUSED, struct wl_pointer* pointer UNUSED, uint32_t serial, struct wl_surface* surface) {
+    _GLFWwindow* window = _glfw.wl.pointerFocus;
+    if (!window) return;
+    _glfw.wl.serial = serial;
+    _glfw.wl.pointerFocus = NULL;
+    if (window->wl.surface == surface) {
+        window->wl.hovered = false;
+        _glfwInputCursorEnter(window, false);
+        _glfw.wl.cursorPreviousShape = GLFW_INVALID_CURSOR;
+    } else csd_handle_pointer_event(window, -3, -3, surface);
+}
+
+static void
+pointerHandleMotion(void* data UNUSED, struct wl_pointer* pointer UNUSED, uint32_t time UNUSED, wl_fixed_t sx, wl_fixed_t sy) {
+    _GLFWwindow* window = _glfw.wl.pointerFocus;
+    if (!window || window->cursorMode == GLFW_CURSOR_DISABLED) return;
+    window->wl.allCursorPosX = wl_fixed_to_double(sx);
+    window->wl.allCursorPosY = wl_fixed_to_double(sy);
+    if (window->wl.decorations.focus != CENTRAL_WINDOW) {
+        csd_handle_pointer_event(window, -1, -1, NULL);
+    } else {
+        window->wl.cursorPosX = x;
+        window->wl.cursorPosY = y;
+        _glfwInputCursorPos(window, x, y);
+        _glfw.wl.cursorPreviousShape = GLFW_INVALID_CURSOR;
+    }
 }
 
 static void pointerHandleButton(void* data UNUSED,
@@ -235,189 +136,138 @@ static void pointerHandleButton(void* data UNUSED,
                                 uint32_t button,
                                 uint32_t state)
 {
-    _GLFWwindow* window = _glfw.wl.pointerFocus;
-    int glfwButton;
-    uint32_t edges = XDG_TOPLEVEL_RESIZE_EDGE_NONE;
-
-    if (!window)
-        return;
-    if (button == BTN_LEFT)
-    {
-        switch (window->wl.decorations.focus)
-        {
-            case CENTRAL_WINDOW:
-                break;
-            case TOP_DECORATION:
-                if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
-                    monotonic_t last_click_at = window->wl.decorations.last_click_on_top_decoration_at;
-                    window->wl.decorations.last_click_on_top_decoration_at = monotonic();
-                    if (window->wl.decorations.last_click_on_top_decoration_at - last_click_at <= _glfwPlatformGetDoubleClickInterval(window)) {
-                        window->wl.decorations.last_click_on_top_decoration_at = 0;
-                        if (window->wl.current.toplevel_states & TOPLEVEL_STATE_MAXIMIZED)
-                            xdg_toplevel_unset_maximized(window->wl.xdg.toplevel);
-                        else
-                            xdg_toplevel_set_maximized(window->wl.xdg.toplevel);
-                        return;
-                    }
-                }
-                if (y < window->wl.decorations.metrics.width)
-                    edges = XDG_TOPLEVEL_RESIZE_EDGE_TOP;
-                else
-                {
-                    if (window->wl.xdg.toplevel)
-                        xdg_toplevel_move(window->wl.xdg.toplevel, _glfw.wl.seat, serial);
-                }
-
-                break;
-            case LEFT_DECORATION:
-                if (y < window->wl.decorations.metrics.width)
-                    edges = XDG_TOPLEVEL_RESIZE_EDGE_TOP_LEFT;
-                else
-                    edges = XDG_TOPLEVEL_RESIZE_EDGE_LEFT;
-                break;
-            case RIGHT_DECORATION:
-                if (y < window->wl.decorations.metrics.width)
-                    edges = XDG_TOPLEVEL_RESIZE_EDGE_TOP_RIGHT;
-                else
-                    edges = XDG_TOPLEVEL_RESIZE_EDGE_RIGHT;
-                break;
-            case BOTTOM_DECORATION:
-                if (x < window->wl.decorations.metrics.width)
-                    edges = XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_LEFT;
-                else if (x > window->wl.width + window->wl.decorations.metrics.width)
-                    edges = XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_RIGHT;
-                else
-                    edges = XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM;
-                break;
-            default:
-                assert(0);
-        }
-        if (edges != XDG_TOPLEVEL_RESIZE_EDGE_NONE)
-        {
-            xdg_toplevel_resize(window->wl.xdg.toplevel, _glfw.wl.seat,
-                                serial, edges);
-        }
-    }
-    else if (button == BTN_RIGHT)
-    {
-        if (window->wl.decorations.focus != CENTRAL_WINDOW && window->wl.xdg.toplevel)
-        {
-            xdg_toplevel_show_window_menu(window->wl.xdg.toplevel, _glfw.wl.seat, serial, (int32_t)x, (int32_t)y - window->wl.decorations.metrics.top);
-            return;
-        }
-    }
-
-    // Don’t pass the button to the user if it was related to a decoration.
-    if (window->wl.decorations.focus != CENTRAL_WINDOW)
-        return;
-
     _glfw.wl.serial = serial; _glfw.wl.input_serial = serial; _glfw.wl.pointer_serial = serial;
 
+    _GLFWwindow* window = _glfw.wl.pointerFocus;
+    if (!window) return;
+    if (window->wl.decorations.focus != CENTRAL_WINDOW) {
+        csd_handle_pointer_event(window, button, state, NULL);
+        return;
+    }
     /* Makes left, right and middle 0, 1 and 2. Overall order follows evdev
      * codes. */
-    glfwButton = button - BTN_LEFT;
-
-    _glfwInputMouseClick(window,
-                         glfwButton,
-                         state == WL_POINTER_BUTTON_STATE_PRESSED
-                                ? GLFW_PRESS
-                                : GLFW_RELEASE,
-                         _glfw.wl.xkb.states.modifiers);
+    int glfwButton = button - BTN_LEFT;
+    _glfwInputMouseClick(
+            window, glfwButton, state == WL_POINTER_BUTTON_STATE_PRESSED ? GLFW_PRESS : GLFW_RELEASE, _glfw.wl.xkb.states.modifiers);
 }
 #undef x
 #undef y
 
-static void pointerHandleAxis(void* data UNUSED,
-                              struct wl_pointer* pointer UNUSED,
-                              uint32_t time UNUSED,
-                              uint32_t axis,
-                              wl_fixed_t value)
-{
+#define info (window->wl.pointer_curr_axis_info)
+
+static void
+pointer_handle_axis_common(enum _GLFWWaylandAxisEvent type, uint32_t axis, wl_fixed_t value) {
     _GLFWwindow* window = _glfw.wl.pointerFocus;
-    double x = 0.0, y = 0.0;
-    if (!window)
-        return;
+    if (!window || window->wl.decorations.focus != CENTRAL_WINDOW) return;
+    float fval = (float) wl_fixed_to_double(value);
 
-    assert(axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL ||
-           axis == WL_POINTER_AXIS_VERTICAL_SCROLL);
+#define CASE(type, type_const, axis, fval) \
+    case type_const: \
+        if (info.type.axis##_axis_type == AXIS_EVENT_UNKNOWN) { \
+        info.type.axis##_axis_type = type_const; info.type.axis = 0.f; } \
+        info.type.axis += fval; break;
 
-    if (axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL) {
-        if (window->wl.axis_discrete_count.x) {
-            window->wl.axis_discrete_count.x--;
-            return;
-        }
-        x = -wl_fixed_to_double(value) * (window->wl.scale);
-    }
-    else if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
-        if (window->wl.axis_discrete_count.y) {
-            window->wl.axis_discrete_count.y--;
-            return;
-        }
-        y = -wl_fixed_to_double(value) * (window->wl.scale);
-    }
-
-    _glfwInputScroll(window, x, y, 1, _glfw.wl.xkb.states.modifiers);
-}
-
-static void pointerHandleFrame(void* data UNUSED,
-                               struct wl_pointer* pointer UNUSED)
-{
-    _GLFWwindow* window = _glfw.wl.pointerFocus;
     if (window) {
-        window->wl.axis_discrete_count.x = 0;
-        window->wl.axis_discrete_count.y = 0;
+        switch ((enum wl_pointer_axis)axis) {
+        case WL_POINTER_AXIS_VERTICAL_SCROLL:
+            switch (type) {
+                case AXIS_EVENT_UNKNOWN: break;
+                CASE(discrete, AXIS_EVENT_DISCRETE, y, -fval); // wheel event
+                CASE(discrete, AXIS_EVENT_VALUE120, y, -fval);  // wheel event higher res than plain discrete
+                CASE(continuous, AXIS_EVENT_CONTINUOUS, y, -fval);  // touchpad, etc. high res
+            }
+            break;
+        case WL_POINTER_AXIS_HORIZONTAL_SCROLL:
+            switch (type) {
+                case AXIS_EVENT_UNKNOWN: break;
+                CASE(discrete, AXIS_EVENT_DISCRETE, x, fval); // wheel event
+                CASE(discrete, AXIS_EVENT_VALUE120, x, fval);  // wheel event higher res than plain discrete
+                CASE(continuous, AXIS_EVENT_CONTINUOUS, x, fval);  // touchpad, etc. high res
+            }
+            break;
+        }
     }
+#undef CASE
 }
 
-static void pointerHandleAxisSource(void* data UNUSED,
-                                    struct wl_pointer* pointer UNUSED,
-                                    uint32_t source UNUSED)
-{
-}
-
-static void pointerHandleAxisStop(void *data UNUSED,
-                  struct wl_pointer *wl_pointer UNUSED,
-                  uint32_t time UNUSED,
-                  uint32_t axis UNUSED)
-{
-}
-
-
-static void pointerHandleAxisDiscrete(void *data UNUSED,
-                  struct wl_pointer *wl_pointer UNUSED,
-                  uint32_t axis,
-                  int32_t discrete)
-{
+static void
+pointer_handle_axis(void *data UNUSED, struct wl_pointer *pointer UNUSED, uint32_t time, uint32_t axis, wl_fixed_t value) {
     _GLFWwindow* window = _glfw.wl.pointerFocus;
-    double x = 0.0, y = 0.0;
-    if (!window)
-        return;
-
-    assert(axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL ||
-           axis == WL_POINTER_AXIS_VERTICAL_SCROLL);
-
-    if (axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL) {
-        x = -discrete;
-        window->wl.axis_discrete_count.x++;
-    }
-    else if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
-        y = -discrete;
-        window->wl.axis_discrete_count.y++;
-    }
-
-    _glfwInputScroll(window, x, y, 0, _glfw.wl.xkb.states.modifiers);
+    if (!window) return;
+    if (!info.timestamp_ns) info.timestamp_ns = ms_to_monotonic_t(time);
+    pointer_handle_axis_common(AXIS_EVENT_CONTINUOUS, axis, value);
 }
 
+static void
+pointer_handle_frame(void *data UNUSED, struct wl_pointer *pointer UNUSED) {
+    _GLFWwindow* window = _glfw.wl.pointerFocus;
+    if (!window) return;
+    float x = 0, y = 0;
+    int highres = 0;
+
+    if (info.discrete.y_axis_type != AXIS_EVENT_UNKNOWN) {
+        y = info.discrete.y;
+        if (info.discrete.y_axis_type == AXIS_EVENT_VALUE120) y /= 120.f;
+    } else if (info.continuous.y_axis_type != AXIS_EVENT_UNKNOWN) {
+        highres = 1;
+        y = info.continuous.y;
+    }
+
+    if (info.discrete.x_axis_type != AXIS_EVENT_UNKNOWN) {
+        x = info.discrete.x;
+        if (info.discrete.x_axis_type == AXIS_EVENT_VALUE120) x /= 120.f;
+    } else if (info.continuous.x_axis_type != AXIS_EVENT_UNKNOWN) {
+        highres = 1;
+        x = info.continuous.x;
+    }
+    /* clear pointer_curr_axis_info for next frame */
+    memset(&info, 0, sizeof(info));
+
+    if (x != 0.0f || y != 0.0f) {
+        float scale = (float)_glfwWaylandWindowScale(window);
+        y *= scale; x *= scale;
+        _glfwInputScroll(window, -x, y, highres, _glfw.wl.xkb.states.modifiers);
+    }
+}
+
+static void
+pointer_handle_axis_source(void* data UNUSED, struct wl_pointer* pointer UNUSED, uint32_t source UNUSED) { }
+
+static void
+pointer_handle_axis_stop(void *data UNUSED, struct wl_pointer *wl_pointer UNUSED, uint32_t time UNUSED, uint32_t axis UNUSED) { }
+
+
+static void
+pointer_handle_axis_discrete(void *data UNUSED, struct wl_pointer *pointer UNUSED, uint32_t axis, int32_t discrete) {
+    pointer_handle_axis_common(AXIS_EVENT_DISCRETE, axis, wl_fixed_from_int(discrete));
+}
+
+static void
+pointer_handle_axis_value120(void *data UNUSED, struct wl_pointer *pointer UNUSED, uint32_t axis, int32_t value120) {
+    pointer_handle_axis_common(AXIS_EVENT_VALUE120, axis, wl_fixed_from_int(value120));
+}
+
+static void
+pointer_handle_axis_relative_direction(void *data UNUSED, struct wl_pointer *pointer UNUSED, uint32_t axis UNUSED, uint32_t axis_relative_direction UNUSED) { }
+
+#undef info
 static const struct wl_pointer_listener pointerListener = {
-    pointerHandleEnter,
-    pointerHandleLeave,
-    pointerHandleMotion,
-    pointerHandleButton,
-    pointerHandleAxis,
-    pointerHandleFrame,
-    pointerHandleAxisSource,
-    pointerHandleAxisStop,
-    pointerHandleAxisDiscrete,
+    .enter = pointerHandleEnter,
+    .leave = pointerHandleLeave,
+    .motion = pointerHandleMotion,
+    .button = pointerHandleButton,
+
+    .axis = pointer_handle_axis,
+    .frame = pointer_handle_frame,
+    .axis_source = pointer_handle_axis_source,
+    .axis_stop = pointer_handle_axis_stop,
+    .axis_discrete = pointer_handle_axis_discrete,
+#ifdef WL_POINTER_AXIS_VALUE120_SINCE_VERSION
+    .axis_value120 = pointer_handle_axis_value120,
+#endif
+#ifdef WL_POINTER_AXIS_RELATIVE_DIRECTION_SINCE_VERSION
+    .axis_relative_direction = pointer_handle_axis_relative_direction,
+#endif
 };
 
 static void keyboardHandleKeymap(void* data UNUSED,
@@ -430,13 +280,15 @@ static void keyboardHandleKeymap(void* data UNUSED,
 
     if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1)
     {
+        _glfwInputError(GLFW_PLATFORM_ERROR, "Unknown keymap format: %u", format);
         close(fd);
         return;
     }
 
-    mapStr = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+    mapStr = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (mapStr == MAP_FAILED) {
         close(fd);
+        _glfwInputError(GLFW_PLATFORM_ERROR, "Mapping of keymap file descriptor failed: %u", format);
         return;
     }
     glfw_xkb_compile_keymap(&_glfw.wl.xkb, mapStr);
@@ -451,17 +303,8 @@ static void keyboardHandleEnter(void* data UNUSED,
                                 struct wl_surface* surface,
                                 struct wl_array* keys)
 {
-    // Happens in the case we just destroyed the surface.
-    if (!surface)
-        return;
-
-    _GLFWwindow* window = wl_surface_get_user_data(surface);
-    if (!window)
-    {
-        window = findWindowFromDecorationSurface(surface, NULL);
-        if (!window)
-            return;
-    }
+    _GLFWwindow* window = get_window_from_surface(surface);
+    if (!window) return;
 
     _glfw.wl.serial = serial; _glfw.wl.input_serial = serial; _glfw.wl.keyboard_enter_serial = serial;
     _glfw.wl.keyboardFocusId = window->id;
@@ -629,13 +472,16 @@ static void registryHandleGlobal(void* data UNUSED,
                                  const char* interface,
                                  uint32_t version)
 {
-#define is(x) strcmp(interface, #x) == 0
+#define is(x) strcmp(interface, x##_interface.name) == 0
     if (is(wl_compositor))
     {
-        _glfw.wl.compositorVersion = min(3, version);
-        _glfw.wl.compositor =
-            wl_registry_bind(registry, name, &wl_compositor_interface,
-                             _glfw.wl.compositorVersion);
+#ifdef WL_SURFACE_PREFERRED_BUFFER_SCALE_SINCE_VERSION
+        _glfw.wl.compositorVersion = MIN(WL_SURFACE_PREFERRED_BUFFER_SCALE_SINCE_VERSION, (int)version);
+        _glfw.wl.has_preferred_buffer_scale = _glfw.wl.compositorVersion >= WL_SURFACE_PREFERRED_BUFFER_SCALE_SINCE_VERSION;
+#else
+        _glfw.wl.compositorVersion = MIN(3, (int)version);
+#endif
+        _glfw.wl.compositor = wl_registry_bind(registry, name, &wl_compositor_interface, _glfw.wl.compositorVersion);
     }
     else if (is(wl_subcompositor))
     {
@@ -655,7 +501,13 @@ static void registryHandleGlobal(void* data UNUSED,
     {
         if (!_glfw.wl.seat)
         {
-            _glfw.wl.seatVersion = min(5, version);
+#ifdef WL_POINTER_AXIS_RELATIVE_DIRECTION_SINCE_VERSION
+            _glfw.wl.seatVersion = MIN(WL_POINTER_AXIS_RELATIVE_DIRECTION_SINCE_VERSION, (int)version);
+#elif defined(WL_POINTER_AXIS_VALUE120_SINCE_VERSION)
+            _glfw.wl.seatVersion = MIN(WL_POINTER_AXIS_VALUE120_SINCE_VERSION, (int)version);
+#else
+            _glfw.wl.seatVersion = MIN(WL_POINTER_AXIS_DISCRETE_SINCE_VERSION, version);
+#endif
             _glfw.wl.seat =
                 wl_registry_bind(registry, name, &wl_seat_interface,
                                  _glfw.wl.seatVersion);
@@ -666,13 +518,17 @@ static void registryHandleGlobal(void* data UNUSED,
             if (_glfw.wl.primarySelectionDeviceManager && !_glfw.wl.primarySelectionDevice) {
                 _glfwSetupWaylandPrimarySelectionDevice();
             }
-            _glfwWaylandInitTextInput();
         }
     }
     else if (is(xdg_wm_base))
     {
-        _glfw.wl.wmBase =
-            wl_registry_bind(registry, name, &xdg_wm_base_interface, 1);
+        _glfw.wl.xdg_wm_base_version = 1;
+#ifdef XDG_TOPLEVEL_STATE_SUSPENDED_SINCE_VERSION
+        _glfw.wl.xdg_wm_base_version = MIN(XDG_TOPLEVEL_STATE_SUSPENDED_SINCE_VERSION, (int)version);
+#elif defined(XDG_TOPLEVEL_WM_CAPABILITIES_SINCE_VERSION)
+        _glfw.wl.xdg_wm_base_version = MIN(XDG_TOPLEVEL_WM_CAPABILITIES_SINCE_VERSION, (int)version);
+#endif
+        _glfw.wl.wmBase = wl_registry_bind(registry, name, &xdg_wm_base_interface, _glfw.wl.xdg_wm_base_version);
         xdg_wm_base_add_listener(_glfw.wl.wmBase, &wmBaseListener, NULL);
     }
     else if (is(zxdg_decoration_manager_v1))
@@ -698,7 +554,6 @@ static void registryHandleGlobal(void* data UNUSED,
     else if (is(zwp_text_input_manager_v3))
     {
         _glfwWaylandBindTextInput(registry, name);
-        _glfwWaylandInitTextInput();
     }
     else if (is(wl_data_device_manager))
     {
@@ -720,11 +575,29 @@ static void registryHandleGlobal(void* data UNUSED,
             _glfwSetupWaylandPrimarySelectionDevice();
         }
     }
+    else if (is(wp_single_pixel_buffer_manager_v1)) {
+        _glfw.wl.wp_single_pixel_buffer_manager_v1 = wl_registry_bind(registry, name, &wp_single_pixel_buffer_manager_v1_interface, 1);
+    }
     else if (is(xdg_activation_v1)) {
         _glfw.wl.xdg_activation_v1 = wl_registry_bind(registry, name, &xdg_activation_v1_interface, 1);
     }
     else if (is(wp_cursor_shape_manager_v1)) {
         _glfw.wl.wp_cursor_shape_manager_v1 = wl_registry_bind(registry, name, &wp_cursor_shape_manager_v1_interface, 1);
+    }
+    else if (is(wp_fractional_scale_manager_v1)) {
+        _glfw.wl.wp_fractional_scale_manager_v1 = wl_registry_bind(registry, name, &wp_fractional_scale_manager_v1_interface, 1);
+    }
+    else if (is(wp_viewporter)) {
+        _glfw.wl.wp_viewporter = wl_registry_bind(registry, name, &wp_viewporter_interface, 1);
+    }
+    else if (is(org_kde_kwin_blur_manager)) {
+        _glfw.wl.org_kde_kwin_blur_manager = wl_registry_bind(registry, name, &org_kde_kwin_blur_manager_interface, 1);
+    }
+    else if (is(zwlr_layer_shell_v1)) {
+        if (version >= 4) {
+            _glfw.wl.zwlr_layer_shell_v1_version = version;
+            _glfw.wl.zwlr_layer_shell_v1 = wl_registry_bind(registry, name, &zwlr_layer_shell_v1_interface, version);
+        }
     }
 #undef is
 }
@@ -760,46 +633,57 @@ static const struct wl_registry_listener registryListener = {
 };
 
 
-
-static void registry_handle_global(void* data,
-                                 struct wl_registry* registry UNUSED,
-                                 uint32_t name UNUSED,
-                                 const char* interface,
-                                 uint32_t version UNUSED) {
-    if (strcmp(interface, "zxdg_decoration_manager_v1") == 0) {
-        bool *has_ssd = (bool*)data;
-        if (has_ssd) *has_ssd = true;
-    }
-}
-
-static void registry_handle_global_remove(void *data UNUSED,
-                                       struct wl_registry *registry UNUSED,
-                                       uint32_t name UNUSED) {}
-GLFWAPI const char*
-glfwWaylandCheckForServerSideDecorations(void) {
-    struct wl_display *display = wl_display_connect(NULL);
-    if (!display) return "ERR: Failed to connect to Wayland display";
-    static const struct wl_registry_listener rl = {
-        registry_handle_global, registry_handle_global_remove
-    };
-    struct wl_registry *registry = wl_display_get_registry(display);
-    bool has_ssd = false;
-    wl_registry_add_listener(registry, &rl, &has_ssd);
-    wl_display_roundtrip(display);
-
-    wl_registry_destroy(registry);
-    wl_display_flush(display);
-    wl_display_flush(display);
-    return has_ssd ? "YES" : "NO";
-}
-
-GLFWAPI int glfwGetCurrentSystemColorTheme(void) {
+GLFWAPI GLFWColorScheme glfwGetCurrentSystemColorTheme(void) {
     return glfw_current_system_color_theme();
+}
+
+static pid_t
+get_socket_peer_pid(int fd) {
+    (void)fd;
+#ifdef __linux__
+    struct ucred ucred;
+    socklen_t len = sizeof(struct ucred);
+    return (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &ucred, &len) == -1) ? -1 : ucred.pid;
+#elif defined(LOCAL_PEERCRED) && defined(XUCRED_VERSION)
+    struct xucred peercred;
+	socklen_t peercredlen = sizeof(peercred);
+    return (getsockopt(c->fd, LOCAL_PEERCRED, 1, (void *)&peercred, &peercredlen) == 0 && peercred.cr_version == XUCRED_VERSION) ? peercred.cr_pid : -1;
+#elif defined(LOCAL_PEERPID)
+    pid_t pid;
+    socklen_t pid_size = sizeof(pid);
+    return getsockopt(client, SOL_LOCAL, LOCAL_PEERPID, &pid, &pid_size) == -1 ? -1 : pid;
+#else
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+GLFWAPI pid_t glfwWaylandCompositorPID(void) {
+    if (!_glfw.wl.display) return -1;
+    int fd = wl_display_get_fd(_glfw.wl.display);
+    if (fd < 0) return -1;
+    return get_socket_peer_pid(fd);
 }
 
 //////////////////////////////////////////////////////////////////////////
 //////                       GLFW platform API                      //////
 //////////////////////////////////////////////////////////////////////////
+
+static const char*
+get_compositor_missing_capabilities(void) {
+#define C(title, x) if (!_glfw.wl.x) p += snprintf(buf, sizeof(buf) - (p - buf), "%s", #title);
+    static char buf[256];
+    char *p = buf;
+    *p = 0;
+    C(viewporter, wp_viewporter); C(fractional_scale, wp_fractional_scale_manager_v1);
+    C(blur, org_kde_kwin_blur_manager); C(server_side_decorations, decorationManager);
+    C(cursor_shape, wp_cursor_shape_manager_v1); C(layer_shell, zwlr_layer_shell_v1);
+    C(single_pixel_buffer, wp_single_pixel_buffer_manager_v1); C(preferred_scale, has_preferred_buffer_scale);
+#undef C
+    return buf;
+}
+
+GLFWAPI const char* glfwWaylandMissingCapabilities(void) { return get_compositor_missing_capabilities(); }
 
 int _glfwPlatformInit(void)
 {
@@ -854,6 +738,7 @@ int _glfwPlatformInit(void)
 
     // Sync so we got all registry objects
     wl_display_roundtrip(_glfw.wl.display);
+    _glfwWaylandInitTextInput();
 
     // Sync so we got all initial output events
     wl_display_roundtrip(_glfw.wl.display);
@@ -886,6 +771,10 @@ int _glfwPlatformInit(void)
         _glfwInputError(GLFW_PLATFORM_ERROR,
                         "Wayland: Failed to find Wayland SHM");
         return false;
+    }
+    if (_glfw.hints.init.debugRendering) {
+        const char *mc = get_compositor_missing_capabilities();
+        if (mc && mc[0]) debug("Compositor missing capabilities: %s\n", mc);
     }
 
     return true;
@@ -960,8 +849,18 @@ void _glfwPlatformTerminate(void)
         zwp_primary_selection_device_manager_v1_destroy(_glfw.wl.primarySelectionDeviceManager);
     if (_glfw.wl.xdg_activation_v1)
         xdg_activation_v1_destroy(_glfw.wl.xdg_activation_v1);
+    if (_glfw.wl.wp_single_pixel_buffer_manager_v1)
+        wp_single_pixel_buffer_manager_v1_destroy(_glfw.wl.wp_single_pixel_buffer_manager_v1);
     if (_glfw.wl.wp_cursor_shape_manager_v1)
         wp_cursor_shape_manager_v1_destroy(_glfw.wl.wp_cursor_shape_manager_v1);
+    if (_glfw.wl.wp_viewporter)
+        wp_viewporter_destroy(_glfw.wl.wp_viewporter);
+    if (_glfw.wl.wp_fractional_scale_manager_v1)
+        wp_fractional_scale_manager_v1_destroy(_glfw.wl.wp_fractional_scale_manager_v1);
+    if (_glfw.wl.org_kde_kwin_blur_manager)
+        org_kde_kwin_blur_manager_destroy(_glfw.wl.org_kde_kwin_blur_manager);
+    if (_glfw.wl.zwlr_layer_shell_v1)
+        zwlr_layer_shell_v1_destroy(_glfw.wl.zwlr_layer_shell_v1);
 
     if (_glfw.wl.registry)
         wl_registry_destroy(_glfw.wl.registry);
@@ -973,8 +872,12 @@ void _glfwPlatformTerminate(void)
     finalizePollData(&_glfw.wl.eventLoopData);
 }
 
+#define GLFW_LOOP_BACKEND wl
+#include "main_loop.h"
+
 const char* _glfwPlatformGetVersionString(void)
 {
+    (void)keep_going;
     return _GLFW_VERSION_NUMBER " Wayland EGL OSMesa"
 #if defined(_POSIX_TIMERS) && defined(_POSIX_MONOTONIC_CLOCK)
         " clock_gettime"
@@ -987,6 +890,3 @@ const char* _glfwPlatformGetVersionString(void)
 #endif
         ;
 }
-
-#define GLFW_LOOP_BACKEND wl
-#include "main_loop.h"

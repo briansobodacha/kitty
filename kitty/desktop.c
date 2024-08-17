@@ -5,7 +5,7 @@
  * Distributed under terms of the GPL3 license.
  */
 
-#include "data-types.h"
+#include "state.h"
 #include "safe-wrappers.h"
 #include "cleanup.h"
 #include "loop-utils.h"
@@ -100,13 +100,17 @@ static void* libcanberra_handle = NULL;
 static void *canberra_ctx = NULL;
 FUNC(ca_context_create, int, void**);
 FUNC(ca_context_destroy, int, void*);
+FUNC(ca_context_play_full, int, void*, uint32_t, void*, void(*)(void), void*);
 typedef int (*ca_context_play_func)(void*, uint32_t, ...); static ca_context_play_func ca_context_play = NULL;
+typedef int (*ca_context_change_props_func)(void*, ...); static ca_context_change_props_func ca_context_change_props = NULL;
 
 static PyObject*
 load_libcanberra_functions(void) {
     LOAD_FUNC(libcanberra_handle, ca_context_create);
     LOAD_FUNC(libcanberra_handle, ca_context_play);
+    LOAD_FUNC(libcanberra_handle, ca_context_play_full);
     LOAD_FUNC(libcanberra_handle, ca_context_destroy);
+    LOAD_FUNC(libcanberra_handle, ca_context_change_props);
     return NULL;
 }
 
@@ -142,8 +146,12 @@ load_libcanberra(void) {
     }
     if (ca_context_create(&canberra_ctx) != 0) {
         fprintf(stderr, "Failed to create libcanberra context, cannot play beep sound\n");
-        ca_context_destroy(canberra_ctx); canberra_ctx = NULL;
+        canberra_ctx = NULL;
         dlclose(libcanberra_handle); libcanberra_handle = NULL;
+    } else {
+        if (ca_context_change_props(canberra_ctx, "application.name", "kitty Terminal", "application.id", "kitty", NULL) != 0) {
+            fprintf(stderr, "Failed to set basic properties on libcanberra context, cannot play beep sound\n");
+        }
     }
 }
 
@@ -179,7 +187,6 @@ play_current_sound(void) {
             which_type, e.which_sound,
             "event.description", e.event_id,
             "media.role", e.media_role,
-            "canberra.cache-control", "permanent",
             "canberra.xdg-theme.name", e.theme_name,
             NULL
         );
@@ -194,7 +201,7 @@ queue_canberra_sound(const char *which_sound, const char *event_id, bool is_path
     current_sound.event_id = strdup(event_id);
     current_sound.media_role = strdup(media_role);
     current_sound.is_path = is_path;
-    current_sound.theme_name = strdup(theme_name);
+    current_sound.theme_name = theme_name ? strdup(theme_name) : NULL;
     pthread_mutex_unlock(&canberra_lock);
     while (true) {
         ssize_t ret = write(canberra_pipe_w, "w", 1);
@@ -242,11 +249,13 @@ play_canberra_sound(const char *which_sound, const char *event_id, bool is_path,
 }
 
 static PyObject*
-play_desktop_sound(PyObject *self UNUSED, PyObject *args) {
+play_desktop_sound_async(PyObject *self UNUSED, PyObject *args, PyObject *kw) {
     const char *which, *event_id = "test sound";
-    const char *theme_name = "freedesktop";
+    const char *theme_name = OPT(bell_theme);
+    if (!theme_name || !theme_name[0]) theme_name = "__custom";
     int is_path = 0;
-    if (!PyArg_ParseTuple(args, "s|sps", &which, &event_id, &is_path, &theme_name)) return NULL;
+    static const char* kwlist[] = {"sound_name", "event_id", "is_path", "theme_name", NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kw, "s|sps", (char**)kwlist, &which, &event_id, &is_path, &theme_name)) return NULL;
     play_canberra_sound(which, event_id, is_path, "event", theme_name);
     Py_RETURN_NONE;
 }
@@ -269,7 +278,7 @@ finalize(void) {
 static PyMethodDef module_methods[] = {
     METHODB(init_x11_startup_notification, METH_VARARGS),
     METHODB(end_x11_startup_notification, METH_VARARGS),
-    METHODB(play_desktop_sound, METH_VARARGS),
+    {"play_desktop_sound_async", (PyCFunction)(void(*)(void))play_desktop_sound_async, METH_VARARGS | METH_KEYWORDS, ""},
 
     {NULL, NULL, 0, NULL}        /* Sentinel */
 };

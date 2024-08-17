@@ -6,6 +6,7 @@ import enum
 import re
 import sys
 from collections import defaultdict
+from contextlib import suppress
 from dataclasses import dataclass, fields
 from functools import lru_cache
 from typing import (
@@ -34,6 +35,7 @@ from kitty.conf.utils import (
     KeyAction,
     KeyFuncWrapper,
     currently_parsing,
+    percent,
     positive_float,
     positive_int,
     python_string,
@@ -44,8 +46,8 @@ from kitty.conf.utils import (
     unit_float,
 )
 from kitty.constants import is_macos
-from kitty.fast_data_types import CURSOR_BEAM, CURSOR_BLOCK, CURSOR_UNDERLINE, Color, Shlex, SingleKey
-from kitty.fonts import FontFeature, FontModification, ModificationType, ModificationUnit, ModificationValue
+from kitty.fast_data_types import CURSOR_BEAM, CURSOR_BLOCK, CURSOR_HOLLOW, CURSOR_UNDERLINE, NO_CURSOR_SHAPE, Color, Shlex, SingleKey
+from kitty.fonts import FontModification, FontSpec, ModificationType, ModificationUnit, ModificationValue
 from kitty.key_names import character_key_name_aliases, functional_key_name_aliases, get_key_name_lookup
 from kitty.rgb import color_as_int
 from kitty.types import FloatEdges, MouseEvent
@@ -91,6 +93,11 @@ def shlex_parse(func: str, rest: str) -> FuncArgsType:
 
 def parse_send_text_bytes(text: str) -> bytes:
     return defines.expand_ansi_c_escapes(text).encode('utf-8')
+
+
+@func_with_args('scroll_prompt_to_top')
+def scroll_prompt_to_top(func: str, rest: str) -> FuncArgsType:
+    return func, [to_bool(rest) if rest else False]
 
 
 @func_with_args('send_text')
@@ -144,7 +151,7 @@ def goto_tab_parse(func: str, rest: str) -> FuncArgsType:
 
 @func_with_args('detach_window')
 def detach_window_parse(func: str, rest: str) -> FuncArgsType:
-    if rest not in ('new', 'new-tab', 'ask', 'tab-prev', 'tab-left', 'tab-right'):
+    if rest not in ('new', 'new-tab', 'new-tab-left', 'new-tab-right', 'ask', 'tab-prev', 'tab-left', 'tab-right'):
         log_error(f'Ignoring invalid detach_window argument: {rest}')
         rest = 'new'
     return func, (rest,)
@@ -164,7 +171,7 @@ def detach_tab_parse(func: str, rest: str) -> FuncArgsType:
     return func, (rest,)
 
 
-@func_with_args('set_background_opacity', 'goto_layout', 'toggle_layout', 'kitty_shell', 'show_kitty_doc', 'set_tab_title', 'push_keyboard_mode')
+@func_with_args('set_background_opacity', 'goto_layout', 'toggle_layout', 'toggle_tab', 'kitty_shell', 'show_kitty_doc', 'set_tab_title', 'push_keyboard_mode')
 def simple_parse(func: str, rest: str) -> FuncArgsType:
     return func, [rest]
 
@@ -211,7 +218,7 @@ def clear_terminal(func: str, rest: str) -> FuncArgsType:
         args = ['reset', True]
     else:
         action = vals[0].lower()
-        if action not in ('reset', 'scroll', 'scrollback', 'clear', 'to_cursor',):
+        if action not in ('reset', 'scroll', 'scrollback', 'clear', 'to_cursor', 'to_cursor_scroll'):
             log_error(f'{action} is unknown for clear_terminal, using reset')
             action = 'reset'
         args = [action, vals[1].lower() == 'active']
@@ -519,6 +526,13 @@ cshapes = {
     'beam': CURSOR_BEAM,
     'underline': CURSOR_UNDERLINE
 }
+cshapes_unfocused = {
+    'block': CURSOR_BLOCK,
+    'beam': CURSOR_BEAM,
+    'underline': CURSOR_UNDERLINE,
+    'hollow': CURSOR_HOLLOW,
+    'unchanged': NO_CURSOR_SHAPE,
+}
 
 
 def to_cursor_shape(x: str) -> int:
@@ -528,6 +542,17 @@ def to_cursor_shape(x: str) -> int:
         raise ValueError(
             'Invalid cursor shape: {} allowed values are {}'.format(
                 x, ', '.join(cshapes)
+            )
+        )
+
+
+def to_cursor_unfocused_shape(x: str) -> int:
+    try:
+        return cshapes_unfocused[x.lower()]
+    except KeyError:
+        raise ValueError(
+            'Invalid unfocused cursor shape: {} allowed values are {}'.format(
+                x, ', '.join(cshapes_unfocused)
             )
         )
 
@@ -639,6 +664,13 @@ def hide_window_decorations(x: str) -> int:
 def resize_draw_strategy(x: str) -> int:
     cmap = {'static': 0, 'scale': 1, 'blank': 2, 'size': 3}
     return cmap.get(x.lower(), 0)
+
+
+def window_logo_scale(x: str) -> Tuple[float, float]:
+    parts = x.split(maxsplit=1)
+    if len(parts) == 1:
+        return positive_float(parts[0]), -1.0
+    return positive_float(parts[0]), positive_float(parts[1])
 
 
 def resize_debounce_time(x: str) -> Tuple[float, float]:
@@ -756,6 +788,10 @@ def config_or_absolute_path(x: str, env: Optional[Dict[str, str]] = None) -> Opt
     return resolve_abs_or_config_path(x, env)
 
 
+def filter_notification(val: str, current_val: Dict[str, str]) -> Iterable[Tuple[str, str]]:
+    yield val, ''
+
+
 def remote_control_password(val: str, current_val: Dict[str, str]) -> Iterable[Tuple[str, Sequence[str]]]:
     val = val.strip()
     if val:
@@ -765,7 +801,7 @@ def remote_control_password(val: str, current_val: Dict[str, str]) -> Iterable[T
             # line of remote_control_password
             raise ValueError('Passwords are not allowed to start with hyphens, ignoring this password')
         if len(parts) == 1:
-            yield parts[0], tuple()
+            yield "", (parts[0],)
         else:
             yield parts[0], tuple(parts[1:])
 
@@ -850,7 +886,7 @@ def clear_all_shortcuts(val: str, dict_with_parse_results: Optional[Dict[str, An
     return ans
 
 
-def font_features(val: str) -> Iterable[Tuple[str, Tuple[FontFeature, ...]]]:
+def font_features(val: str) -> Iterable[Tuple[str, Tuple[defines.ParsedFontFeature, ...]]]:
     if val == 'none':
         return
     parts = val.split()
@@ -861,11 +897,9 @@ def font_features(val: str) -> Iterable[Tuple[str, Tuple[FontFeature, ...]]]:
         features = []
         for feat in parts[1:]:
             try:
-                parsed = defines.parse_font_feature(feat)
+                features.append(defines.ParsedFontFeature(feat))
             except ValueError:
                 log_error(f'Ignoring invalid font feature: {feat}')
-            else:
-                features.append(FontFeature(feat, parsed))
         yield parts[0], tuple(features)
 
 
@@ -979,11 +1013,8 @@ kitten_alias = action_alias
 def symbol_map_parser(val: str, min_size: int = 2) -> Iterable[Tuple[Tuple[int, int], str]]:
     parts = val.split()
 
-    def abort() -> None:
-        log_error(f'Symbol map: {val} is invalid, ignoring')
-
     if len(parts) < min_size:
-        return abort()
+        raise ValueError('must have codepoints AND font name')
     family = ' '.join(parts[1:])
 
     def to_chr(x: str) -> int:
@@ -994,12 +1025,9 @@ def symbol_map_parser(val: str, min_size: int = 2) -> Iterable[Tuple[Tuple[int, 
     for x in parts[0].split(','):
         a_, b_ = x.replace('–', '-').partition('-')[::2]
         b_ = b_ or a_
-        try:
-            a, b = map(to_chr, (a_, b_))
-        except Exception:
-            return abort()
+        a, b = map(to_chr, (a_, b_))
         if b < a or max(a, b) > sys.maxunicode or min(a, b) < 1:
-            return abort()
+            raise ValueError(f'Invalid range: {a:x} - {b:x}')
         yield (a, b), family
 
 
@@ -1365,6 +1393,163 @@ def parse_mouse_map(val: str) -> Iterable[MouseMapping]:
         return
     for mode in sorted(specified_modes):
         yield MouseMapping(button, mods, count, mode == 'grabbed', definition=action)
+
+
+def parse_font_spec(spec: str) -> FontSpec:
+    return FontSpec.from_setting(spec)
+
+
+JumpTypes = Literal['start', 'end', 'none', 'both']
+
+
+class EasingFunction(NamedTuple):
+    type: Literal['steps', 'linear', 'cubic-bezier', ''] = ''
+
+    num_steps: int = 0
+    jump_type: JumpTypes = 'end'
+
+    linear_x: Tuple[float, ...] = ()
+    linear_y: Tuple[float, ...] = ()
+
+    cubic_bezier_points: Tuple[float, ...] = ()
+
+    def __repr__(self) -> str:
+        fields = ', '.join(f'{f}={getattr(self, f)!r}' for f in self._fields if getattr(self, f) != self._field_defaults[f])
+        return f'kitty.options.utils.EasingFunction({fields})'
+
+    def __bool__(self) -> bool:
+        return bool(self.type)
+
+    @classmethod
+    def cubic_bezier(cls, params: str) -> 'EasingFunction':
+        parts = params.replace(',', ' ').split()
+        if len(parts) != 4:
+            raise ValueError('cubic-bezier easing function must have four points')
+        return cls(type='cubic-bezier', cubic_bezier_points=(
+            unit_float(parts[0]), float(parts[1]), unit_float(parts[2]), float(parts[3])))
+
+    @classmethod
+    def linear(cls, params: str) -> 'EasingFunction':
+        parts = params.split(',')
+        if len(parts) < 2:
+            raise ValueError('Must specify at least two points for the linear easing function')
+        xaxis: List[float] = []
+        yaxis: List[float] = []
+
+        def balance(end: float) -> None:
+            extra = len(yaxis) - len(xaxis)
+            if extra <= 0:
+                return
+            start = xaxis[-1] if xaxis else 0.
+            delta = (end - start) / max(1, extra - 1)
+            if delta <= 0.:
+                raise ValueError(f'Linear easing curve must have strictly increasing points: {params} does not')
+            if xaxis:
+                for i in range(extra):
+                    xaxis.append(start + (i+1) * delta)
+            else:
+                for i in range(extra):
+                    xaxis.append(i * delta)
+
+        def add_point(y: float, x: Optional[float] = None) -> None:
+            if x is None:
+                yaxis.append(y)
+            else:
+                x = unit_float(x)
+                balance(x)
+                xaxis.append(x)
+                yaxis.append(y)
+
+        for r in parts:
+            points = r.strip().split()
+            y = unit_float(points[0])
+            if len(points) == 1:
+                add_point(y)
+            elif len(points) == 2:
+                add_point(y, percent(points[1]))
+            elif len(points) == 3:
+                add_point(y, percent(points[1]))
+                add_point(y, percent(points[2]))
+            else:
+                raise ValueError(f'{r} has too many points for a linear easing curve parameter')
+        balance(1)
+        return cls(type='linear', linear_x=tuple(xaxis), linear_y=tuple(yaxis))
+
+    @classmethod
+    def steps(cls, params: str) -> 'EasingFunction':
+        parts = params.replace(',', ' ').split()
+        jump_type: JumpTypes = 'end'
+        if len(parts) == 2:
+            n = int(parts[0])
+            jt = parts[1]
+            mapping: Dict[str, JumpTypes] = {
+                'jump-start': 'start', 'start': 'start', 'end': 'end', 'jump-end': 'end', 'jump-none': 'none', 'jump-both': 'both'
+            }
+            try:
+                jump_type = mapping[jt.lower()]
+            except KeyError:
+                raise KeyError(f'{jt} is not a valid jump type for a linear easing function')
+            if jump_type == 'none':
+                n = max(2, n)
+            else:
+                n = max(1, n)
+        else:
+            n = max(1, int(parts[0]))
+        return cls(type='steps', jump_type=jump_type, num_steps=n)
+
+
+def parse_animation(spec: str, interval: float = -1.) -> Tuple[float, EasingFunction, EasingFunction]:
+    with suppress(Exception):
+        interval = float(spec)
+        return interval, EasingFunction(), EasingFunction()
+
+    m = [EasingFunction(), EasingFunction()]
+    def parse_func(func_name: str, params: str) -> None:
+        idx = 1 if m[0] else 0
+        if m[idx]:
+            raise ValueError(f'{spec} specified more than two easing functions')
+        if func_name == 'cubic-bezier':
+            m[idx] = EasingFunction.cubic_bezier(params)
+        elif func_name == 'linear':
+            m[idx] = EasingFunction.linear(params)
+        elif func_name == 'steps':
+            m[idx] = EasingFunction.steps(params)
+        else:
+            raise KeyError(f'{func_name} is not a valid easing function')
+
+    for match in re.finditer(r'([-+.0-9a-zA-Z]+)(?:\(([^)]*)\)){0,1}', spec):
+        func_name, params = match.group(1, 2)
+        if params:
+            parse_func(func_name, params)
+            continue
+        with suppress(Exception):
+            interval = float(func_name)
+            continue
+        if func_name == 'ease-in-out':
+            parse_func('cubic-bezier', '0.42, 0, 0.58, 1')
+        elif func_name == 'linear':
+            parse_func('cubic-bezier', '0, 0, 1, 1')
+        elif func_name == 'ease':
+            parse_func('cubic-bezier', '0.25, 0.1, 0.25, 1')
+        elif func_name == 'ease-out':
+            parse_func('cubic-bezier', '0, 0, 0.58, 1')
+        elif func_name == 'ease-in':
+            parse_func('cubic-bezier', '0.42, 0, 1, 1')
+        elif func_name == 'step-start':
+            parse_func('steps', '1, start')
+        elif func_name == 'step-end':
+            parse_func('steps', '1, end')
+        else:
+            raise KeyError(f'{func_name} is not a valid easing function')
+    return interval, m[0], m[1]
+
+
+def cursor_blink_interval(spec: str) -> Tuple[float, EasingFunction, EasingFunction]:
+    return parse_animation(spec)
+
+
+def visual_bell_duration(spec: str) -> Tuple[float, EasingFunction, EasingFunction]:
+    return parse_animation(spec, interval=0.)
 
 
 def deprecated_hide_window_decorations_aliases(key: str, val: str, ans: Dict[str, Any]) -> None:

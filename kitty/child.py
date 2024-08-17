@@ -4,8 +4,10 @@
 import os
 import sys
 from collections import defaultdict
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager, suppress
-from typing import TYPE_CHECKING, DefaultDict, Dict, Generator, List, Optional, Sequence, Tuple
+from itertools import count
+from typing import TYPE_CHECKING, DefaultDict, Optional
 
 import kitty.fast_data_types as fast_data_types
 
@@ -30,17 +32,17 @@ if is_macos:
     def cwd_of_process(pid: int) -> str:
         return os.path.realpath(_cwd(pid))
 
-    def process_group_map() -> DefaultDict[int, List[int]]:
-        ans: DefaultDict[int, List[int]] = defaultdict(list)
+    def process_group_map() -> DefaultDict[int, list[int]]:
+        ans: DefaultDict[int, list[int]] = defaultdict(list)
         for pid, pgid in _process_group_map():
             ans[pgid].append(pid)
         return ans
 
-    def cmdline_of_pid(pid: int) -> List[str]:
+    def cmdline_of_pid(pid: int) -> list[str]:
         return cmdline_(pid)
 else:
 
-    def cmdline_of_pid(pid: int) -> List[str]:
+    def cmdline_of_pid(pid: int) -> list[str]:
         with open(f'/proc/{pid}/cmdline', 'rb') as f:
             return list(filter(None, f.read().decode('utf-8').split('\0')))
 
@@ -61,8 +63,8 @@ else:
         with open(f'/proc/{pid}/environ', 'rb') as f:
             return f.read().decode('utf-8')
 
-    def process_group_map() -> DefaultDict[int, List[int]]:
-        ans: DefaultDict[int, List[int]] = defaultdict(list)
+    def process_group_map() -> DefaultDict[int, list[int]]:
+        ans: DefaultDict[int, list[int]] = defaultdict(list)
         for x in os.listdir('/proc'):
             try:
                 pid = int(x)
@@ -86,8 +88,8 @@ def checked_terminfo_dir() -> Optional[str]:
     return terminfo_dir if os.path.isdir(terminfo_dir) else None
 
 
-def processes_in_group(grp: int) -> List[int]:
-    gmap: Optional[DefaultDict[int, List[int]]] = getattr(process_group_map, 'cached_map', None)
+def processes_in_group(grp: int) -> list[int]:
+    gmap: Optional[DefaultDict[int, list[int]]] = getattr(process_group_map, 'cached_map', None)
     if gmap is None:
         try:
             gmap = process_group_map()
@@ -109,11 +111,11 @@ def cached_process_data() -> Generator[None, None, None]:
         delattr(process_group_map, 'cached_map')
 
 
-def parse_environ_block(data: str) -> Dict[str, str]:
+def parse_environ_block(data: str) -> dict[str, str]:
     """Parse a C environ block of environment variables into a dictionary."""
     # The block is usually raw data from the target process.  It might contain
     # trailing garbage and lines that do not look like assignments.
-    ret: Dict[str, str] = {}
+    ret: dict[str, str] = {}
     pos = 0
 
     while True:
@@ -132,11 +134,11 @@ def parse_environ_block(data: str) -> Dict[str, str]:
     return ret
 
 
-def environ_of_process(pid: int) -> Dict[str, str]:
+def environ_of_process(pid: int) -> dict[str, str]:
     return parse_environ_block(_environ_of_process(pid))
 
 
-def process_env() -> Dict[str, str]:
+def process_env() -> dict[str, str]:
     ans = dict(os.environ)
     ssl_env_var = getattr(sys, 'kitty_ssl_env_var', None)
     if ssl_env_var is not None:
@@ -145,14 +147,14 @@ def process_env() -> Dict[str, str]:
     return ans
 
 
-def default_env() -> Dict[str, str]:
-    ans: Optional[Dict[str, str]] = getattr(default_env, 'env', None)
+def default_env() -> dict[str, str]:
+    ans: Optional[dict[str, str]] = getattr(default_env, 'env', None)
     if ans is None:
         return process_env()
     return ans
 
 
-def set_default_env(val: Optional[Dict[str, str]] = None) -> None:
+def set_default_env(val: Optional[dict[str, str]] = None) -> None:
     env = process_env().copy()
     has_lctype = False
     if val:
@@ -166,7 +168,7 @@ def set_LANG_in_default_env(val: str) -> None:
     default_env().setdefault('LANG', val)
 
 
-def openpty() -> Tuple[int, int]:
+def openpty() -> tuple[int, int]:
     master, slave = os.openpty()  # Note that master and slave are in blocking mode
     os.set_inheritable(slave, True)
     os.set_inheritable(master, False)
@@ -179,10 +181,18 @@ def getpid() -> str:
     return str(os.getpid())
 
 
+@run_once
+def base64_terminfo_data() -> str:
+    return (b'b64:' + fast_data_types.base64_encode(fast_data_types.terminfo_data(), True)).decode('ascii')
+
+
 class ProcessDesc(TypedDict):
     cwd: Optional[str]
     pid: int
     cmdline: Optional[Sequence[str]]
+
+
+child_counter = count()
 
 
 class Child:
@@ -196,13 +206,14 @@ class Child:
         argv: Sequence[str],
         cwd: str,
         stdin: Optional[bytes] = None,
-        env: Optional[Dict[str, str]] = None,
+        env: Optional[dict[str, str]] = None,
         cwd_from: Optional['CwdRequest'] = None,
         is_clone_launch: str = '',
         add_listen_on_env_var: bool = True,
         hold: bool = False,
     ):
         self.is_clone_launch = is_clone_launch
+        self.id = next(child_counter)
         self.add_listen_on_env_var = add_listen_on_env_var
         self.argv = list(argv)
         if cwd_from:
@@ -215,12 +226,12 @@ class Child:
         self.cwd = os.path.abspath(cwd)
         self.stdin = stdin
         self.env = env or {}
-        self.final_env:Dict[str, str] = {}
+        self.final_env:dict[str, str] = {}
         self.is_default_shell = bool(self.argv and self.argv[0] == shell_path)
         self.should_run_via_run_shell_kitten = is_macos and self.is_default_shell
         self.hold = hold
 
-    def get_final_env(self) -> Dict[str, str]:
+    def get_final_env(self) -> dict[str, str]:
         from kitty.options.utils import DELETE_ENV_VAR
         env = default_env().copy()
         opts = fast_data_types.get_options()
@@ -242,9 +253,12 @@ class Child:
             # can use it to display the current directory name rather
             # than the resolved path
             env['PWD'] = self.cwd
-        tdir = checked_terminfo_dir()
-        if tdir:
-            env['TERMINFO'] = tdir
+        if opts.terminfo_type == 'path':
+            tdir = checked_terminfo_dir()
+            if tdir:
+                env['TERMINFO'] = tdir
+        elif opts.terminfo_type == 'direct':
+            env['TERMINFO'] = base64_terminfo_data()
         env['KITTY_INSTALLATION_DIR'] = kitty_base_dir
         if opts.forward_stdio:
             env['KITTY_STDIO_FORWARDED'] = '3'
@@ -330,6 +344,14 @@ class Child:
         self.terminal_ready_fd = ready_write_fd
         if self.child_fd is not None:
             os.set_blocking(self.child_fd, False)
+        if not is_macos:
+            ppid = getpid()
+            try:
+                fast_data_types.systemd_move_pid_into_new_scope(pid, f'kitty-{ppid}-{self.id}.scope', f'kitty child process: {pid} launched by: {ppid}')
+            except NotImplementedError:
+                pass
+            except OSError as err:
+                log_error("Could not move child process into a systemd scope: " + str(err))
         return pid
 
     def __del__(self) -> None:
@@ -342,7 +364,7 @@ class Child:
         os.close(self.terminal_ready_fd)
         self.terminal_ready_fd = -1
 
-    def cmdline_of_pid(self, pid: int) -> List[str]:
+    def cmdline_of_pid(self, pid: int) -> list[str]:
         try:
             ans = cmdline_of_pid(pid)
         except Exception:
@@ -352,7 +374,7 @@ class Child:
         return ans
 
     @property
-    def foreground_processes(self) -> List[ProcessDesc]:
+    def foreground_processes(self) -> list[ProcessDesc]:
         if self.child_fd is None:
             return []
         try:
@@ -372,7 +394,7 @@ class Child:
             return []
 
     @property
-    def cmdline(self) -> List[str]:
+    def cmdline(self) -> list[str]:
         try:
             assert self.pid is not None
             return self.cmdline_of_pid(self.pid) or list(self.argv)
@@ -380,7 +402,7 @@ class Child:
             return list(self.argv)
 
     @property
-    def foreground_cmdline(self) -> List[str]:
+    def foreground_cmdline(self) -> list[str]:
         try:
             assert self.pid_for_cwd is not None
             return self.cmdline_of_pid(self.pid_for_cwd) or self.cmdline
@@ -388,7 +410,7 @@ class Child:
             return self.cmdline
 
     @property
-    def environ(self) -> Dict[str, str]:
+    def environ(self) -> dict[str, str]:
         try:
             assert self.pid is not None
             return environ_of_process(self.pid) or self.final_env.copy()
@@ -446,7 +468,7 @@ class Child:
         return self.get_foreground_cwd()
 
     @property
-    def foreground_environ(self) -> Dict[str, str]:
+    def foreground_environ(self) -> dict[str, str]:
         pid = self.pid_for_cwd
         if pid is not None:
             with suppress(Exception):

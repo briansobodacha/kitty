@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 # License: GPLv3 Copyright: 2021, Kovid Goyal <kovid at kovidgoyal.net>
 
+from collections.abc import Iterator, Mapping, Sequence
 from enum import Enum
 from functools import update_wrapper
-from typing import TYPE_CHECKING, Any, Callable, Dict, Generic, Iterator, Mapping, NamedTuple, Optional, Sequence, Tuple, TypedDict, TypeVar, Union
+from typing import TYPE_CHECKING, Any, Callable, Generic, NamedTuple, Optional, TypedDict, TypeVar, Union
 
 if TYPE_CHECKING:
     from kitty.fast_data_types import SingleKey
@@ -66,6 +67,14 @@ class SignalInfo(NamedTuple):
     sival_ptr: int
 
 
+class LayerShellConfig(NamedTuple):
+    type: int = 0
+    edge: int = 0
+    focus_policy: int = 0
+    output_name: str = ''
+    size_in_cells: int = 0
+
+
 def mod_to_names(mods: int, has_kitty_mod: bool = False, kitty_mod: int = 0) -> Iterator[str]:
     if has_kitty_mod:
         mods &= ~kitty_mod
@@ -87,7 +96,7 @@ def human_repr_of_single_key(self: 'SingleKey', kitty_mod: int) -> str:
 
 
 class Shortcut(NamedTuple):
-    keys: Tuple['SingleKey', ...]
+    keys: tuple['SingleKey', ...]
 
     def human_repr(self, kitty_mod: int = 0) -> str:
         return ' > '.join(human_repr_of_single_key(k, kitty_mod) for k in self.keys)
@@ -174,7 +183,7 @@ def run_once(f: Callable[[], _T]) -> 'RunOnce[_T]':
 
 
 @run_once
-def modmap() -> Dict[str, int]:
+def modmap() -> dict[str, int]:
     from .constants import is_macos
     from .fast_data_types import (
         GLFW_MOD_ALT,

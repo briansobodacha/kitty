@@ -25,36 +25,41 @@ alpha-blending and text over graphics.
     :alt: Demo of graphics rendering in kitty
     :align: center
 
-Some programs and libraries that use the kitty graphics protocol:
+Some applications that use the kitty graphics protocol:
 
-* `termpdf.py <https://github.com/dsanson/termpdf.py>`_ - a terminal PDF/DJVU/CBR viewer
-* `ranger <https://github.com/ranger/ranger>`_ - a terminal file manager, with image previews
+* `awrit <https://github.com/chase/awrit>`_ - Chromium-based web browser rendered in Kitty with mouse and keyboard support
+* `broot <https://dystroy.org/broot/>`_ - a terminal file explorer and manager, with preview of images, SVG, PDF, etc.
+* `chafa <https://github.com/hpjansson/chafa>`_  - a terminal image viewer
 * :doc:`kitty-diff <kittens/diff>` - a side-by-side terminal diff program with support for images
-* `tpix <https://github.com/jesvedberg/tpix>`_ - a statically compiled binary that can be used to display images and easily installed on remote servers without root access
+* `fzf <https://github.com/junegunn/fzf/commit/d8188fce7b7bea982e7f9050c35e488e49fb8fd0>`_ - A command line fuzzy finder
 * `mpv <https://github.com/mpv-player/mpv/commit/874e28f4a41a916bb567a882063dd2589e9234e1>`_ - A video player that can play videos in the terminal
+* `neofetch <https://github.com/dylanaraps/neofetch>`_ - A command line system information tool
 * `pixcat <https://github.com/mirukana/pixcat>`_ - a third party CLI and python library that wraps the graphics protocol
-* `neofetch <https://github.com/dylanaraps/neofetch>`_ - A command line system
-  information tool
-* `viu <https://github.com/atanunq/viu>`_ - a terminal image viewer
-* `ctx.graphics <https://ctx.graphics/>`_ - Library for drawing graphics
+* `ranger <https://github.com/ranger/ranger>`_ - a terminal file manager, with image previews
+* `termpdf.py <https://github.com/dsanson/termpdf.py>`_ - a terminal PDF/DJVU/CBR viewer
 * `timg <https://github.com/hzeller/timg>`_ - a terminal image and video viewer
+* `tpix <https://github.com/jesvedberg/tpix>`_ - a statically compiled binary that can be used to display images and easily installed on remote servers without root access
+* `twitch-tui <https://github.com/Xithrius/twitch-tui>`_ - Twitch chat in the terminal
+* `viu <https://github.com/atanunq/viu>`_ - a terminal image viewer
+* `Yazi <https://github.com/sxyazi/yazi>`_ - Blazing fast terminal file manager written in Rust, based on async I/O
+
+Libraries:
+
+* `ctx.graphics <https://ctx.graphics/>`_ - Library for drawing graphics
 * `notcurses <https://github.com/dankamongmen/notcurses>`_ - C library for terminal graphics with bindings for C++, Rust and Python
 * `rasterm <https://github.com/BourgeoisBear/rasterm>`_  - Go library to display images in the terminal
-* `chafa <https://github.com/hpjansson/chafa>`_  - a terminal image viewer
 * `hologram.nvim <https://github.com/edluffy/hologram.nvim>`_  - view images inside nvim
-* `kui.nvim <https://github.com/romgrk/kui.nvim>`_  - Build sophisticated UIs inside neovim using the kitty graphics protocol
 * `image.nvim <https://github.com/3rd/image.nvim>`_ - Bringing images to neovim
+* `image_preview.nvim <https://github.com/adelarsq/image_preview.nvim/>`_ - Image preview for neovim
+* `kui.nvim <https://github.com/romgrk/kui.nvim>`_  - Build sophisticated UIs inside neovim using the kitty graphics protocol
 * `term-image <https://github.com/AnonymouX47/term-image>`_  - A Python library, CLI and TUI to display and browse images in the terminal
 * `glkitty <https://github.com/michaeljclark/glkitty>`_ - C library to draw OpenGL shaders in the terminal with a glgears demo
-* `twitch-tui <https://github.com/Xithrius/twitch-tui>`_ - Twitch chat in the terminal
-* `awrit <https://github.com/chase/awrit>`_ - Chromium-based web browser rendered in Kitty with mouse and keyboard support
-* `fzf <https://github.com/junegunn/fzf/commit/d8188fce7b7bea982e7f9050c35e488e49fb8fd0>`_ - A command line fuzzy finder
 
 Other terminals that have implemented the graphics protocol:
 
-* `WezTerm <https://github.com/wez/wezterm/issues/986>`_
 * `Konsole <https://invent.kde.org/utilities/konsole/-/merge_requests/594>`_
 * `wayst <https://github.com/91861/wayst>`_
+* `WezTerm <https://github.com/wez/wezterm/issues/986>`_
 
 
 Getting the window size
@@ -228,7 +233,7 @@ This is a so-called *Application Programming Command (APC)*. Most terminal
 emulators ignore APC codes, making it safe to use.
 
 The control data is a comma-separated list of ``key=value`` pairs.  The payload
-is arbitrary binary data, base64-encoded to prevent interoperation problems
+is arbitrary binary data, :rfc:`base64 <4648>` encoded to prevent interoperation problems
 with legacy terminals that get confused by control codes within an APC code.
 The meaning of the payload is interpreted based on the control data.
 
@@ -289,7 +294,8 @@ compression is supported, which is specified using ``o=z``. For example::
     <ESC>_Gf=24,s=10,v=20,o=z;<payload><ESC>\
 
 This is the same as the example from the RGB data section, except that the
-payload is now compressed using deflate (this occurs prior to base64-encoding).
+payload is now compressed using deflate (this occurs prior to
+:rfc:`base64 <4648>` encoding).
 The terminal emulator will decompress it before rendering. You can specify
 compression for any format. The terminal emulator will decompress before
 interpreting the pixel data.
@@ -361,7 +367,7 @@ Remote clients, those that are unable to use the filesystem/shared memory to
 transmit data, must send the pixel data directly using escape codes. Since
 escape codes are of limited maximum length, the data will need to be chunked up
 for transfer. This is done using the ``m`` key. The pixel data must first be
-base64 encoded then chunked up into chunks no larger than ``4096`` bytes. All
+:rfc:`base64 <4648>` encoded then chunked up into chunks no larger than ``4096`` bytes. All
 chunks, except the last, must have a size that is a multiple of 4. The client
 then sends the graphics escape code as usual, with the addition of an ``m`` key
 that must have the value ``1`` for all but the last chunk, where it must be
@@ -637,7 +643,7 @@ terminal may apply other heuristics (but it doesn't have to).
 It is important to distinguish between virtual image placements and real images
 displayed on top of Unicode placeholders. Virtual placements are invisible and only play
 the role of prototypes for real images. Virtual placements can be deleted by a
-deletion command only when the `d` key is equal to ``i``, ``I``, ``n`` or ``N``.
+deletion command only when the `d` key is equal to ``i``, ``I``, ``r``, ``R``, ``n`` or ``N``.
 The key values ``a``, ``c``, ``p``, ``q``, ``x``, ``y``, ``z`` and their capital
 variants never affect virtual placements because they do not have a physical
 location on the screen.
@@ -729,13 +735,14 @@ scrollback buffer. The values of the ``x`` and ``y`` keys are the same as cursor
 Value of ``d``       Meaning
 =================    ============
 ``a`` or ``A``       Delete all placements visible on screen
-``i`` or ``I``       Delete all images with the specified id, specified using the ``i`` key. If you specify a ``p`` key for the placement                      id as well, then only the placement with the specified image id and placement id will be deleted.
+``i`` or ``I``       Delete all images with the specified id, specified using the ``i`` key. If you specify a ``p`` key for the placement                          id as well, then only the placement with the specified image id and placement id will be deleted.
 ``n`` or ``N``       Delete newest image with the specified number, specified using the ``I`` key. If you specify a ``p`` key for the
                      placement id as well, then only the placement with the specified number and placement id will be deleted.
 ``c`` or ``C``       Delete all placements that intersect with the current cursor position.
 ``f`` or ``F``       Delete animation frames.
 ``p`` or ``P``       Delete all placements that intersect a specific cell, the cell is specified using the ``x`` and ``y`` keys
 ``q`` or ``Q``       Delete all placements that intersect a specific cell having a specific z-index. The cell and z-index is specified using the ``x``, ``y`` and ``z`` keys.
+``r`` or ``R``       Delete all images whose id is greater than or equal to the value of the ``x`` key and less than or equal to the value of the ``y`` (added in kitty version 0.33.0).
 ``x`` or ``X``       Delete all placements that intersect the specified column, specified using the ``x`` key.
 ``y`` or ``Y``       Delete all placements that intersect the specified row, specified using the ``y`` key.
 ``z`` or ``Z``       Delete all placements that have the specified z-index, specified using the ``z`` key.
@@ -950,7 +957,7 @@ by the ``C`` key with the default being to alpha blend the source rectangle
 onto the destination rectangle. With ``C=1`` it will be a simple replacement
 of pixels. For example::
 
-    <ESC>_Gi=1,r=7,c=9,w=23,h=27,X=4,Y=8,x=1,y=3<ESC>\
+    <ESC>_Ga=c,i=1,r=7,c=9,w=23,h=27,X=4,Y=8,x=1,y=3<ESC>\
 
 Will compose a ``23x27`` rectangle located at ``(4, 8)`` in the ``7th frame``
 onto the rectangle located at ``(1, 3)`` in the ``9th frame``. These will be
@@ -1083,9 +1090,11 @@ Key      Value                 Default    Description
 **Keys for deleting images**
 -----------------------------------------------------------
 ``d``    Single character.     ``a``      What to delete.
-         ``(a, A, c, C, n, N,
-         i, I, p, P, q, Q, x,
-         X, y, Y, z, Z)``.
+         ``(
+         a, A, c, C, n, N,
+         i, I, p, P, q, Q, r,
+         R, x, X, y, Y, z, Z
+         )``.
 =======  ====================  =========  =================
 
 

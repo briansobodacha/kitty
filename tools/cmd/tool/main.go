@@ -6,11 +6,14 @@ import (
 	"fmt"
 
 	"kitty/kittens/ask"
+	"kitty/kittens/choose_fonts"
 	"kitty/kittens/clipboard"
 	"kitty/kittens/diff"
 	"kitty/kittens/hints"
 	"kitty/kittens/hyperlinked_grep"
 	"kitty/kittens/icat"
+	"kitty/kittens/notify"
+	"kitty/kittens/query_terminal"
 	"kitty/kittens/show_key"
 	"kitty/kittens/ssh"
 	"kitty/kittens/themes"
@@ -18,6 +21,7 @@ import (
 	"kitty/kittens/unicode_input"
 	"kitty/tools/cli"
 	"kitty/tools/cmd/at"
+	"kitty/tools/cmd/benchmark"
 	"kitty/tools/cmd/edit_in_kitty"
 	"kitty/tools/cmd/mouse_demo"
 	"kitty/tools/cmd/pytest"
@@ -25,6 +29,7 @@ import (
 	"kitty/tools/cmd/show_error"
 	"kitty/tools/cmd/update_self"
 	"kitty/tools/tui"
+	"kitty/tools/utils/images"
 )
 
 var _ = fmt.Print
@@ -66,8 +71,10 @@ func KittyToolEntryPoints(root *cli.Command) {
 	ask.EntryPoint(root)
 	// hints
 	hints.EntryPoint(root)
-	// hints
+	// diff
 	diff.EntryPoint(root)
+	// notify
+	notify.EntryPoint(root)
 	// themes
 	themes.EntryPoint(root)
 	themes.ParseEntryPoint(root)
@@ -75,6 +82,10 @@ func KittyToolEntryPoints(root *cli.Command) {
 	run_shell.EntryPoint(root)
 	// show_error
 	show_error.EntryPoint(root)
+	// choose-fonts
+	choose_fonts.EntryPoint(root)
+	// query-terminal
+	query_terminal.EntryPoint(root)
 	// __pytest__
 	pytest.EntryPoint(root)
 	// __hold_till_enter__
@@ -96,6 +107,8 @@ func KittyToolEntryPoints(root *cli.Command) {
 			return confirm_and_run_shebang(args)
 		},
 	})
+	// __convert_image__
+	images.ConvertEntryPoint(root)
 	// __generate_man_pages__
 	root.AddSubCommand(&cli.Command{
 		Name:            "__generate_man_pages__",
@@ -121,4 +134,5 @@ func KittyToolEntryPoints(root *cli.Command) {
 			return
 		},
 	})
+	benchmark.EntryPoint(root)
 }

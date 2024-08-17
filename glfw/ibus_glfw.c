@@ -46,7 +46,7 @@
 #include "internal.h"
 #include "ibus_glfw.h"
 
-#define debug(...) if (_glfw.hints.init.debugKeyboard) printf(__VA_ARGS__);
+#define debug debug_input
 static const char IBUS_SERVICE[]         = "org.freedesktop.IBus";
 static const char IBUS_PATH[]            = "/org/freedesktop/IBus";
 static const char IBUS_INTERFACE[]       = "org.freedesktop.IBus";

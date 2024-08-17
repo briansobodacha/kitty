@@ -12,7 +12,8 @@ import (
 	"kitty/tools/utils/images"
 	"kitty/tools/utils/shm"
 
-	"github.com/disintegration/imaging"
+	"github.com/edwvee/exiffix"
+	"github.com/kovidgoyal/imaging"
 )
 
 var _ = fmt.Print
@@ -108,8 +109,8 @@ func scale_image(imgd *image_data) bool {
 	return false
 }
 
-func load_one_frame_image(ctx *images.Context, imgd *image_data, src *opened_input) (img image.Image, err error) {
-	img, err = imaging.Decode(src.file, imaging.AutoOrientation(true))
+func load_one_frame_image(imgd *image_data, src *opened_input) (img image.Image, err error) {
+	img, _, err = exiffix.Decode(src.file)
 	src.Rewind()
 	if err != nil {
 		return
@@ -163,7 +164,7 @@ func render_image_with_go(imgd *image_data, src *opened_input) (err error) {
 			return err
 		}
 	default:
-		img, err := load_one_frame_image(&ctx, imgd, src)
+		img, err := load_one_frame_image(imgd, src)
 		if err != nil {
 			return err
 		}

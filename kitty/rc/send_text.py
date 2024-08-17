@@ -56,7 +56,7 @@ class ClearSession(SessionAction):
             for wid in s.window_ids:
                 qw = boss.window_id_map.get(wid)
                 if qw is not None:
-                    qw.screen.render_unfocused_cursor = 0
+                    qw.screen.render_unfocused_cursor = False
 
 
 class FocusChangedSession(SessionAction):
@@ -65,14 +65,14 @@ class FocusChangedSession(SessionAction):
         s = sessions_map.get(self.sid)
         if s is not None:
             boss = get_boss()
-            val = int(focused)
             for wid in s.window_ids:
                 qw = boss.window_id_map.get(wid)
                 if qw is not None:
-                    qw.screen.render_unfocused_cursor = val
+                    qw.screen.render_unfocused_cursor = focused
 
 
 class SendText(RemoteCommand):
+    disallow_responses = True
     protocol_spec = __doc__ = '''
     data+/str: The data being sent. Can be either: text: followed by text or base64: followed by standard base64 encoded bytes
     match/str: A string indicating the window to send text to
@@ -90,8 +90,12 @@ class SendText(RemoteCommand):
         " and :code:`'\\\\u21fa'` to send Unicode characters. Remember to use single-quotes otherwise"
         ' the backslash is interpreted as a shell escape character. If you use the :option:`kitten @ send-text --match` option'
         ' the text will be sent to all matched windows. By default, text is sent to'
-        ' only the currently active window.'
+        ' only the currently active window. Note that errors are not reported, for technical reasons,'
+        ' so send-text always succeeds, even if no text was sent to any window.'
     )
+    # since send-text can send data over the tty to the window in which it was
+    # run --no-reponse is always in effect for it, hence errors are not
+    # reported.
     options_spec = MATCH_WINDOW_OPTION + '\n\n' + MATCH_TAB_OPTION.replace('--match -m', '--match-tab -t') + '''\n
 --all
 type=bool-set
@@ -217,7 +221,7 @@ on bracketed paste mode.
         if session == 'end':
             s = create_or_update_session()
             for w in actual_windows:
-                w.screen.render_unfocused_cursor = 0
+                w.screen.render_unfocused_cursor = False
                 s.window_ids.discard(w.id)
             ClearSession(sid)()
         elif session == 'start':
@@ -232,7 +236,7 @@ on bracketed paste mode.
                 window.actions_on_removal.append(ClearSession(sid))
                 window.actions_on_focus_change.append(FocusChangedSession(sid))
             for w in actual_windows:
-                w.screen.render_unfocused_cursor = 1
+                w.screen.render_unfocused_cursor = True
                 s.window_ids.add(w.id)
         else:
             bp = payload_get('bracketed_paste')
@@ -240,7 +244,7 @@ on bracketed paste mode.
                 s = create_or_update_session()
             for w in actual_windows:
                 if sid:
-                    w.screen.render_unfocused_cursor = 1
+                    w.screen.render_unfocused_cursor = True
                     s.window_ids.add(w.id)
                 if isinstance(data, WindowSystemKeyEvent):
                     kdata = w.encoded_key(data)

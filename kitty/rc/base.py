@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, FrozenSet, Iterable, Iter
 
 from kitty.cli import CompletionSpec, get_defaults_from_seq, parse_args, parse_option_spec
 from kitty.cli_stub import RCOptions as R
-from kitty.constants import appname, list_kitty_resources, running_in_kitty
+from kitty.constants import list_kitty_resources, running_in_kitty
 from kitty.types import AsyncResponse
 
 if TYPE_CHECKING:
@@ -29,6 +29,11 @@ class NoResponse:
 
 class RemoteControlError(Exception):
     pass
+
+
+class RemoteControlErrorWithoutTraceback(Exception):
+
+    hide_traceback = True
 
 
 class MatchError(ValueError):
@@ -77,6 +82,7 @@ PayloadGetType = PayloadGetter
 ArgsType = List[str]
 ImageCompletion = CompletionSpec.from_string('type:file group:"Images"')
 ImageCompletion.extensions = 'png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'tiff'
+SUPPORTED_IMAGE_FORMATS = tuple(x.upper() for x in ImageCompletion.extensions if x != 'jpg')
 
 
 MATCH_WINDOW_OPTION = '''\
@@ -219,7 +225,10 @@ class ArgsHandling:
                 yield f'args = append(args, "{x}")'
             yield '}'
         if self.minimum_count > -1:
-            yield f'if len(args) < {self.minimum_count} {{ return fmt.Errorf("%s", "Must specify at least {self.minimum_count} arguments to {cmd_name}") }}'
+            if self.minimum_count == 1:
+                yield f'if len(args) < {self.minimum_count} {{ return fmt.Errorf("%s", "Must specify at least one argument to {cmd_name}") }}'
+            else:
+                yield f'if len(args) < {self.minimum_count} {{ return fmt.Errorf("%s", "Must specify at least {self.minimum_count} arguments to {cmd_name}") }}'
         if self.args_choices:
             achoices = tuple(self.args_choices())
             yield 'achoices := map[string]bool{' + ' '.join(f'"{x}":true,' for x in achoices) + '}'
@@ -243,7 +252,10 @@ class ArgsHandling:
                 elif self.special_parse.startswith('+'):
                     fields, sp = self.special_parse[1:].split(':', 1)
                     handled_fields.update(set(fields.split(',')))
-                    yield f'err = {sp}'
+                    if sp.startswith('!'):
+                        yield f'io_data.multiple_payload_generator, err = {sp[1:]}'
+                    else:
+                        yield f'err = {sp}'
                 else:
                     yield f'{dest}, err = {self.special_parse}'
                 yield 'if err != nil { return err }'
@@ -323,6 +335,7 @@ class RemoteCommand:
     argspec = args_count = args_completion = ArgsHandling()
     field_to_option_map: Optional[Dict[str, str]] = None
     reads_streaming_data: bool = False
+    disallow_responses: bool = False
 
     def __init__(self) -> None:
         self.desc = self.desc or self.short_desc
@@ -417,7 +430,7 @@ class RemoteCommand:
 
 
 def cli_params_for(command: RemoteCommand) -> Tuple[Callable[[], str], str, str, str]:
-    return (command.options_spec or '\n').format, command.args.spec, command.desc, f'{appname} @ {command.name}'
+    return (command.options_spec or '\n').format, command.args.spec, command.desc, f'kitten @ {command.name}'
 
 
 def parse_subcommand_cli(command: RemoteCommand, args: ArgsType) -> Tuple[Any, ArgsType]:

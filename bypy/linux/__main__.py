@@ -10,16 +10,12 @@ import subprocess
 import tarfile
 import time
 
-from bypy.constants import OUTPUT_DIR, PREFIX, is64bit, python_major_minor_version
+from bypy.constants import OUTPUT_DIR, PREFIX, python_major_minor_version
 from bypy.freeze import extract_extension_modules, freeze_python, path_to_freeze_dir
 from bypy.utils import get_dll_path, mkdtemp, py_compile, walk
 
 j = os.path.join
 machine = (os.uname()[4] or '').lower()
-if machine.startswith('arm64') or machine.startswith('aarch64'):
-    arch = 'arm64'
-else:
-    arch = 'x86_64' if is64bit else 'i686'
 self_dir = os.path.dirname(os.path.abspath(__file__))
 py_ver = '.'.join(map(str, python_major_minor_version()))
 iv = globals()['init_env']
@@ -28,8 +24,8 @@ kitty_constants = iv['kitty_constants']
 
 def binary_includes():
     return tuple(map(get_dll_path, (
-            'expat', 'sqlite3', 'ffi', 'z', 'lzma', 'png16', 'lcms2', 'crypt',
-            'iconv', 'pcre', 'graphite2', 'glib-2.0', 'freetype', 'xxhash',
+            'expat', 'sqlite3', 'ffi', 'z', 'lzma', 'png16', 'lcms2', 'ssl', 'crypto', 'crypt',
+            'iconv', 'pcre2-8', 'graphite2', 'glib-2.0', 'freetype', 'xxhash',
             'harfbuzz', 'xkbcommon', 'xkbcommon-x11',
             # fontconfig is not bundled because in typical brain dead Linux
             # distro fashion, different distros use different default config
@@ -37,7 +33,7 @@ def binary_includes():
             'ncursesw', 'readline', 'brotlicommon', 'brotlienc', 'brotlidec',
             'wayland-client', 'wayland-cursor',
         ))) + (
-                get_dll_path('bz2', 2), get_dll_path('ssl', 2), get_dll_path('crypto', 2),
+                get_dll_path('bz2', 2),
                 get_dll_path(f'python{py_ver}', 2),
         )
 
@@ -198,12 +194,13 @@ def strip_binaries(files):
 def create_tarfile(env, compression_level='9'):
     print('Creating archive...')
     base = OUTPUT_DIR
+    arch = 'arm64' if 'arm64' in os.environ['BYPY_ARCH'] else ('i686' if 'i386' in os.environ['BYPY_ARCH'] else 'x86_64')
     try:
         shutil.rmtree(base)
     except OSError as err:
-        if err.errno != errno.ENOENT:
+        if err.errno not in (errno.ENOENT, errno.EBUSY):  # EBUSY when the directory is mountpoint
             raise
-    os.mkdir(base)
+    os.makedirs(base, exist_ok=True)
     dist = os.path.join(base, f'{kitty_constants["appname"]}-{kitty_constants["version"]}-{arch}.tar')
     with tarfile.open(dist, mode='w', format=tarfile.PAX_FORMAT) as tf:
         cwd = os.getcwd()
@@ -216,7 +213,8 @@ def create_tarfile(env, compression_level='9'):
     print('Compressing archive...')
     ans = f'{dist.rpartition(".")[0]}.txz'
     start_time = time.time()
-    subprocess.check_call(['xz', '--verbose', '--threads=0', '-f', f'-{compression_level}', dist])
+    threads = 4 if arch == 'i686' else 0
+    subprocess.check_call(['xz', '--verbose', f'--threads={threads}', '-f', f'-{compression_level}', dist])
     secs = time.time() - start_time
     print('Compressed in {} minutes {} seconds'.format(secs // 60, secs % 60))
     os.rename(f'{dist}.xz', ans)

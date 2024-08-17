@@ -5,8 +5,9 @@ import errno
 import os
 import pwd
 import sys
+from collections.abc import Iterator
 from contextlib import suppress
-from typing import TYPE_CHECKING, Any, FrozenSet, Iterator, NamedTuple, Optional, Set
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 
 from .types import run_once
 
@@ -22,7 +23,7 @@ class Version(NamedTuple):
 
 appname: str = 'kitty'
 kitty_face = '🐱'
-version: Version = Version(0, 32, 1)
+version: Version = Version(0, 36, 0)
 str_version: str = '.'.join(map(str, version))
 _plat = sys.platform.lower()
 is_macos: bool = 'darwin' in _plat
@@ -67,7 +68,7 @@ def kitty_exe() -> str:
     rpath = getattr(sys, 'kitty_run_data').get('bundle_exe_dir')
     if not rpath:
         items = os.environ.get('PATH', '').split(os.pathsep) + [os.path.join(kitty_base_dir, 'kitty', 'launcher')]
-        seen: Set[str] = set()
+        seen: set[str] = set()
         for candidate in filter(None, items):
             if candidate not in seen:
                 seen.add(candidate)
@@ -116,7 +117,7 @@ def _get_config_dir() -> str:
     candidate = os.path.abspath(os.path.expanduser(os.environ.get('XDG_CONFIG_HOME') or '~/.config'))
     ans = os.path.join(candidate, appname)
     try:
-        os.makedirs(ans, exist_ok=True)
+        os.makedirs(os.path.realpath(ans), exist_ok=True)
     except FileExistsError:
         raise SystemExit(f'A file {ans} already exists. It must be a directory, not a file.')
     except PermissionError:
@@ -177,8 +178,9 @@ terminfo_dir = os.path.join(kitty_base_dir, 'terminfo')
 logo_png_file = os.path.join(kitty_base_dir, 'logo', 'kitty.png')
 beam_cursor_data_file = os.path.join(kitty_base_dir, 'logo', 'beam-cursor.png')
 shell_integration_dir = os.path.join(kitty_base_dir, 'shell-integration')
+fonts_dir = os.path.join(kitty_base_dir, 'fonts')
 try:
-    shell_path = pwd.getpwuid(os.geteuid()).pw_shell or '/bin/sh'
+    shell_path = os.environ.get('SHELL') or pwd.getpwuid(os.geteuid()).pw_shell or '/bin/sh'
 except KeyError:
     with suppress(Exception):
         print('Failed to read login shell via getpwuid() for current user, falling back to /bin/sh', file=sys.stderr)
@@ -187,6 +189,31 @@ except KeyError:
 # https://github.com/ansible/ansible/issues/11536#issuecomment-153030743
 ssh_control_master_template = 'kssh-{kitty_pid}-{ssh_placeholder}'
 
+# See https://specifications.freedesktop.org/icon-naming-spec/latest/ar01s04.html
+# Update the spec in docs/desktop-notifications.rst if you change this.
+standard_icon_names = {
+    'error': ('dialog-error', '☠'),
+    'warning': ('dialog-warning','⚠'),
+    'warn': ('dialog-warning', '⚠'),
+    'info': ('dialog-information', 'ℹ'),
+    'question': ('dialog-question', '❔'),
+
+    'help': ('system-help', '📖'),
+    'file-manager': ('system-file-manager', '🗄'),
+    'system-monitor': ('utilities-system-monitor', '🎛'),
+    'text-editor': ('utilities-text-editor', '📄'),
+}
+
+# See https://github.com/TUNER88/iOSSystemSoundsLibrary for Apple's system
+# sound ids not all of which are available on macOS.
+standard_sound_names = {
+    'error': ('dialog-error', 1),
+    'info': ('dialog-information', 2),
+    'warning': ('dialog-warning', 3),
+    'warn': ('dialog-warning', 3),
+    'question': ('dialog-question', 4),
+}
+
 
 def glfw_path(module: str) -> str:
     prefix = 'kitty.' if getattr(sys, 'frozen', False) else ''
@@ -194,7 +221,7 @@ def glfw_path(module: str) -> str:
 
 
 def detect_if_wayland_ok() -> bool:
-    if 'WAYLAND_DISPLAY' not in os.environ:
+    if 'WAYLAND_DISPLAY' not in os.environ and 'WAYLAND_SOCKET' not in os.environ:
         return False
     if 'KITTY_DISABLE_WAYLAND' in os.environ:
         return False
@@ -260,7 +287,7 @@ def website_url(doc_name: str = '', website: str = website_base_url) -> str:
     return website + doc_name.lstrip('/')
 
 
-handled_signals: Set[int] = set()
+handled_signals: set[int] = set()
 
 
 def clear_handled_signals(*a: Any) -> None:
@@ -300,6 +327,6 @@ def local_docs() -> str:
 
 
 @run_once
-def wrapped_kitten_names() -> FrozenSet[str]:
+def wrapped_kitten_names() -> frozenset[str]:
     import kitty.fast_data_types as f
     return frozenset(f.wrapped_kitten_names())

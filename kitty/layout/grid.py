@@ -45,7 +45,7 @@ class Grid(Layout):
         bias: Optional[Sequence[float]] = None,
     ) -> LayoutDimension:
         decoration_pairs = tuple(repeat((0, 0), num))
-        return layout_dimension(lgd.central.left, lgd.central.width, lgd.cell_width, decoration_pairs, bias=bias, left_align=lgd.align_top_left)
+        return layout_dimension(lgd.central.left, lgd.central.width, lgd.cell_width, decoration_pairs, bias=bias, alignment=lgd.alignment_x)
 
     def row_layout(
         self,
@@ -53,31 +53,48 @@ class Grid(Layout):
         bias: Optional[Sequence[float]] = None,
     ) -> LayoutDimension:
         decoration_pairs = tuple(repeat((0, 0), num))
-        return layout_dimension(lgd.central.top, lgd.central.height, lgd.cell_height, decoration_pairs, bias=bias, left_align=lgd.align_top_left)
+        return layout_dimension(lgd.central.top, lgd.central.height, lgd.cell_height, decoration_pairs, bias=bias, alignment=lgd.alignment_y)
 
     def variable_layout(self, layout_func: Callable[..., LayoutDimension], num_windows: int, biased_map: Dict[int, float]) -> LayoutDimension:
         return layout_func(num_windows, bias=biased_map if num_windows > 1 else None)
 
+    def position_for_window_idx(self, idx: int, num_windows: int, ncols:int , nrows: int, special_rows: int, special_col: int) -> Tuple[int, int]:
+        row_num = col_num = 0
+
+        def on_col_done(col_windows: List[int]) -> None:
+            nonlocal col_num, row_num
+            row_num = 0
+            col_num += 1
+
+        for window_idx, xl, yl in self.layout_windows(
+                num_windows, nrows, ncols, special_rows, special_col, on_col_done):
+            if idx == window_idx:
+                return row_num, col_num
+            row_num += 1
+        return 0, 0
+
+    def bias_slot(self, all_windows: WindowList, idx: int, fractional_bias: float, cell_increment_bias_h: float, cell_increment_bias_v: float) -> bool:
+        num_windows = all_windows.num_groups
+        ncols, nrows, special_rows, special_col = calc_grid_size(num_windows)
+        row_num, col_num = self.position_for_window_idx(idx, num_windows, ncols, nrows, special_rows, special_col)
+        if row_num == 0:
+            b = self.biased_cols
+            layout_func = self.column_layout
+            bias_idx = col_num
+            increment = cell_increment_bias_h
+        else:
+            b = self.biased_rows
+            layout_func = self.row_layout
+            bias_idx = row_num
+            increment = cell_increment_bias_v
+        before_layout = tuple(self.variable_layout(layout_func, num_windows, b))
+        b[bias_idx] = increment
+        return tuple(self.variable_layout(layout_func, num_windows, b)) == before_layout
+
     def apply_bias(self, idx: int, increment: float, all_windows: WindowList, is_horizontal: bool = True) -> bool:
         num_windows = all_windows.num_groups
         ncols, nrows, special_rows, special_col = calc_grid_size(num_windows)
-
-        def position_for_window_idx(idx: int) -> Tuple[int, int]:
-            row_num = col_num = 0
-
-            def on_col_done(col_windows: List[int]) -> None:
-                nonlocal col_num, row_num
-                row_num = 0
-                col_num += 1
-
-            for window_idx, xl, yl in self.layout_windows(
-                    num_windows, nrows, ncols, special_rows, special_col, on_col_done):
-                if idx == window_idx:
-                    return row_num, col_num
-                row_num += 1
-            return 0, 0
-
-        row_num, col_num = position_for_window_idx(idx)
+        row_num, col_num = self.position_for_window_idx(idx, num_windows, ncols, nrows, special_rows, special_col)
 
         if is_horizontal:
             b = self.biased_cols
@@ -99,11 +116,11 @@ class Grid(Layout):
             def layout_func(windows: ListOfWindows, bias: Optional[Sequence[float]] = None) -> LayoutDimension:
                 return self.row_layout(num_windows, bias=bias)
 
-        before_layout = list(self.variable_layout(layout_func, num_windows, b))
+        before_layout = tuple(self.variable_layout(layout_func, num_windows, b))
         candidate = b.copy()
         before = candidate.get(bias_idx, 0)
         candidate[bias_idx] = before + increment
-        if before_layout == list(self.variable_layout(layout_func, num_windows, candidate)):
+        if before_layout == tuple(self.variable_layout(layout_func, num_windows, candidate)):
             return False
         setattr(self, attr, candidate)
         return True
@@ -157,8 +174,10 @@ class Grid(Layout):
             number_of_cells = content_size // cell_length
             cell_area = number_of_cells * cell_length
             extra = content_size - cell_area
-            if extra > 0 and not lgd.align_top_left:
+            if lgd.alignment_x == 0:  # center
                 before_dec += extra // 2
+            elif lgd.alignment_x > 0:  # end
+                before_dec += extra
             return LayoutData(start + before_dec, number_of_cells, before_dec, size - cell_area - before_dec, cell_area)
 
         def position_window_in_grid_cell(window_idx: int, xl: LayoutData, yl: LayoutData) -> None:

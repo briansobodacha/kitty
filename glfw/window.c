@@ -34,7 +34,6 @@
 #include <assert.h>
 #include <string.h>
 #include <stdlib.h>
-#include <float.h>
 
 
 //////////////////////////////////////////////////////////////////////////
@@ -57,7 +56,7 @@ void _glfwInputWindowFocus(_GLFWwindow* window, bool focused)
             if (window->activated_keys[i].key > 0 && window->activated_keys[i].action == GLFW_PRESS)
             {
                 const int native_key = _glfwPlatformGetNativeKeyForKey(window->activated_keys[i].key);
-                GLFWkeyevent ev = {.key = window->activated_keys[i].key, .native_key = native_key, .action = GLFW_RELEASE};
+                GLFWkeyevent ev = {.key = window->activated_keys[i].key, .native_key = native_key, .action = GLFW_RELEASE, .fake_event_on_focus_change = true};
                 _glfwInputKeyboard(window, &ev);
             }
         }
@@ -315,6 +314,7 @@ void glfwDefaultWindowHints(void)
     _glfw.hints.window.autoIconify  = true;
     _glfw.hints.window.centerCursor = true;
     _glfw.hints.window.focusOnShow  = true;
+    _glfw.hints.window.blur_radius  = 0;
 
     // The default is 24 bits of color, 24 bits of depth and 8 bits of stencil,
     // double buffered
@@ -334,9 +334,6 @@ void glfwDefaultWindowHints(void)
     _glfw.hints.window.ns.retina = true;
     // use the default colorspace assigned by the system
     _glfw.hints.window.ns.color_space = 0;
-    // no blur
-    _glfw.hints.window.ns.blur_radius = 0;
-    _glfw.hints.window.x11.enable_blur = 0;
 }
 
 GLFWAPI void glfwWindowHint(int hint, int value)
@@ -420,11 +417,8 @@ GLFWAPI void glfwWindowHint(int hint, int value)
         case GLFW_COCOA_COLOR_SPACE:
             _glfw.hints.window.ns.color_space = value;
             return;
-        case GLFW_COCOA_BLUR_RADIUS:
-            _glfw.hints.window.ns.blur_radius = value;
-            return;
-        case GLFW_X11_BLUR:
-            _glfw.hints.window.x11.enable_blur = value;
+        case GLFW_BLUR_RADIUS:
+            _glfw.hints.window.blur_radius = value;
             return;
         case GLFW_COCOA_GRAPHICS_SWITCHING:
             _glfw.hints.context.nsgl.offline = value ? true : false;
@@ -474,8 +468,10 @@ GLFWAPI void glfwWindowHint(int hint, int value)
         case GLFW_REFRESH_RATE:
             _glfw.hints.refreshRate = value;
             return;
+        case GLFW_WAYLAND_BGCOLOR:
+            _glfw.hints.window.wl.bgcolor = value;
+            return;
     }
-
     _glfwInputError(GLFW_INVALID_ENUM, "Invalid window hint 0x%08X", hint);
 }
 
@@ -1017,6 +1013,16 @@ GLFWAPI void glfwSetWindowAttrib(GLFWwindow* handle, int attrib, int value)
     else
         _glfwInputError(GLFW_INVALID_ENUM, "Invalid window attribute 0x%08X", attrib);
 }
+
+GLFWAPI int glfwSetWindowBlur(GLFWwindow* handle, int value)
+{
+    _GLFWwindow* window = (_GLFWwindow*) handle;
+    assert(window != NULL);
+
+    _GLFW_REQUIRE_INIT_OR_RETURN(0);
+    return _glfwPlatformSetWindowBlur(window, value);
+}
+
 
 GLFWAPI GLFWmonitor* glfwGetWindowMonitor(GLFWwindow* handle)
 {

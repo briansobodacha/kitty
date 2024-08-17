@@ -2,18 +2,22 @@
 # License: GPL v3 Copyright: 2016, Kovid Goyal <kovid at kovidgoyal.net>
 
 import ctypes
+import os
 import sys
+from collections.abc import Generator
 from functools import partial
 from math import ceil, cos, floor, pi
-from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, List, Optional, Tuple, Union, cast
+from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Union, cast
 
-from kitty.constants import is_macos
+from kitty.constants import fonts_dir, is_macos
 from kitty.fast_data_types import (
     NUM_UNDERLINE_STYLES,
     Screen,
     create_test_font_group,
+    current_fonts,
     get_fallback_font,
     get_options,
+    set_builtin_nerd_font,
     set_font_data,
     set_options,
     set_send_sprite_to_gpu,
@@ -23,38 +27,33 @@ from kitty.fast_data_types import (
 )
 from kitty.fonts.box_drawing import BufType, distribute_dots, render_box_char, render_missing_glyph
 from kitty.options.types import Options, defaults
+from kitty.options.utils import parse_font_spec
 from kitty.types import _T
 from kitty.typing import CoreTextFont, FontConfigPattern
 from kitty.utils import log_error
 
+from . import family_name_to_key
+from .common import get_font_files
+
 if is_macos:
-    from .core_text import find_font_features
     from .core_text import font_for_family as font_for_family_macos
-    from .core_text import get_font_files as get_font_files_coretext
 else:
-    from .fontconfig import find_font_features
     from .fontconfig import font_for_family as font_for_family_fontconfig
-    from .fontconfig import get_font_files as get_font_files_fontconfig
 
 FontObject = Union[CoreTextFont, FontConfigPattern]
-current_faces: List[Tuple[FontObject, bool, bool]] = []
+current_faces: list[tuple[FontObject, bool, bool]] = []
+builtin_nerd_font_descriptor: Optional[FontObject] = None
 
 
-def get_font_files(opts: Options) -> Dict[str, Any]:
-    if is_macos:
-        return get_font_files_coretext(opts)
-    return get_font_files_fontconfig(opts)
-
-
-def font_for_family(family: str) -> Tuple[FontObject, bool, bool]:
+def font_for_family(family: str) -> tuple[FontObject, bool, bool]:
     if is_macos:
         return font_for_family_macos(family)
     return font_for_family_fontconfig(family)
 
 
 def merge_ranges(
-    a: Tuple[Tuple[int, int], _T], b: Tuple[Tuple[int, int], _T], priority_map: Dict[Tuple[int, int], int]
-) -> Generator[Tuple[Tuple[int, int], _T], None, None]:
+    a: tuple[tuple[int, int], _T], b: tuple[tuple[int, int], _T], priority_map: dict[tuple[int, int], int]
+) -> Generator[tuple[tuple[int, int], _T], None, None]:
     a_start, a_end = a[0]
     b_start, b_end = b[0]
     a_val, b_val = a[1], b[1]
@@ -96,8 +95,8 @@ def merge_ranges(
             after_range = ((b_end + 1, a_end), a_val)
             after_range_prio = a_prio
     # check if the before, mid and after ranges can be coalesced
-    ranges: List[Tuple[Tuple[int, int], _T]] = []
-    priorities: List[int] = []
+    ranges: list[tuple[tuple[int, int], _T]] = []
+    priorities: list[int] = []
     for rq, prio in ((before_range, before_range_prio), (mid_range, mid_range_prio), (after_range, after_range_prio)):
         if rq is None:
             continue
@@ -118,7 +117,7 @@ def merge_ranges(
     yield from ranges
 
 
-def coalesce_symbol_maps(maps: Dict[Tuple[int, int], _T]) -> Dict[Tuple[int, int], _T]:
+def coalesce_symbol_maps(maps: dict[tuple[int, int], _T]) -> dict[tuple[int, int], _T]:
     if not maps:
         return maps
     priority_map = {r: i for i, r in enumerate(maps.keys())}
@@ -142,13 +141,17 @@ def coalesce_symbol_maps(maps: Dict[Tuple[int, int], _T]) -> Dict[Tuple[int, int
     return dict(ans)
 
 
-def create_symbol_map(opts: Options) -> Tuple[Tuple[int, int, int], ...]:
+def create_symbol_map(opts: Options) -> tuple[tuple[int, int, int], ...]:
     val = coalesce_symbol_maps(opts.symbol_map)
-    family_map: Dict[str, int] = {}
+    family_map: dict[str, int] = {}
     count = 0
     for family in val.values():
         if family not in family_map:
             font, bold, italic = font_for_family(family)
+            fkey = family_name_to_key(family)
+            if fkey in ('symbolsnfm', 'symbols nerd font mono') and font['postscript_name'] != 'SymbolsNFM' and builtin_nerd_font_descriptor:
+                font = builtin_nerd_font_descriptor
+                bold = italic = False
             family_map[family] = count
             count += 1
             current_faces.append((font, bold, italic))
@@ -156,60 +159,52 @@ def create_symbol_map(opts: Options) -> Tuple[Tuple[int, int, int], ...]:
     return sm
 
 
-def create_narrow_symbols(opts: Options) -> Tuple[Tuple[int, int, int], ...]:
+def create_narrow_symbols(opts: Options) -> tuple[tuple[int, int, int], ...]:
     return tuple((a, b, v) for (a, b), v in coalesce_symbol_maps(opts.narrow_symbols).items())
 
 
-def descriptor_for_idx(idx: int) -> Tuple[FontObject, bool, bool]:
+def descriptor_for_idx(idx: int) -> tuple[FontObject, bool, bool]:
     return current_faces[idx]
 
 
-def dump_faces(ftypes: List[str], indices: Dict[str, int]) -> None:
-    def face_str(f: Tuple[FontObject, bool, bool]) -> str:
-        fo = f[0]
-        if 'index' in fo:
-            return '{}:{}'.format(fo['path'], cast('FontConfigPattern', fo)['index'])
-        fo = cast('CoreTextFont', fo)
-        return fo['path']
-
-    log_error('Preloaded font faces:')
-    log_error('normal face:', face_str(current_faces[0]))
-    for ftype in ftypes:
-        if indices[ftype]:
-            log_error(ftype, 'face:', face_str(current_faces[indices[ftype]]))
-    si_faces = current_faces[max(indices.values())+1:]
-    if si_faces:
-        log_error('Symbol map faces:')
-        for face in si_faces:
-            log_error(face_str(face))
+def dump_font_debug() -> None:
+    cf = current_fonts()
+    log_error('Text fonts:')
+    for key, text in {'medium': 'Normal', 'bold': 'Bold', 'italic': 'Italic', 'bi': 'Bold-Italic'}.items():
+        log_error(f'  {text}:', cf[key].identify_for_debug())  # type: ignore
+    ss = cf['symbol']
+    if ss:
+        log_error('Symbol map fonts:')
+        for s in ss:
+            log_error('  ' + s.identify_for_debug())
 
 
-def set_font_family(opts: Optional[Options] = None, override_font_size: Optional[float] = None, debug_font_matching: bool = False) -> None:
-    global current_faces
+def set_font_family(opts: Optional[Options] = None, override_font_size: Optional[float] = None, add_builtin_nerd_font: bool = False) -> None:
+    global current_faces, builtin_nerd_font_descriptor
     opts = opts or defaults
     sz = override_font_size or opts.font_size
     font_map = get_font_files(opts)
     current_faces = [(font_map['medium'], False, False)]
-    ftypes = 'bold italic bi'.split()
+    ftypes: list[Literal['bold', 'italic', 'bi']] = ['bold', 'italic', 'bi']
     indices = {k: 0 for k in ftypes}
     for k in ftypes:
         if k in font_map:
             indices[k] = len(current_faces)
             current_faces.append((font_map[k], 'b' in k, 'i' in k))
     before = len(current_faces)
+    if add_builtin_nerd_font:
+        builtin_nerd_font_path = os.path.join(fonts_dir, 'SymbolsNerdFontMono-Regular.ttf')
+        if os.path.exists(builtin_nerd_font_path):
+            builtin_nerd_font_descriptor = set_builtin_nerd_font(builtin_nerd_font_path)
+        else:
+            log_error(f'No builtin NERD font found in {fonts_dir}')
     sm = create_symbol_map(opts)
     ns = create_narrow_symbols(opts)
     num_symbol_fonts = len(current_faces) - before
-    font_features = {}
-    for face, _, _ in current_faces:
-        font_features[face['postscript_name']] = find_font_features(face['postscript_name'])
-    font_features.update(opts.font_features)
-    if debug_font_matching:
-        dump_faces(ftypes, indices)
     set_font_data(
         render_box_drawing, prerender_function, descriptor_for_idx,
         indices['bold'], indices['italic'], indices['bi'], num_symbol_fonts,
-        sm, sz, font_features, ns
+        sm, sz, ns
     )
 
 
@@ -393,7 +388,7 @@ def prerender_function(
     cursor_underline_thickness: float,
     dpi_x: float,
     dpi_y: float
-) -> Tuple[Tuple[int, ...], Tuple[CBufType, ...]]:
+) -> tuple[tuple[int, ...], tuple[CBufType, ...]]:
     # Pre-render the special underline, strikethrough and missing and cursor cells
     f = partial(
         render_special, cell_width=cell_width, cell_height=cell_height, baseline=baseline,
@@ -416,7 +411,7 @@ def prerender_function(
     return tuple(map(ctypes.addressof, tcells)), tcells
 
 
-def render_box_drawing(codepoint: int, cell_width: int, cell_height: int, dpi: float) -> Tuple[int, CBufType]:
+def render_box_drawing(codepoint: int, cell_width: int, cell_height: int, dpi: float) -> tuple[int, CBufType]:
     CharTexture = ctypes.c_ubyte * (cell_width * cell_height)
     buf = CharTexture()
     render_box_char(
@@ -430,8 +425,8 @@ class setup_for_testing:
     def __init__(self, family: str = 'monospace', size: float = 11.0, dpi: float = 96.0):
         self.family, self.size, self.dpi = family, size, dpi
 
-    def __enter__(self) -> Tuple[Dict[Tuple[int, int, int], bytes], int, int]:
-        opts = defaults._replace(font_family=self.family, font_size=self.size)
+    def __enter__(self) -> tuple[dict[tuple[int, int, int], bytes], int, int]:
+        opts = defaults._replace(font_family=parse_font_spec(self.family), font_size=self.size)
         set_options(opts)
         sprites = {}
 
@@ -452,7 +447,7 @@ class setup_for_testing:
         set_send_sprite_to_gpu(None)
 
 
-def render_string(text: str, family: str = 'monospace', size: float = 11.0, dpi: float = 96.0) -> Tuple[int, int, List[bytes]]:
+def render_string(text: str, family: str = 'monospace', size: float = 11.0, dpi: float = 96.0) -> tuple[int, int, list[bytes]]:
     with setup_for_testing(family, size, dpi) as (sprites, cell_width, cell_height):
         s = Screen(None, 1, len(text)*2)
         line = s.line(0)
@@ -473,7 +468,7 @@ def render_string(text: str, family: str = 'monospace', size: float = 11.0, dpi:
 
 def shape_string(
     text: str = "abcd", family: str = 'monospace', size: float = 11.0, dpi: float = 96.0, path: Optional[str] = None
-) -> List[Tuple[int, int, int, Tuple[int, ...]]]:
+) -> list[tuple[int, int, int, tuple[int, ...]]]:
     with setup_for_testing(family, size, dpi) as (sprites, cell_width, cell_height):
         s = Screen(None, 1, len(text)*2)
         line = s.line(0)
@@ -481,29 +476,30 @@ def shape_string(
         return test_shape(line, path)
 
 
-def show(outfile: str, width: int, height: int, fmt: int) -> None:
-    import os
+def show(rgba_data: bytes, width: int, height: int, fmt: int = 32) -> None:
     from base64 import standard_b64encode
 
     from kittens.tui.images import GraphicsCommand
+
+    data = memoryview(standard_b64encode(rgba_data))
     cmd = GraphicsCommand()
     cmd.a = 'T'
     cmd.f = fmt
     cmd.s = width
     cmd.v = height
-    cmd.t = 't'
+
+    while data:
+        chunk, data = data[:4096], data[4096:]
+        cmd.m = 1 if data else 0
+        sys.stdout.buffer.write(cmd.serialize(chunk))
+        cmd.clear()
     sys.stdout.flush()
-    sys.stdout.buffer.write(cmd.serialize(standard_b64encode(os.path.abspath(outfile).encode())))
     sys.stdout.buffer.flush()
 
 
 def display_bitmap(rgb_data: bytes, width: int, height: int) -> None:
-    from tempfile import NamedTemporaryFile
-    setattr(display_bitmap, 'detected', True)
-    with NamedTemporaryFile(suffix='.rgba', delete=False) as f:
-        f.write(rgb_data)
     assert len(rgb_data) == 4 * width * height
-    show(f.name, width, height, 32)
+    show(rgb_data, width, height)
 
 
 def test_render_string(
@@ -517,8 +513,8 @@ def test_render_string(
     cell_width, cell_height, cells = render_string(text, family, size, dpi)
     rgb_data = concat_cells(cell_width, cell_height, True, tuple(cells))
     cf = current_fonts()
-    fonts = [cf['medium'].display_name()]
-    fonts.extend(f.display_name() for f in cf['fallback'])
+    fonts = [cf['medium'].postscript_name()]
+    fonts.extend(f.postscript_name() for f in cf['fallback'])
     msg = 'Rendered string {} below, with fonts: {}\n'.format(text, ', '.join(fonts))
     try:
         print(msg)
@@ -539,7 +535,7 @@ def test_fallback_font(qtext: Optional[str] = None, bold: bool = False, italic: 
             try:
                 print(text, f)
             except UnicodeEncodeError:
-                sys.stdout.buffer.write(f'{text} {f}\n'.encode('utf-8'))
+                sys.stdout.buffer.write(f'{text} {f}\n'.encode())
 
 
 def showcase() -> None:

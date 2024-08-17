@@ -10,11 +10,13 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"net/http"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,11 +28,6 @@ import (
 	"kitty/tools/tui/subseq"
 	"kitty/tools/utils"
 	"kitty/tools/utils/style"
-
-	"github.com/shirou/gopsutil/v3/process"
-	"golang.org/x/exp/maps"
-	"golang.org/x/exp/slices"
-	"golang.org/x/sys/unix"
 )
 
 var _ = fmt.Print
@@ -312,6 +309,7 @@ var AllColorSettingNames = map[string]bool{ // {{{
 	"mark2_foreground":        true,
 	"mark3_background":        true,
 	"mark3_foreground":        true,
+	"second_transparent_bg":   true,
 	"selection_background":    true,
 	"selection_foreground":    true,
 	"tab_bar_background":      true,
@@ -346,7 +344,7 @@ func set_comment_in_zip_file(path string, comment string) error {
 		}
 	}
 	dest.Close()
-	return utils.AtomicUpdateFile(path, buf.Bytes(), 0o644)
+	return utils.AtomicUpdateFile(path, bytes.NewReader(buf.Bytes()), 0o644)
 }
 
 func fetch_cached(name, url, cache_path string, max_cache_age time.Duration) (string, error) {
@@ -580,83 +578,13 @@ func (self *Theme) Code() (string, error) {
 	return self.load_code()
 }
 
-func patch_conf(text, theme_name string) string {
-	addition := fmt.Sprintf("# BEGIN_KITTY_THEME\n# %s\ninclude current-theme.conf\n# END_KITTY_THEME", theme_name)
-	pat := utils.MustCompile(`(?ms)^# BEGIN_KITTY_THEME.+?# END_KITTY_THEME`)
-	replaced := false
-	ntext := pat.ReplaceAllStringFunc(text, func(string) string {
-		replaced = true
-		return addition
-	})
-	if !replaced {
-		if text != "" {
-			text += "\n\n"
-		}
-		ntext = text + addition
-	}
-	pat = utils.MustCompile(fmt.Sprintf(`(?m)^\s*(%s)\b`, strings.Join(maps.Keys(AllColorSettingNames), "|")))
-	return pat.ReplaceAllString(ntext, `# $1`)
-}
-func is_kitty_gui_cmdline(cmd ...string) bool {
-	if len(cmd) == 0 {
-		return false
-	}
-	if filepath.Base(cmd[0]) != "kitty" {
-		return false
-	}
-	if len(cmd) == 1 {
-		return true
-	}
-	s := cmd[1][:1]
-	switch s {
-	case `@`:
-		return false
-	case `+`:
-		if cmd[1] == `+` {
-			return len(cmd) > 2 && cmd[2] == `open`
-		}
-		return cmd[1] == `+open`
-	}
-	return true
-}
-
-type ReloadDestination string
-
-const (
-	RELOAD_IN_PARENT ReloadDestination = "parent"
-	RELOAD_IN_ALL    ReloadDestination = "all"
-)
-
-func reload_config(reload_in ReloadDestination) bool {
-	switch reload_in {
-	case RELOAD_IN_PARENT:
-		if pid, err := strconv.Atoi(os.Getenv("KITTY_PID")); err == nil {
-			if p, err := process.NewProcess(int32(pid)); err == nil {
-				if c, err := p.CmdlineSlice(); err == nil && is_kitty_gui_cmdline(c...) {
-					return p.SendSignal(unix.SIGUSR1) == nil
-				}
-			}
-		}
-	case RELOAD_IN_ALL:
-		if all, err := process.Processes(); err == nil {
-			for _, p := range all {
-				if c, err := p.CmdlineSlice(); err == nil && is_kitty_gui_cmdline(c...) {
-					_ = p.SendSignal(unix.SIGUSR1)
-				}
-			}
-			return true
-		}
-	}
-	return false
-}
-
 func (self *Theme) SaveInDir(dirpath string) (err error) {
 	path := filepath.Join(dirpath, self.Name()+".conf")
 	code, err := self.Code()
 	if err != nil {
 		return err
 	}
-	return utils.AtomicUpdateFile(path, utils.UnsafeStringToBytes(code), 0o644)
+	return utils.AtomicUpdateFile(path, bytes.NewReader(utils.UnsafeStringToBytes(code)), 0o644)
 }
 
 func (self *Theme) SaveInConf(config_dir, reload_in, config_file_name string) (err error) {
@@ -666,7 +594,7 @@ func (self *Theme) SaveInConf(config_dir, reload_in, config_file_name string) (e
 	if err != nil {
 		return err
 	}
-	err = utils.AtomicUpdateFile(path, utils.UnsafeStringToBytes(code), 0o644)
+	err = utils.AtomicUpdateFile(path, bytes.NewReader(utils.UnsafeStringToBytes(code)), 0o644)
 	if err != nil {
 		return err
 	}
@@ -674,22 +602,18 @@ func (self *Theme) SaveInConf(config_dir, reload_in, config_file_name string) (e
 	if !filepath.IsAbs(config_file_name) {
 		confpath = filepath.Join(config_dir, config_file_name)
 	}
-	if q, err := filepath.EvalSymlinks(confpath); err == nil {
-		confpath = q
+	patcher := config.Patcher{Write_backup: true}
+	if _, err = patcher.Patch(
+		confpath, "KITTY_THEME", fmt.Sprintf("# %s\ninclude current-theme.conf", self.metadata.Name),
+		utils.Keys(AllColorSettingNames)...); err != nil {
+		return
 	}
-	raw, err := os.ReadFile(confpath)
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return err
+	switch reload_in {
+	case "parent":
+		config.ReloadConfigInKitty(true)
+	case "all":
+		config.ReloadConfigInKitty(false)
 	}
-	nraw := patch_conf(utils.UnsafeBytesToString(raw), self.metadata.Name)
-	if len(raw) > 0 {
-		_ = os.WriteFile(confpath+".bak", raw, 0o600)
-	}
-	err = utils.AtomicUpdateFile(confpath, utils.UnsafeStringToBytes(nraw), 0o600)
-	if err != nil {
-		return err
-	}
-	reload_config(ReloadDestination(reload_in))
 	return
 }
 
@@ -809,12 +733,12 @@ func (self *Themes) At(x int) *Theme {
 func (self *Themes) Names() []string { return self.index_map }
 
 func (self *Themes) create_index_map() {
-	self.index_map = maps.Keys(self.name_map)
+	self.index_map = utils.Keys(self.name_map)
 	self.index_map = utils.StableSortWithKey(self.index_map, strings.ToLower)
 }
 
 func (self *Themes) Filtered(is_ok func(*Theme) bool) *Themes {
-	themes := utils.Filter(maps.Values(self.name_map), is_ok)
+	themes := utils.Filter(utils.Values(self.name_map), is_ok)
 	ans := Themes{name_map: make(map[string]*Theme, len(themes))}
 	for _, theme := range themes {
 		ans.name_map[theme.metadata.Name] = theme

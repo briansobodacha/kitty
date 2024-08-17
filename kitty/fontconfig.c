@@ -5,13 +5,11 @@
  * Distributed under terms of the GPL3 license.
  */
 
-#include "state.h"
 #include "cleanup.h"
 #include "lineops.h"
 #include "fonts.h"
 #include <fontconfig/fontconfig.h>
 #include <dlfcn.h>
-#include "emoji.h"
 #include "freetype_render_ui_text.h"
 #ifndef FC_COLOR
 #define FC_COLOR "color"
@@ -20,6 +18,7 @@
 
 static bool initialized = false;
 static void* libfontconfig_handle = NULL;
+static struct {PyObject *face, *descriptor;} builtin_nerd_font = {0};
 
 #define FcInit dynamically_loaded_fc_symbol.Init
 #define FcFini dynamically_loaded_fc_symbol.Fini
@@ -43,6 +42,7 @@ static void* libfontconfig_handle = NULL;
 #define FcPatternCreate dynamically_loaded_fc_symbol.PatternCreate
 #define FcPatternGetBool dynamically_loaded_fc_symbol.PatternGetBool
 #define FcPatternAddCharSet dynamically_loaded_fc_symbol.PatternAddCharSet
+#define FcConfigAppFontAddFile dynamically_loaded_fc_symbol.ConfigAppFontAddFile
 
 static struct {
     FcBool(*Init)(void);
@@ -67,6 +67,7 @@ static struct {
     FcPattern * (*PatternCreate) (void);
     FcResult (*PatternGetBool) (const FcPattern *p, const char *object, int n, FcBool *b);
     FcBool (*PatternAddCharSet) (FcPattern *p, const char *object, const FcCharSet *c);
+    FcBool (*ConfigAppFontAddFile) (FcConfig *config, const FcChar8 *file);
 } dynamically_loaded_fc_symbol = {0};
 #define LOAD_FUNC(name) {\
     *(void **) (&dynamically_loaded_fc_symbol.name) = dlsym(libfontconfig_handle, "Fc" #name); \
@@ -117,6 +118,7 @@ load_fontconfig_lib(void) {
         LOAD_FUNC(PatternCreate);
         LOAD_FUNC(PatternGetBool);
         LOAD_FUNC(PatternAddCharSet);
+        LOAD_FUNC(ConfigAppFontAddFile);
 }
 #undef LOAD_FUNC
 
@@ -132,6 +134,8 @@ ensure_initialized(void) {
 static void
 finalize(void) {
     if (initialized) {
+        Py_CLEAR(builtin_nerd_font.face);
+        Py_CLEAR(builtin_nerd_font.descriptor);
         FcFini();
         dlclose(libfontconfig_handle);
         libfontconfig_handle = NULL;
@@ -149,45 +153,51 @@ pyspacing(int val) {
 #undef S
 }
 
+static PyObject*
+increment_and_return(PyObject *x) { if (x) Py_INCREF(x); return x; }
 
 static PyObject*
 pattern_as_dict(FcPattern *pat) {
-    PyObject *ans = PyDict_New(), *p = NULL, *list = NULL;
+    RAII_PyObject(ans, Py_BuildValue("{ss}", "descriptor_type", "fontconfig"));
     if (ans == NULL) return NULL;
 
 #define PS(x) PyUnicode_Decode((const char*)x, strlen((const char*)x), "UTF-8", "replace")
 
-#define G(type, get, which, conv, name) { \
+#define G(type, get, which, conv, name, default) { \
     type out; \
     if (get(pat, which, 0, &out) == FcResultMatch) { \
-        p = conv(out); if (p == NULL) goto exit; \
-        if (PyDict_SetItemString(ans, #name, p) != 0) goto exit; \
-        Py_CLEAR(p); \
-    }}
+        RAII_PyObject(p, conv(out)); \
+        if (!p || PyDict_SetItemString(ans, #name, p) != 0) return NULL; \
+    } else { RAII_PyObject(d, default); if (!d || PyDict_SetItemString(ans, #name, d) != 0) return NULL; } \
+}
 
 #define L(type, get, which, conv, name) { \
     type out; int n = 0; \
-    list = PyList_New(0); \
-    if (!list) goto exit; \
+    RAII_PyObject(list, PyList_New(0)); \
+    if (!list) return NULL; \
     while (get(pat, which, n++, &out) == FcResultMatch) { \
-        p = conv(out); if (p == NULL) goto exit; \
-        if (PyList_Append(list, p) != 0) goto exit; \
-        Py_CLEAR(p); \
+        RAII_PyObject(p, conv(out));  \
+        if (!p || PyList_Append(list, p) != 0) return NULL; \
     } \
-    if (PyDict_SetItemString(ans, #name, list) != 0) goto exit; \
-    Py_CLEAR(list); \
+    if (PyDict_SetItemString(ans, #name, list) != 0) return NULL; \
 }
-#define S(which, key) G(FcChar8*, FcPatternGetString, which, PS, key)
+#define S(which, key) G(FcChar8*, FcPatternGetString, which, PS, key, PyUnicode_FromString(""))
 #define LS(which, key) L(FcChar8*, FcPatternGetString, which, PS, key)
-#define I(which, key) G(int, FcPatternGetInteger, which, PyLong_FromLong, key)
-#define B(which, key) G(int, FcPatternGetBool, which, pybool, key)
-#define E(which, key, conv) G(int, FcPatternGetInteger, which, conv, key)
+#define I(which, key) G(int, FcPatternGetInteger, which, PyLong_FromLong, key, PyLong_FromUnsignedLong(0))
+#define B(which, key) G(FcBool, FcPatternGetBool, which, pybool, key, increment_and_return(Py_False))
+#define E(which, key, conv) G(int, FcPatternGetInteger, which, conv, key, PyLong_FromUnsignedLong(0))
     S(FC_FILE, path);
     S(FC_FAMILY, family);
     S(FC_STYLE, style);
     S(FC_FULLNAME, full_name);
     S(FC_POSTSCRIPT_NAME, postscript_name);
     LS(FC_FONT_FEATURES, fontfeatures);
+    B(FC_VARIABLE, variable);
+#ifdef FC_NAMED_INSTANCE
+    B(FC_NAMED_INSTANCE, named_instance);
+#else
+    PyDict_SetItemString(ans, "named_instance", Py_False);
+#endif
     I(FC_WEIGHT, weight);
     I(FC_WIDTH, width)
     I(FC_SLANT, slant);
@@ -200,11 +210,8 @@ pattern_as_dict(FcPattern *pat) {
     B(FC_OUTLINE, outline);
     B(FC_COLOR, color);
     E(FC_SPACING, spacing, pyspacing);
-exit:
-    if (PyErr_Occurred()) Py_CLEAR(ans);
-    Py_CLEAR(p);
-    Py_CLEAR(list);
 
+    Py_INCREF(ans);
     return ans;
 #undef PS
 #undef S
@@ -231,22 +238,28 @@ font_set(FcFontSet *fs) {
 #define AP(func, which, in, desc) if (!func(pat, which, in)) { PyErr_Format(PyExc_ValueError, "Failed to add %s to fontconfig pattern", desc, NULL); goto end; }
 
 static PyObject*
-fc_list(PyObject UNUSED *self, PyObject *args) {
+fc_list(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
     ensure_initialized();
-    int allow_bitmapped_fonts = 0, spacing = -1;
+    int allow_bitmapped_fonts = 0, spacing = -1, only_variable = 0;
     PyObject *ans = NULL;
     FcObjectSet *os = NULL;
     FcPattern *pat = NULL;
     FcFontSet *fs = NULL;
-    if (!PyArg_ParseTuple(args, "|ip", &spacing, &allow_bitmapped_fonts)) return NULL;
+    static char *kwds[] = {"spacing", "allow_bitmapped_fonts", "only_variable", NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kw, "|ipp", kwds, &spacing, &allow_bitmapped_fonts, &only_variable)) return NULL;
     pat = FcPatternCreate();
     if (pat == NULL) return PyErr_NoMemory();
     if (!allow_bitmapped_fonts) {
-        AP(FcPatternAddBool, FC_OUTLINE, true, "outline");
-        AP(FcPatternAddBool, FC_SCALABLE, true, "scalable");
+        AP(FcPatternAddBool, FC_OUTLINE, FcTrue, "outline");
+        AP(FcPatternAddBool, FC_SCALABLE, FcTrue, "scalable");
     }
     if (spacing > -1) AP(FcPatternAddInteger, FC_SPACING, spacing, "spacing");
-    os = FcObjectSetBuild(FC_FILE, FC_POSTSCRIPT_NAME, FC_FAMILY, FC_STYLE, FC_FULLNAME, FC_WEIGHT, FC_WIDTH, FC_SLANT, FC_HINT_STYLE, FC_INDEX, FC_HINTING, FC_SCALABLE, FC_OUTLINE, FC_COLOR, FC_SPACING, NULL);
+    if (only_variable) AP(FcPatternAddBool, FC_VARIABLE, FcTrue, "variable");
+    os = FcObjectSetBuild(FC_FILE, FC_POSTSCRIPT_NAME, FC_FAMILY, FC_STYLE, FC_FULLNAME, FC_WEIGHT, FC_WIDTH, FC_SLANT, FC_HINT_STYLE, FC_INDEX, FC_HINTING, FC_SCALABLE, FC_OUTLINE, FC_COLOR, FC_SPACING, FC_VARIABLE,
+#ifdef FC_NAMED_INSTANCE
+    FC_NAMED_INSTANCE,
+#endif
+    NULL);
     if (!os) { PyErr_SetString(PyExc_ValueError, "Failed to create fontconfig object set"); goto end; }
     fs = FcFontList(NULL, pat, os);
     if (!fs) { PyErr_SetString(PyExc_ValueError, "Failed to create fontconfig font set"); goto end; }
@@ -395,27 +408,52 @@ end:
 }
 
 PyObject*
-specialize_font_descriptor(PyObject *base_descriptor, FONTS_DATA_HANDLE fg) {
+specialize_font_descriptor(PyObject *base_descriptor, double font_sz_in_pts, double dpi_x, double dpi_y) {
     ensure_initialized();
-    PyObject *p = PyDict_GetItemString(base_descriptor, "path"), *ans = NULL;
+    PyObject *p = PyDict_GetItemString(base_descriptor, "path");
     PyObject *idx = PyDict_GetItemString(base_descriptor, "index");
     if (p == NULL) { PyErr_SetString(PyExc_ValueError, "Base descriptor has no path"); return NULL; }
     if (idx == NULL) { PyErr_SetString(PyExc_ValueError, "Base descriptor has no index"); return NULL; }
+    unsigned long face_idx = PyLong_AsUnsignedLong(idx);
+    if (PyErr_Occurred()) return NULL;
+
     FcPattern *pat = FcPatternCreate();
     if (pat == NULL) return PyErr_NoMemory();
-    long face_idx = MAX(0, PyLong_AsLong(idx));
+    RAII_PyObject(ans, NULL);
     AP(FcPatternAddString, FC_FILE, (const FcChar8*)PyUnicode_AsUTF8(p), "path");
     AP(FcPatternAddInteger, FC_INDEX, face_idx, "index");
-    AP(FcPatternAddDouble, FC_SIZE, fg->font_sz_in_pts, "size");
-    AP(FcPatternAddDouble, FC_DPI, (fg->logical_dpi_x + fg->logical_dpi_y) / 2.0, "dpi");
+    AP(FcPatternAddDouble, FC_SIZE, font_sz_in_pts, "size");
+    AP(FcPatternAddDouble, FC_DPI, (dpi_x + dpi_y) / 2.0, "dpi");
     ans = _fc_match(pat);
+    FcPatternDestroy(pat); pat = NULL;
+    if (!ans) return NULL;
+    // fontconfig returns a completely random font if the base descriptor
+    // points to a font that fontconfig hasnt indexed, for example the builting
+    // NERD font
+    PyObject *new_path = PyDict_GetItemString(ans, "path");
+    if (!new_path || PyObject_RichCompareBool(p, new_path, Py_EQ) != 1) { Py_CLEAR(ans); ans = PyDict_Copy(base_descriptor); if (!ans) return NULL;  }
+
     if (face_idx > 0) {
         // For some reason FcFontMatch sets the index to zero, so manually restore it.
-        PyDict_SetItemString(ans, "index", idx);
+        if (PyDict_SetItemString(ans, "index", idx) != 0) return NULL;
     }
-end:
-    if (pat != NULL) FcPatternDestroy(pat);
+    PyObject *named_style = PyDict_GetItemString(base_descriptor, "named_style");
+    if (named_style) {
+        if (PyDict_SetItemString(ans, "named_style", named_style) != 0) return NULL;
+    }
+    PyObject *axes = PyDict_GetItemString(base_descriptor, "axes");
+    if (axes) {
+        if (PyDict_SetItemString(ans, "axes", axes) != 0) return NULL;
+    }
+    PyObject *features = PyDict_GetItemString(base_descriptor, "features");
+    if (features) {
+        if (PyDict_SetItemString(ans, "features", features) != 0) return NULL;
+    }
+    Py_INCREF(ans);
     return ans;
+end:
+    if (pat) FcPatternDestroy(pat);
+    return NULL;
 }
 
 bool
@@ -437,38 +475,107 @@ end:
     return ok;
 }
 
+static bool face_has_codepoint(const void *face, char_type cp) { return glyph_id_for_codepoint(face, cp) > 0; }
+
 PyObject*
 create_fallback_face(PyObject UNUSED *base_face, CPUCell* cell, bool bold, bool italic, bool emoji_presentation, FONTS_DATA_HANDLE fg) {
     ensure_initialized();
     PyObject *ans = NULL;
+    RAII_PyObject(d, NULL);
     FcPattern *pat = FcPatternCreate();
     if (pat == NULL) return PyErr_NoMemory();
+    bool glyph_found = false;
     AP(FcPatternAddString, FC_FAMILY, (const FcChar8*)(emoji_presentation ? "emoji" : "monospace"), "family");
     if (!emoji_presentation && bold) { AP(FcPatternAddInteger, FC_WEIGHT, FC_WEIGHT_BOLD, "weight"); }
     if (!emoji_presentation && italic) { AP(FcPatternAddInteger, FC_SLANT, FC_SLANT_ITALIC, "slant"); }
     if (emoji_presentation) { AP(FcPatternAddBool, FC_COLOR, true, "color"); }
     size_t num = cell_as_unicode_for_fallback(cell, char_buf);
     add_charset(pat, num);
-    PyObject *d = _fc_match(pat);
+    d = _fc_match(pat);
+face_from_descriptor:
     if (d) {
         ssize_t idx = -1;
         PyObject *q;
         while ((q = iter_fallback_faces(fg, &idx))) {
-            if (face_equals_descriptor(q, d)) { ans = PyLong_FromSsize_t(idx); Py_CLEAR(d); goto end; }
+            if (face_equals_descriptor(q, d)) {
+                ans = PyLong_FromSsize_t(idx);
+                if (!glyph_found) glyph_found = has_cell_text(face_has_codepoint, q, cell, false);
+                goto end;
+            }
         }
         ans = face_from_descriptor(d, fg);
-        Py_CLEAR(d);
+        if (!glyph_found) glyph_found = has_cell_text(face_has_codepoint, ans, cell, false);
     }
 end:
-    if (pat != NULL) FcPatternDestroy(pat);
+    Py_CLEAR(d);
+    if (pat != NULL) { FcPatternDestroy(pat); pat = NULL; }
+    if (!glyph_found && !PyErr_Occurred()) {
+        if (builtin_nerd_font.face && has_cell_text(face_has_codepoint, builtin_nerd_font.face, cell, false)) {
+            Py_CLEAR(ans);
+            d = builtin_nerd_font.descriptor; Py_INCREF(d); glyph_found = true; goto face_from_descriptor;
+        } else {
+            if (global_state.debug_font_fallback && ans) has_cell_text(face_has_codepoint, ans, cell, true);
+            Py_CLEAR(ans); ans = Py_None; Py_INCREF(ans);
+        }
+    }
     return ans;
 }
 
+
+static PyObject*
+set_builtin_nerd_font(PyObject UNUSED *self, PyObject *pypath) {
+    if (!PyUnicode_Check(pypath)) { PyErr_SetString(PyExc_TypeError, "path must be a string"); return NULL; }
+    ensure_initialized();
+    const char *path = PyUnicode_AsUTF8(pypath);
+    FcPattern *pat = FcPatternCreate();
+    if (pat == NULL) return PyErr_NoMemory();
+    Py_CLEAR(builtin_nerd_font.face);
+    Py_CLEAR(builtin_nerd_font.descriptor);
+
+    builtin_nerd_font.face = face_from_path(path, 0, NULL);
+    if (builtin_nerd_font.face) {
+        // Copy whatever hinting settings fontconfig returns for the nerd font postscript name
+        AP(FcPatternAddString, FC_POSTSCRIPT_NAME, (const unsigned char*)postscript_name_for_face(builtin_nerd_font.face), "postscript_name");
+        RAII_PyObject(d, _fc_match(pat));
+        if (!d) goto end;
+        builtin_nerd_font.descriptor = PyDict_New();
+        if (!builtin_nerd_font.descriptor) goto end;
+#define copy(key) { PyObject *t = PyDict_GetItemString(d, #key); if (t) { if (PyDict_SetItemString(builtin_nerd_font.descriptor, #key, t) != 0)goto end; } }
+        copy(hinting); copy(hint_style);
+#undef copy
+        if (PyDict_SetItemString(builtin_nerd_font.descriptor, "path", pypath) != 0) goto end;
+        if (PyDict_SetItemString(builtin_nerd_font.descriptor, "index", PyLong_FromLong(0)) != 0) goto end;
+    }
+end:
+    if (pat) FcPatternDestroy(pat);
+    if (PyErr_Occurred()) {
+        Py_CLEAR(builtin_nerd_font.face);
+        Py_CLEAR(builtin_nerd_font.descriptor);
+        return NULL;
+    }
+    Py_INCREF(builtin_nerd_font.descriptor);
+    return builtin_nerd_font.descriptor;
+}
+
+
+static PyObject*
+add_font_file(PyObject UNUSED *self, PyObject *args) {
+    ensure_initialized();
+    const char *path = NULL;
+    if (!PyArg_ParseTuple(args, "s", &path)) return NULL;
+    if (FcConfigAppFontAddFile(NULL, (const unsigned char*)path)) Py_RETURN_TRUE;
+    Py_RETURN_FALSE;
+}
+
+
 #undef AP
+
 static PyMethodDef module_methods[] = {
-    METHODB(fc_list, METH_VARARGS),
+    {"fc_list", (PyCFunction)(void (*) (void))(fc_list), METH_VARARGS | METH_KEYWORDS, NULL},
     METHODB(fc_match, METH_VARARGS),
     METHODB(fc_match_postscript_name, METH_VARARGS),
+    METHODB(add_font_file, METH_VARARGS),
+    METHODB(set_builtin_nerd_font, METH_O),
     {NULL, NULL, 0, NULL}        /* Sentinel */
 };
 

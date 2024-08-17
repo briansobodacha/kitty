@@ -7,6 +7,7 @@ import (
 	"kitty"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -163,7 +164,7 @@ func RunShell(shell_cmd []string, shell_integration_env_var_val, cwd string) (er
 		shell_env = env
 	}
 	exe := shell_cmd[0]
-	if runtime.GOOS == "darwin" {
+	if runtime.GOOS == "darwin" && (os.Getenv("KITTY_RUNNING_SHELL_INTEGRATION_TEST") != "1" || os.Getenv("KITTY_RUNNING_BASH_INTEGRATION_TEST") != "") {
 		// ensure shell runs in login mode. On macOS lots of people use ~/.bash_profile instead of ~/.bashrc
 		// which means they expect the shell to run in login mode always. Le Sigh.
 		shell_cmd[0] = "-" + filepath.Base(shell_cmd[0])
@@ -183,6 +184,9 @@ func RunShell(shell_cmd []string, shell_integration_env_var_val, cwd string) (er
 	}
 	return unix.Exec(utils.FindExe(exe), shell_cmd, env)
 }
+
+var debugprintln = tty.DebugPrintln
+var _ = debugprintln
 
 func RunCommandRestoringTerminalToSaneStateAfter(cmd []string) {
 	exe := utils.FindExe(cmd[0])
@@ -213,7 +217,17 @@ func RunCommandRestoringTerminalToSaneStateAfter(cmd []string) {
 			defer term.Close()
 		}
 	}
-	err = c.Run()
+	func() {
+		if err = c.Start(); err != nil {
+			fmt.Fprintln(os.Stderr, cmd[0], "failed to start with error:", err)
+			return
+		}
+		// Ignore SIGINT as the kernel tends to send it to us as well as the
+		// subprocess on Ctrl+C
+		signal.Ignore(os.Interrupt)
+		defer signal.Reset(os.Interrupt)
+		err = c.Wait()
+	}()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, cmd[0], "failed with error:", err)
 	}

@@ -1,11 +1,13 @@
 #!/usr/bin/env python
 # License: GPL v3 Copyright: 2016, Kovid Goyal <kovid at kovidgoyal.net>
 
-from kitty.fast_data_types import DECAWM, DECCOLM, DECOM, IRM, Cursor, parse_bytes
+from kitty.config import defaults
+from kitty.fast_data_types import DECAWM, DECCOLM, DECOM, IRM, VT_PARSER_BUFFER_SIZE, Color, ColorProfile, Cursor
 from kitty.marks import marker_from_function, marker_from_regex
+from kitty.rgb import color_names
 from kitty.window import pagerhist
 
-from . import BaseTest
+from . import BaseTest, parse_bytes
 
 
 class TestScreen(BaseTest):
@@ -304,6 +306,16 @@ class TestScreen(BaseTest):
         s.draw('x' * len(str(s.line(1))))
         s.resize(s.lines, s.columns + 4)
         self.ae(str(s.linebuf), 'xxx\nxx\nbb\n\n')
+        s = self.create_screen()
+        c = s.callbacks
+        parse_bytes(s, b'\x1b[?2048$p')  # ]
+        self.ae(c.wtcbuf, b'\x1b[?2048;2$y')  # ]
+        c.clear()
+        parse_bytes(s, b'\x1b[?2048h\x1b[?2048$p')  # ]]
+        self.ae(c.wtcbuf, b'\x1b[?2048;1$y')  # ]
+        self.ae(c.num_of_resize_events, 1)
+        parse_bytes(s, b'\x1b[?2048h')  # ]
+        self.ae(c.num_of_resize_events, 2)
 
     def test_cursor_after_resize(self):
 
@@ -419,6 +431,9 @@ class TestScreen(BaseTest):
             s.draw('*')
         s.cursor_position(2, 2)
         self.ae(str(s.line(0)), '\t*'*13)
+        s = self.create_screen(cols=4, lines=2)
+        s.draw('aaaX\tbbbb')
+        self.ae(str(s.line(0)) + str(s.line(1)), 'aaaXbbbb')
 
     def test_margins(self):
         # Taken from vttest/main.c
@@ -599,6 +614,23 @@ class TestScreen(BaseTest):
         s.carriage_return(), s.linefeed()
         s.draw('\u25b6\ufe0f')
         self.ae(s.cursor.x, 2)
+
+    def test_writing_with_cursor_on_trailer_of_wide_character(self):
+        s = self.create_screen()
+        def r(x, pos, expected):
+            s.reset()
+            s.draw('😸')
+            self.ae(s.cursor.x, 2)
+            s.cursor.x = 1
+            s.draw(x)
+            self.ae(s.cursor.x, pos)
+            self.ae(str(s.line(0)), expected)
+
+        r('a', 2, ' a')
+        r('😸', 3, ' 😸')
+        r('\u0304', 1, '😸\u0304')
+        r('\r', 0, '😸')
+
 
     def test_serialize(self):
         from kitty.window import as_text
@@ -805,32 +837,32 @@ class TestScreen(BaseTest):
         s.draw('hij')
         self.ae(s.line(1).hyperlink_ids(), (1, 1, 2, 2, 2))
         set_link()
-        self.ae([('a:url-a', 1), (':url-b', 2)], s.hyperlinks_as_list())
+        self.ae({('a:url-a', 1), (':url-b', 2)}, s.hyperlinks_as_set())
         s.garbage_collect_hyperlink_pool()
-        self.ae([('a:url-a', 1), (':url-b', 2)], s.hyperlinks_as_list())
+        self.ae({('a:url-a', 1), (':url-b', 2)}, s.hyperlinks_as_set())
         for i in range(s.lines + 2):
             s.linefeed()
         s.garbage_collect_hyperlink_pool()
-        self.ae([('a:url-a', 1), (':url-b', 2)], s.hyperlinks_as_list())
+        self.ae({('a:url-a', 1), (':url-b', 2)}, s.hyperlinks_as_set())
         for i in range(s.lines * 2):
             s.linefeed()
         s.garbage_collect_hyperlink_pool()
-        self.assertFalse(s.hyperlinks_as_list())
+        self.assertFalse(s.hyperlinks_as_set())
         set_link('url-a', 'x')
         s.draw('a')
         set_link('url-a', 'y')
         s.draw('a')
         set_link()
-        self.ae([('x:url-a', 1), ('y:url-a', 2)], s.hyperlinks_as_list())
+        self.ae({('x:url-a', 1), ('y:url-a', 2)}, s.hyperlinks_as_set())
 
         s = self.create_screen()
         set_link('u' * 2048)
         s.draw('a')
-        self.ae([(':' + 'u' * 2045, 1)], s.hyperlinks_as_list())
+        self.ae({(':' + 'u' * 2045, 1)}, s.hyperlinks_as_set())
         s = self.create_screen()
         set_link('u' * 2048, 'i' * 300)
         s.draw('a')
-        self.ae([('i'*256 + ':' + 'u' * (2045 - 256), 1)], s.hyperlinks_as_list())
+        self.ae({('i'*256 + ':' + 'u' * (2045 - 256), 1)}, s.hyperlinks_as_set())
 
         s = self.create_screen()
         set_link('1'), s.draw('1')
@@ -839,19 +871,19 @@ class TestScreen(BaseTest):
         s.cursor.x = 1
         set_link(), s.draw('X')
         self.ae(s.line(0).hyperlink_ids(), (1, 0, 3, 0, 0))
-        self.ae([(':1', 1), (':2', 2), (':3', 3)], s.hyperlinks_as_list())
+        self.ae({(':1', 1), (':2', 2), (':3', 3)}, s.hyperlinks_as_set())
         s.garbage_collect_hyperlink_pool()
-        self.ae([(':1', 1), (':3', 2)], s.hyperlinks_as_list())
+        self.ae({(':1', 1), (':3', 2)}, s.hyperlinks_as_set())
         set_link('3'), s.draw('3')
-        self.ae([(':1', 1), (':3', 2)], s.hyperlinks_as_list())
+        self.ae({(':1', 1), (':3', 2)}, s.hyperlinks_as_set())
         set_link('4'), s.draw('4')
-        self.ae([(':1', 1), (':3', 2), (':4', 3)], s.hyperlinks_as_list())
+        self.ae({(':1', 1), (':3', 2), (':4', 3)}, s.hyperlinks_as_set())
 
         s = self.create_screen()
         set_link('1'), s.draw('1')
         set_link('2'), s.draw('2')
         set_link('1'), s.draw('1')
-        self.ae([(':2', 2), (':1', 1)], s.hyperlinks_as_list())
+        self.ae({(':2', 2), (':1', 1)}, s.hyperlinks_as_set())
 
         s = self.create_screen()
         set_link('1'), s.draw('12'), set_link(), s.draw('X'), set_link('1'), s.draw('3')
@@ -912,21 +944,22 @@ class TestScreen(BaseTest):
         def send(what: str):
             return parse_bytes(s, f'\033]52;p;{what}\a'.encode('ascii'))
 
-        def t(q, use_pending_mode, *expected):
+        def t(q, *expected):
             c.clear()
-            if use_pending_mode:
-                parse_bytes(s, b'\033[?2026h')
             send(q)
-            if use_pending_mode:
-                self.ae(c.cc_buf, [])
-                parse_bytes(s, b'\033[?2026l')
-            self.ae(c.cc_buf, list(expected))
+            del q
+            t.ex = list(expected)
+            del expected
+            try:
+                self.ae(tuple(map(len, c.cc_buf)), tuple(map(len, t.ex)))
+                self.ae(c.cc_buf, t.ex)
+            finally:
+                del t.ex
 
-        for use_pending_mode in (False, True):
-            t('XYZ', use_pending_mode, ('p;XYZ', False))
-            t('a' * 8192, use_pending_mode, ('p;' + 'a' * (8192 - 6), True), (';' + 'a' * 6, False))
-            t('', use_pending_mode, ('p;', False))
-            t('!', use_pending_mode, ('p;!', False))
+        t('XYZ', ('p;XYZ', False))
+        t('a' * VT_PARSER_BUFFER_SIZE, ('p;' + 'a' * (VT_PARSER_BUFFER_SIZE - 8), True), (';' + 'a' * 8, False))
+        t('', ('p;', False))
+        t('!', ('p;!', False))
 
     def test_key_encoding_flags_stack(self):
         s = self.create_screen()
@@ -988,7 +1021,7 @@ class TestScreen(BaseTest):
         w('#P')
         w('#R')
         ac(0, 1)
-        w('#10P')
+        w('10#P')
         w('#R')
         ac(0, 1)
         w('#Q')
@@ -1007,24 +1040,30 @@ class TestScreen(BaseTest):
             url = ''.join(s.text_for_marked_url())
             self.assertEqual(expected, url)
 
-        def t(url, x=0, y=0, before='', after=''):
+        def t(url, x=0, y=0, before='', after='', expected=''):
             s.reset()
             s.cursor.x = x
             s.cursor.y = y
             s.draw(before + url + after)
-            ae(url, x=x + 1 + len(before), y=y)
+            ae(expected or url, x=x + 1 + len(before), y=y)
 
 
         t('http://moo.com')
         t('http://moo.com/something?else=+&what-')
+        t('http://moo.com#fragme')
         for (st, e) in '() {} [] <>'.split():
             t('http://moo.com', before=st, after=e)
-        for trailer in ')-=]}':
+        for trailer in ')-=':
             t('http://moo.com' + trailer)
-        for trailer in '{([':
+        for trailer in '{}([<>':
             t('http://moo.com', after=trailer)
         t('http://moo.com', x=s.columns - 9)
         t('https://wraps-by-one-char.com', before='[', after=']')
+        t('http://[::1]:8080')
+        t('https://wr[aps-by-one-ch]ar.com')
+        t('http://[::1]:8080/x', after='[')
+        t('http://[::1]:8080/x]y34', expected='http://[::1]:8080/x')
+        t('https://wraps-by-one-char.com[]/x', after='[')
 
     def test_prompt_marking(self):
         s = self.create_screen()
@@ -1187,7 +1226,7 @@ class TestScreen(BaseTest):
 
         def cb(data):
             nonlocal response
-            response = set_pointer_shape(s, data)
+            response = set_pointer_shape(s, str(data, 'utf-8'))
         c.set_pointer_shape = cb
 
         def send(a):
@@ -1221,3 +1260,23 @@ class TestScreen(BaseTest):
         t('<', '0')
         t('=left_ptr', 'default')
         t('=fleur', 'move')
+
+    def test_color_profile(self):
+        c = ColorProfile(defaults)
+        for i in range(8):
+            col = getattr(defaults, f'color{i}')
+            self.ae(c.as_color(i << 8 | 1), col)
+        self.ae(c.as_color(255 << 8 | 1), Color(0xee, 0xee, 0xee))
+        s = self.create_screen()
+        s.color_profile.reload_from_opts(defaults)
+        def q(send, expected=None):
+            s.callbacks.clear()
+            parse_bytes(s, b'\x1b]21;' + ';'.join(f'{k}={v}' for k, v in send.items()).encode() + b'\a')
+            self.ae(s.callbacks.color_control_responses, [expected] if expected else [])
+        q({k: '?' for k in 'background foreground 213 unknown'.split()}, {
+            'background': defaults.background, 'foreground': defaults.foreground, '213': defaults.color213, 'unknown': '?'})
+        q({'background':'aquamarine'})
+        q({'background':'?', 'selection_background': '?'}, {'background': color_names['aquamarine'], 'selection_background': s.color_profile.highlight_bg})
+        q({'selection_background': ''})
+        self.assertIsNone(s.color_profile.highlight_bg)
+        q({'selection_background': '?'}, {'selection_background': ''})

@@ -31,18 +31,20 @@
 #define LIKELY(x)    __builtin_expect (!!(x), 1)
 #define UNLIKELY(x)  __builtin_expect (!!(x), 0)
 #define MAX(x, y) __extension__ ({ \
-    __typeof__ (x) a = (x); __typeof__ (y) b = (y); \
-        a > b ? a : b;})
+    const __typeof__ (x) __a__ = (x); const __typeof__ (y) __b__ = (y); \
+        __a__ > __b__ ? __a__ : __b__;})
 #define MIN(x, y) __extension__ ({ \
-    __typeof__ (x) a = (x); __typeof__ (y) b = (y); \
-        a < b ? a : b;})
+    const __typeof__ (x) __a__ = (x); const __typeof__ (y) __b__ = (y); \
+        __a__ < __b__ ? __a__ : __b__;})
 #define SWAP(x, y) do { __typeof__(x) _sw_ = y; y = x; x = _sw_; } while(0)
 #define xstr(s) str(s)
 #define str(s) #s
 #define arraysz(x) (sizeof(x)/sizeof(x[0]))
 #define zero_at_i(array, idx) memset((array) + (idx), 0, sizeof((array)[0]))
 #define zero_at_ptr(p) memset((p), 0, sizeof((p)[0]))
+#define literal_strlen(x) (sizeof(x)-1)
 #define zero_at_ptr_count(p, count) memset((p), 0, (count) * sizeof((p)[0]))
+#define C0_EXCEPT_NL_SPACE_TAB 0x0 ... 0x8: case 0xb ... 0x1f: case 0x7f
 void log_error(const char *fmt, ...) __attribute__ ((format (printf, 1, 2)));
 #define fatal(...) { log_error(__VA_ARGS__); exit(EXIT_FAILURE); }
 static inline void cleanup_free(void *p) { free(*(void**)p); }
@@ -50,6 +52,10 @@ static inline void cleanup_free(void *p) { free(*(void**)p); }
 static inline void cleanup_decref(PyObject **p) { Py_CLEAR(*p); }
 #define RAII_PyObject(name, initializer) __attribute__((cleanup(cleanup_decref))) PyObject *name = initializer
 #define RAII_PY_BUFFER(name) __attribute__((cleanup(PyBuffer_Release))) Py_buffer name = {0}
+#if PY_VERSION_HEX < 0x030a0000
+static inline PyObject* Py_NewRef(PyObject *o) { Py_INCREF(o); return o; }
+static inline PyObject* Py_XNewRef(PyObject *o) { Py_XINCREF(o); return o; }
+#endif
 
 typedef unsigned long long id_type;
 typedef uint32_t char_type;
@@ -62,7 +68,7 @@ typedef uint16_t glyph_index;
 typedef uint32_t pixel;
 typedef unsigned int index_type;
 typedef uint16_t sprite_index;
-typedef enum CursorShapes { NO_CURSOR_SHAPE, CURSOR_BLOCK, CURSOR_BEAM, CURSOR_UNDERLINE, NUM_OF_CURSOR_SHAPES } CursorShape;
+typedef enum CursorShapes { NO_CURSOR_SHAPE, CURSOR_BLOCK, CURSOR_BEAM, CURSOR_UNDERLINE, CURSOR_HOLLOW, NUM_OF_CURSOR_SHAPES } CursorShape;
 typedef enum { DISABLE_LIGATURES_NEVER, DISABLE_LIGATURES_CURSOR, DISABLE_LIGATURES_ALWAYS } DisableLigature;
 
 #define ERROR_PREFIX "[PARSE ERROR]"
@@ -163,16 +169,17 @@ typedef struct ImageAnchorPosition {
     }
 
 #ifdef __clang__
-#define IGNORE_PEDANTIC_WARNINGS _Pragma("clang diagnostic push") _Pragma("clang diagnostic ignored \"-Wpedantic\"")
-#define END_IGNORE_PEDANTIC_WARNINGS _Pragma("clang diagnostic pop")
-#define ALLOW_UNUSED_RESULT _Pragma("clang diagnostic push") _Pragma("clang diagnostic ignored \"-Wunused-result\"")
-#define END_ALLOW_UNUSED_RESULT _Pragma("clang diagnostic pop")
+#define START_IGNORE_DIAGNOSTIC(diag) _Pragma(xstr(clang diagnostic push))  _Pragma(xstr(clang diagnostic ignored diag))
+#define END_IGNORE_DIAGNOSTIC _Pragma("clang diagnostic pop")
 #else
-#define IGNORE_PEDANTIC_WARNINGS _Pragma("GCC diagnostic ignored \"-Wpedantic\"")
-#define END_IGNORE_PEDANTIC_WARNINGS _Pragma("GCC diagnostic pop")
-#define ALLOW_UNUSED_RESULT _Pragma("GCC diagnostic ignored \"-Wunused-result\"")
-#define END_ALLOW_UNUSED_RESULT _Pragma("GCC diagnostic pop")
+#define START_IGNORE_DIAGNOSTIC(diag) _Pragma(xstr(GCC diagnostic push))  _Pragma(xstr(GCC diagnostic ignored diag))
+#define END_IGNORE_DIAGNOSTIC _Pragma("GCC diagnostic pop")
 #endif
+
+#define IGNORE_PEDANTIC_WARNINGS START_IGNORE_DIAGNOSTIC("-Wpedantic")
+#define END_IGNORE_PEDANTIC_WARNINGS END_IGNORE_DIAGNOSTIC
+#define ALLOW_UNUSED_RESULT IGNORE_DIAGNOSTIC("-Wunused-result")
+#define END_ALLOW_UNUSED_RESULT END_IGNORE_DIAGNOSTIC
 #define START_ALLOW_CASE_RANGE IGNORE_PEDANTIC_WARNINGS
 #define END_ALLOW_CASE_RANGE END_IGNORE_PEDANTIC_WARNINGS
 #define BIT_MASK(__TYPE__, __ONE_COUNT__) \
@@ -297,9 +304,10 @@ typedef struct {
 } Cursor;
 
 typedef struct {
-    bool is_visible, is_focused;
+    bool is_focused, render_even_when_unfocused;
     CursorShape shape;
     unsigned int x, y;
+    float opacity;
 } CursorRenderInfo;
 
 typedef enum DynamicColorType {
@@ -315,22 +323,15 @@ typedef union DynamicColor {
 } DynamicColor;
 
 typedef struct {
-    DynamicColor default_fg, default_bg, cursor_color, cursor_text_color, highlight_fg, highlight_bg, visual_bell_color;
+    DynamicColor default_fg, default_bg, cursor_color, cursor_text_color, highlight_fg, highlight_bg, visual_bell_color, second_transparent_bg;
 } DynamicColors;
-
-
-typedef struct {
-    DynamicColors dynamic_colors;
-    uint32_t color_table[256];
-} ColorStackEntry;
 
 typedef struct {
     PyObject_HEAD
 
     bool dirty;
-    uint32_t color_table[256];
-    uint32_t orig_color_table[256];
-    ColorStackEntry *color_stack;
+    uint32_t color_table[256], orig_color_table[256];
+    struct { DynamicColors dynamic_colors; uint32_t color_table[256]; } *color_stack;
     unsigned int color_stack_idx, color_stack_sz;
     DynamicColors configured, overridden;
     color_type mark_foregrounds[MARK_MASK+1], mark_backgrounds[MARK_MASK+1];
@@ -343,9 +344,6 @@ typedef struct {
 typedef struct {int x;} *SPRITE_MAP_HANDLE;
 #define FONTS_DATA_HEAD SPRITE_MAP_HANDLE sprite_map; double logical_dpi_x, logical_dpi_y, font_sz_in_pts; unsigned int cell_width, cell_height;
 typedef struct {FONTS_DATA_HEAD} *FONTS_DATA_HANDLE;
-
-#define PARSER_BUF_SZ (8 * 1024)
-#define READ_BUF_SZ (1024*1024)
 
 #define clear_sprite_position(cell) (cell).sprite_x = 0; (cell).sprite_y = 0; (cell).sprite_z = 0;
 
@@ -372,6 +370,8 @@ cursor_to_attrs(const Cursor *c, const uint16_t width) {
     return ans;
 }
 
+#define cursor_as_gpu_cell(cursor) {.attrs=cursor_to_attrs(cursor, 0), .fg=(cursor->fg & COL_MASK), .bg=(cursor->bg & COL_MASK), .decoration_fg=cursor->decoration_fg & COL_MASK}
+
 static inline void
 attrs_to_cursor(const CellAttrs attrs, Cursor *c) {
     c->decoration = attrs.decoration; c->bold = attrs.bold;  c->italic = attrs.italic;
@@ -386,15 +386,14 @@ LineBuf* alloc_linebuf(unsigned int, unsigned int);
 HistoryBuf* alloc_historybuf(unsigned int, unsigned int, unsigned int);
 ColorProfile* alloc_color_profile(void);
 void copy_color_profile(ColorProfile*, ColorProfile*);
-PyObject* create_256_color_table(void);
 PyObject* parse_bytes_dump(PyObject UNUSED *, PyObject *);
 PyObject* parse_bytes(PyObject UNUSED *, PyObject *);
 void cursor_reset(Cursor*);
 Cursor* cursor_copy(Cursor*);
 void cursor_copy_to(Cursor *src, Cursor *dest);
 void cursor_reset_display_attrs(Cursor*);
-void cursor_from_sgr(Cursor *self, int *params, unsigned int count);
-void apply_sgr_to_cells(GPUCell *first_cell, unsigned int cell_count, int *params, unsigned int count);
+void cursor_from_sgr(Cursor *self, int *params, unsigned int count, bool is_group);
+void apply_sgr_to_cells(GPUCell *first_cell, unsigned int cell_count, int *params, unsigned int count, bool is_group);
 const char* cell_as_sgr(const GPUCell *, const GPUCell *);
 const char* cursor_as_sgr(const Cursor *);
 
@@ -403,7 +402,7 @@ bool schedule_write_to_child(unsigned long id, unsigned int num, ...);
 bool schedule_write_to_child_python(unsigned long id, const char *prefix, PyObject* tuple_of_str_or_bytes, const char *suffix);
 bool set_iutf8(int, bool);
 
-DynamicColor colorprofile_to_color(ColorProfile *self, DynamicColor entry, DynamicColor defval);
+DynamicColor colorprofile_to_color(const ColorProfile *self, DynamicColor entry, DynamicColor defval);
 color_type
 colorprofile_to_color_with_fallback(ColorProfile *self, DynamicColor entry, DynamicColor defval, DynamicColor fallback, DynamicColor falback_defval);
 void copy_color_table_to_buffer(ColorProfile *self, color_type *address, int offset, size_t stride);
@@ -424,4 +423,13 @@ void play_canberra_sound(const char *which_sound, const char *event_id, bool is_
 SPRITE_MAP_HANDLE alloc_sprite_map(unsigned int, unsigned int);
 SPRITE_MAP_HANDLE free_sprite_map(SPRITE_MAP_HANDLE);
 const char* get_hyperlink_for_id(const HYPERLINK_POOL_HANDLE, hyperlink_id_type id, bool only_url);
-void log_event(const char *format, ...) __attribute__((format(printf, 1, 2)));
+
+#define memset_array(array, val, count) if ((count) > 0) { \
+    (array)[0] = (val); \
+    size_t __copied__ = 1; \
+    while (__copied__ < (count)) { \
+        const size_t __num__ = MIN(__copied__, (count) - __copied__); \
+        memcpy((array) + __copied__, (array), __num__ * sizeof((val))); \
+        __copied__ += __num__; \
+    } \
+}

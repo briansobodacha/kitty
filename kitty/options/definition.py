@@ -32,33 +32,25 @@ kitty has very powerful font management. You can configure individual font faces
 and even specify special fonts for particular characters.
 ''')
 
-opt('font_family', 'monospace',
+opt('font_family', 'monospace', option_type='parse_font_spec',
     long_text='''
 You can specify different fonts for the bold/italic/bold-italic variants.
-To get a full list of supported fonts use the ``kitty +list-fonts`` command.
-By default they are derived automatically, by the OSes font system. When
-:opt:`bold_font` or :opt:`bold_italic_font` is set to :code:`auto` on macOS, the
-priority of bold fonts is semi-bold, bold, heavy. Setting them manually is
-useful for font families that have many weight variants like Book, Medium,
-Thick, etc.
-For example::
-
-    font_family      Operator Mono Book
-    bold_font        Operator Mono Medium
-    italic_font      Operator Mono Book Italic
-    bold_italic_font Operator Mono Medium Italic
+The easiest way to select fonts is to run the ``kitten choose-fonts`` command
+which will present a nice UI for you to select the fonts you want with previews
+and support for selecting variable fonts and font features. If you want to learn
+to select fonts manually, read the :ref:`font specification syntax <font_spec_syntax>`.
 '''
     )
 
-opt('bold_font', 'auto')
+opt('bold_font', 'auto', option_type='parse_font_spec')
 
-opt('italic_font', 'auto')
+opt('italic_font', 'auto', option_type='parse_font_spec')
 
-opt('bold_italic_font', 'auto')
+opt('bold_italic_font', 'auto', option_type='parse_font_spec')
 
 opt('font_size', '11.0',
     option_type='to_font_size', ctype='double',
-    long_text='Font size (in pts)'
+    long_text='Font size (in pts).'
     )
 
 opt('force_ltr', 'no',
@@ -132,12 +124,13 @@ Note that this refers to programming ligatures, typically implemented using the
 '''
     )
 
-opt('+font_features', 'none',
-    option_type='font_features',
-    add_to_default=False,
-    long_text='''
-Choose exactly which OpenType features to enable or disable. This is useful as
-some fonts might have features worthwhile in a terminal. For example, Fira Code
+opt('+font_features', 'none', option_type='font_features', ctype='!font_features',
+    add_to_default=False, long_text='''
+Choose exactly which OpenType features to enable or disable. Note that for the
+main fonts, features can be specified when selecting the font using the choose-fonts kitten.
+This setting is useful for fallback fonts.
+
+Some fonts might have features worthwhile in a terminal. For example, Fira Code
 includes a discretionary feature, :code:`zero`, which in that font changes the
 appearance of the zero (0), to make it more easily distinguishable from Ø. Fira
 Code also includes other discretionary features known as Stylistic Sets which
@@ -154,19 +147,8 @@ feature in the italic font but not in the regular font.
 On Linux, font features are first read from the FontConfig database and then
 this option is applied, so they can be configured in a single, central place.
 
-To get the PostScript name for a font, use ``kitty +list-fonts --psnames``:
-
-.. code-block:: sh
-
-    $ kitty +list-fonts --psnames | grep Fira
-    Fira Code
-    Fira Code Bold (FiraCode-Bold)
-    Fira Code Light (FiraCode-Light)
-    Fira Code Medium (FiraCode-Medium)
-    Fira Code Regular (FiraCode-Regular)
-    Fira Code Retina (FiraCode-Retina)
-
-The part in brackets is the PostScript name.
+To get the PostScript name for a font, use the ``fc-scan file.ttf`` command on Linux
+or the `Font Book tool on macOS <https://apple.stackexchange.com/questions/79875/how-can-i-get-the-postscript-name-of-a-ttf-font-installed-in-os-x>`__.
 
 Enable alternate zero and oldstyle numerals::
 
@@ -290,13 +272,13 @@ egr()  # }}}
 
 
 # cursor {{{
-agr('cursor', 'Cursor customization')
+agr('cursor', 'Text cursor customization')
 
 opt('cursor', '#cccccc',
     option_type='to_color_or_none',
     long_text='''
-Default cursor color. If set to the special value :code:`none` the cursor will
-be rendered with a "reverse video" effect. It's color will be the color of the
+Default text cursor color. If set to the special value :code:`none` the cursor will
+be rendered with a "reverse video" effect. Its color will be the color of the
 text in the cell it is over and the text will be rendered with the background
 color of the cell. Note that if the program running in the terminal sets a
 cursor color, this takes precedence. Also, the cursor colors are modified if
@@ -311,7 +293,7 @@ opt('cursor_text_color', '#111111',
     long_text='''
 The color of text under the cursor. If you want it rendered with the
 background color of the cell underneath instead, use the special keyword:
-background. Note that if :opt:`cursor` is set to :code:`none` then this option
+`background`. Note that if :opt:`cursor` is set to :code:`none` then this option
 is ignored. Note that some themes set this value, so if you want to override it,
 place your value after the lines where the theme file is included.
 '''
@@ -330,6 +312,12 @@ cursor shape to :code:`beam` at shell prompts. You can avoid this by setting
 '''
     )
 
+opt('cursor_shape_unfocused', 'hollow', option_type='to_cursor_unfocused_shape', ctype='int', long_text='''
+Defines the text cursor shape when the OS window is not focused. The unfocused
+cursor shape can be one of :code:`block`, :code:`beam`, :code:`underline`,
+:code:`hollow` and :code:`unchanged` (leave the cursor shape as it is).
+''')
+
 opt('cursor_beam_thickness', '1.5',
     option_type='positive_float', ctype='float',
     long_text='The thickness of the beam cursor (in pts).'
@@ -340,12 +328,17 @@ opt('cursor_underline_thickness', '2.0',
     long_text='The thickness of the underline cursor (in pts).'
     )
 
-opt('cursor_blink_interval', '-1',
-    option_type='float', ctype='time',
-    long_text='''
+opt('cursor_blink_interval', '-1', option_type='cursor_blink_interval', ctype='!cursor_blink_interval', long_text='''
 The interval to blink the cursor (in seconds). Set to zero to disable blinking.
 Negative values mean use system default. Note that the minimum interval will be
-limited to :opt:`repaint_delay`.
+limited to :opt:`repaint_delay`. You can also animate the cursor blink by specifying
+an :term:`easing function`. For example, setting this to option to :code:`0.5 ease-in-out`
+will cause the cursor blink to be animated over a second, in the first half of the second
+it will go from opaque to transparent and then back again over the next half. You can specify
+different easing functions for the two halves, for example: :code:`-1 linear ease-out`. kitty
+supports all the :link:`CSS easing functions <https://developer.mozilla.org/en-US/docs/Web/CSS/easing-function>`.
+Note that turning on animations uses extra power as it means the screen is redrawn multiple times
+per blink interval. See also, :opt:`cursor_stop_blinking_after`.
 '''
     )
 
@@ -356,6 +349,7 @@ Stop blinking cursor after the specified number of seconds of keyboard
 inactivity. Set to zero to never stop blinking.
 '''
     )
+
 egr()  # }}}
 
 
@@ -373,6 +367,14 @@ using :opt:`scrollback_pager_history_size`. Note that on config reload if this
 is changed it will only affect newly created windows, not existing ones.
 '''
     )
+
+opt('scrollback_indicator_opacity', '1.0',
+    option_type='unit_float', ctype='float', long_text='''
+The opacity of the scrollback indicator which is a small colored rectangle that moves
+along the right hand side of the window as you scroll, indicating what fraction you
+have scrolled. The default is one which means fully opaque, aka visible.
+Set to a value between zero and one to make the indicator less visible.''')
+
 
 opt('scrollback_pager', 'less --chop-long-lines --RAW-CONTROL-CHARS +INPUT_LINE_NUMBER',
     option_type='to_cmdline',
@@ -470,7 +472,7 @@ opt('url_style', 'curly',
 opt('open_url_with', 'default',
     option_type='to_cmdline',
     long_text='''
-The program to open clicked URLs. The special value :code:`default` with first
+The program to open clicked URLs. The special value :code:`default` will first
 look for any URL handlers defined via the :doc:`open_actions` facility and if
 non are found, it will use the Operating System's default URL handler
 (:program:`open` on macOS and :program:`xdg-open` on Linux).
@@ -791,7 +793,7 @@ mma('Select line from point',
     'select_line_from_point ctrl+alt+left triplepress ungrabbed mouse_selection line_from_point',
     long_text='Select from the clicked point to the end of the line.'
     ' If you would like to select the word at the point and then extend to the rest of the line,'
-    ' change line_from_point to word_and_line_from_point.'
+    ' change `line_from_point` to `word_and_line_from_point`.'
     )
 
 mma('Extend the current selection',
@@ -830,7 +832,7 @@ mma('Select line from point even when grabbed',
     'select_line_from_point_grabbed ctrl+shift+alt+left triplepress ungrabbed,grabbed mouse_selection line_from_point',
     long_text='Select from the clicked point to the end of the line even when grabbed.'
     ' If you would like to select the word at the point and then extend to the rest of the line,'
-    ' change line_from_point to word_and_line_from_point.'
+    ' change `line_from_point` to `word_and_line_from_point`.'
     )
 
 mma('Extend the current selection even when grabbed',
@@ -867,7 +869,7 @@ Delay before input from the program running in the terminal is processed (in
 milliseconds). Note that decreasing it will increase responsiveness, but also
 increase CPU usage and might cause flicker in full screen programs that redraw
 the entire screen on each loop, because kitty is so fast that partial screen
-updates will be drawn.
+updates will be drawn. This setting is ignored when the input buffer is almost full.
 '''
     )
 
@@ -895,10 +897,16 @@ The audio bell. Useful to disable it in environments that require silence.
     )
 
 opt('visual_bell_duration', '0.0',
-    option_type='positive_float', ctype='time',
+    option_type='visual_bell_duration', ctype='!visual_bell_duration',
     long_text='''
 The visual bell duration (in seconds). Flash the screen when a bell occurs for
-the specified number of seconds. Set to zero to disable.
+the specified number of seconds. Set to zero to disable. The flash is animated, fading
+in and out over the specified duration. The :term:`easing function` used for the fading can be controlled.
+For example, :code:`2.0 linear` will casuse the flash to fade in and out linearly. The default
+if unspecified is to use :code:`ease-in-out` which fades slowly at the start, middle and end.
+You can specify different easing functions for the fade-in and fade-out parts, like this:
+:code:`2.0 ease-in linear`. kitty
+supports all the :link:`CSS easing functions <https://developer.mozilla.org/en-US/docs/Web/CSS/easing-function>`.
 '''
     )
 
@@ -915,7 +923,7 @@ opt('window_alert_on_bell', 'yes',
     option_type='to_bool', ctype='bool',
     long_text='''
 Request window attention on bell. Makes the dock icon bounce on macOS or the
-taskbar flash on linux.
+taskbar flash on Linux.
 '''
     )
 
@@ -948,15 +956,25 @@ opt('bell_path', 'none',
 Path to a sound file to play as the bell sound. If set to :code:`none`, the
 system default bell sound is used. Must be in a format supported by the
 operating systems sound API, such as WAV or OGA on Linux (libcanberra) or AIFF,
-MP3 or WAV on macOS (NSSound)
+MP3 or WAV on macOS (NSSound).
 '''
     )
 
 opt('linux_bell_theme', '__custom', ctype='!bell_theme',
-    long_text='The XDG Sound Theme kitty will use to play the bell sound.'
-    ' Defaults to the custom theme name used by GNOME and Budgie, falling back to the default freedesktop theme if it does not exist.'
-    ' This option may be removed if Linux ever provides desktop-agnostic support for setting system sound themes.'
-    )
+    long_text='''
+The XDG Sound Theme kitty will use to play the bell sound.
+Defaults to the custom theme name specified in the
+:link:`XDG Sound theme specification <https://specifications.freedesktop.org/sound-theme-spec/latest/sound_lookup.html>,
+falling back to the default freedesktop theme if it does not exist.
+To change your sound theme desktop wide, create :file:`~/.local/share/sounds/__custom/index.theme` with the contents:
+
+    [Sound Theme]
+
+    Inherits=name-of-the-sound-theme-you-want-to-use
+
+Replace :code:`name-of-the-sound-theme-you-want-to-use` with the actual theme name. Now all compliant applications
+should use sounds from this theme.
+''')
 
 egr()  # }}}
 
@@ -1071,13 +1089,16 @@ bottom and left.
     )
 
 opt('placement_strategy', 'center',
-    choices=('center', 'top-left'),
+    choices=('top-left', 'top', 'top-right', 'left', 'center', 'right', 'bottom-left', 'bottom', 'bottom-right'),
     long_text='''
 When the window size is not an exact multiple of the cell size, the cell area of
 the terminal window will have some extra padding on the sides. You can control
 how that padding is distributed with this option. Using a value of
 :code:`center` means the cell area will be placed centrally. A value of
 :code:`top-left` means the padding will be only at the bottom and right edges.
+The value can be one of: :code:`top-left`, :code:`top`, :code:`top-right`,
+:code:`left`, :code:`center`, :code:`right`, :code:`bottom-left`,
+:code:`bottom`, :code:`bottom-right`.
 '''
     )
 
@@ -1123,7 +1144,7 @@ corners from clipping text. Or use :code:`titlebar-and-corners`.
 opt('window_logo_path', 'none',
     option_type='config_or_absolute_path', ctype='!window_logo_path',
     long_text='''
-Path to a logo image. Must be in PNG format. Relative paths are interpreted
+Path to a logo image. Must be in PNG/JPEG/WEBP/GIF/TIFF/BMP format. Relative paths are interpreted
 relative to the kitty config directory. The logo is displayed in a corner of
 every kitty window. The position is controlled by :opt:`window_logo_position`.
 Individual windows can be configured to have different logos either using the
@@ -1149,6 +1170,17 @@ faded and one being fully opaque.
 '''
     )
 
+opt('window_logo_scale', '0', option_type='window_logo_scale', ctype='!window_logo_scale', long_text='''
+The percentage (0-100] of the window size to which the logo should scale. Using a single
+number means the logo is scaled to that percentage of the shortest window dimension, while preseving
+aspect ratio of the logo image.
+
+Using two numbers means the width and height of the logo are scaled to the respective
+percentage of the window's width and height.
+
+Using zero as the percentage disables scaling in that dimension. A single zero (the default)
+disables all scaling of the window logo.
+''')
 
 opt('resize_debounce_time', '0.1 0.5',
     option_type='resize_debounce_time', ctype='!resize_debounce_time',
@@ -1356,6 +1388,8 @@ use :code:`{sup.index}`. All data available is:
     :code:`active_oldest_exe` for the oldest foreground process.
 :code:`max_title_length`
     The maximum title length available.
+:code:`keyboard_mode`
+    The name of the current :ref:`keyboard mode <modal_mappings>` or the empty string if no keyboard mode is active.
 
 Note that formatting is done by Python's string formatting machinery, so you can
 use, for instance, :code:`{layout_name[:2].upper()}` to show only the first two
@@ -1447,7 +1481,8 @@ theme with a background color in your editor, it will not be rendered as
 transparent. Instead you should change the default background color in your
 kitty config and not use a background color in the editor color scheme. Or use
 the escape codes to set the terminals default colors in a shell script to
-launch your editor. Be aware that using a value less than 1.0 is a (possibly
+launch your editor. See also :opt:`second_transparent_bg`.
+Be aware that using a value less than 1.0 is a (possibly
 significant) performance hit. When using a low value for this setting, it is
 desirable that you set the :opt:`background` color to a color the matches the
 general color of the desktop background, for best text rendering.  If you want
@@ -1468,12 +1503,12 @@ control the :italic:`blur radius` (amount of blurring). Setting it to too high
 a value will cause severe performance issues and/or rendering artifacts.
 Usually, values up to 64 work well. Note that this might cause performance issues,
 depending on how the platform implements it, so use with care. Currently supported
-on macOS and KDE under X11.
+on macOS and KDE.
 ''')
 
 opt('background_image', 'none',
     option_type='config_or_absolute_path', ctype='!background_image',
-    long_text='Path to a background image. Must be in PNG format.'
+    long_text='Path to a background image. Must be in PNG/JPEG/WEBP/TIFF/GIF/BMP format.'
     )
 
 opt('background_image_layout', 'tiled',
@@ -1491,6 +1526,15 @@ opt('background_image_linear', 'no',
     option_type='to_bool', ctype='bool',
     long_text='When background image is scaled, whether linear interpolation should be used.'
     )
+
+opt('second_transparent_bg', 'none', option_type='to_color_or_none', long_text='''
+When the background color matches this color, :opt:`background_opacity` is applied to it
+to render it as semi-transparent, just as for colors matching the background color.
+Useful in more complex UIs like editors where you could want more than a single background color
+to be rendered as transparent, for instance, for a cursor highlight line background.
+Terminal applications can set this color using :ref:`The kitty color control <color_control>`
+escape code.
+''')
 
 opt('dynamic_background_opacity', 'no',
     option_type='to_bool', ctype='bool',
@@ -1627,32 +1671,32 @@ opt('color15', '#ffffff',
     )
 
 opt('mark1_foreground', 'black',
-    option_type='to_color', ctype='color_as_int',
+    option_type='to_color',
     long_text='Color for marks of type 1'
     )
 
 opt('mark1_background', '#98d3cb',
-    option_type='to_color', ctype='color_as_int',
+    option_type='to_color',
     long_text='Color for marks of type 1 (light steel blue)'
     )
 
 opt('mark2_foreground', 'black',
-    option_type='to_color', ctype='color_as_int',
+    option_type='to_color',
     long_text='Color for marks of type 2'
     )
 
 opt('mark2_background', '#f2dcd3',
-    option_type='to_color', ctype='color_as_int',
+    option_type='to_color',
     long_text='Color for marks of type 1 (beige)'
     )
 
 opt('mark3_foreground', 'black',
-    option_type='to_color', ctype='color_as_int',
+    option_type='to_color',
     long_text='Color for marks of type 3'
     )
 
 opt('mark3_background', '#f274bc',
-    option_type='to_color', ctype='color_as_int',
+    option_type='to_color',
     long_text='Color for marks of type 3 (violet)'
     )
 
@@ -2865,6 +2909,7 @@ agr('advanced', 'Advanced')
 opt('shell', '.',
     long_text='''
 The shell program to execute. The default value of :code:`.` means to use
+the value of of the :envvar:`SHELL` environment variable or if unset,
 whatever shell is set as the default shell for the current user. Note that on
 macOS if you change this, you might need to add :code:`--login` and
 :code:`--interactive` to ensure that the shell starts in interactive mode and
@@ -2889,9 +2934,9 @@ doesn't work, kitty will cycle through various known editors (:program:`vim`,
 opt('close_on_child_death', 'no',
     option_type='to_bool', ctype='bool',
     long_text='''
-Close the window when the child process (shell) exits. With the default value
+Close the window when the child process (usually the shell) exits. With the default value
 :code:`no`, the terminal will remain open when the child exits as long as there
-are still processes outputting to the terminal (for example disowned or
+are still other processes outputting to the terminal (for example disowned or
 backgrounded processes). When enabled with :code:`yes`, the window will close as
 soon as the child process exits. Note that setting it to :code:`yes` means that
 any background processes still using the terminal can fail silently because
@@ -3001,6 +3046,29 @@ The value of :code:`VAR2` will be :code:`<path to home directory>/a/b`.
 '''
     )
 
+opt('+filter_notification', '', option_type='filter_notification', add_to_default=False, long_text='''
+Specify rules to filter out notifications sent by applications running in kitty.
+Can be specified multiple times to create multiple filter rules. A rule specification
+is of the form :code:`field:regexp`. A filter rule
+can match on any of the fields: :code:`title`, :code:`body`, :code:`app`, :code:`type`.
+The special value of :code:`all` filters out all notifications. Rules can be combined
+using Boolean operators. Some examples::
+
+    filter_notification title:hello or body:"abc.*def"
+    # filter out notification from vim except for ones about updates, (?i)
+    # makes matching case insesitive.
+    filter_notification app:"[ng]?vim" and not body:"(?i)update"
+    # filter out all notifications
+    filter_notification all
+
+The field :code:`app` is the name of the application sending the notification and :code:`type`
+is the type of the notification. Not all applications will send these fields, so you can also
+match on the title and body of the notification text. More sophisticated programmatic filtering
+and custom actions on notifications can be done by creating a notifications.py file in the
+kitty config directory (:file:`~/.config/kitty`). An annotated sample is
+:link:`available <https://github.com/kovidgoyal/kitty/blob/master/docs/notifications.py>`.
+''')
+
 opt('+watcher', '',
     option_type='store_multiple',
     add_to_default=False,
@@ -3057,7 +3125,8 @@ using the :option:`kitty --session` :code:`=none` command line option for indivi
 instances. See :ref:`sessions` in the kitty documentation for details. Note that
 relative paths are interpreted with respect to the kitty config directory.
 Environment variables in the path are expanded. Changing this option by
-reloading the config is not supported.
+reloading the config is not supported. Note that if kitty is invoked with command line
+arguments specifying a command to run, this option is ignored.
 '''
     )
 
@@ -3202,7 +3271,8 @@ Some more examples::
     # Ring a bell when a command takes more than 10 seconds in a invisible window
     notify_on_cmd_finish invisible 10.0 bell
     # Run 'notify-send' when a command takes more than 10 seconds in a invisible window
-    notify_on_cmd_finish invisible 10.0 command notify-send job finished
+    # Here %c is replaced by the current command line and %s by the job exit code
+    notify_on_cmd_finish invisible 10.0 command notify-send "job finished with status: %s" %c
 '''
     )
 
@@ -3219,6 +3289,18 @@ work. Changing this option by reloading the config will only affect newly
 created windows.
 '''
     )
+
+opt('terminfo_type', 'path', choices=('path', 'direct', 'none'),
+    long_text='''
+The value of the :envvar:`TERMINFO` environment variable to set. This variable is
+used by programs running in the terminal to search for terminfo databases. The default value
+of :code:`path` causes kitty to set it to a filesystem location containing the
+kitty terminfo database. A value of :code:`direct` means put the entire database into
+the env var directly. This can be useful when connecting to containers, for example. But,
+note that not all software supports this. A value of :code:`none` means do not touch the variable.
+'''
+    )
+
 
 opt('forward_stdio', 'no', option_type='to_bool', long_text='''
 Forward STDOUT and STDERR of the kitty process to child processes
@@ -3252,8 +3334,8 @@ agr('os', 'OS specific tweaks')
 opt('wayland_titlebar_color', 'system', option_type='titlebar_color', ctype='uint', long_text='''
 The color of the kitty window's titlebar on Wayland systems with client
 side window decorations such as GNOME. A value of :code:`system` means to use
-the default system color, a value of :code:`background` means to use the
-background color of the currently active window and finally you can use an
+the default system colors, a value of :code:`background` means to use the
+background color of the currently active kitty window and finally you can use an
 arbitrary color, such as :code:`#12af59` or :code:`red`.
 '''
     )
@@ -3388,6 +3470,14 @@ based on the system state is chosen automatically. Set it to :code:`x11` or
 config is not supported.
 '''
     )
+
+opt('wayland_enable_ime', 'yes', option_type='to_bool', ctype='bool', long_text='''
+Enable Input Method Extension on Wayland. This is typically used for
+inputting text in East Asian languages. However, its implementation in
+Wayland is often buggy and introduces latency into the input loop,
+so disable this if you know you dont need it. Changing this option
+by reloading the config is not supported, it will not have any effect.
+''')
 egr()  # }}}
 
 
@@ -4031,7 +4121,7 @@ map('Open the selected file at the selected line',
     'goto_file_line kitty_mod+p>n kitten hints --type linenum',
     long_text='''
 Select something that looks like :code:`filename:linenum` and open it in
-:program:`vim` at the specified line number.
+your default editor at the specified line number.
 '''
     )
 
@@ -4113,7 +4203,7 @@ map('Reset background opacity',
 
 map('Reset the terminal',
     'reset_terminal kitty_mod+delete clear_terminal reset active',
-    long_text='''
+    long_text=r'''
 You can create shortcuts to clear/reset the terminal. For example::
 
     # Reset the terminal
@@ -4124,8 +4214,10 @@ You can create shortcuts to clear/reset the terminal. For example::
     map f1 clear_terminal scrollback active
     # Scroll the contents of the screen into the scrollback
     map f1 clear_terminal scroll active
-    # Clear everything up to the line with the cursor
+    # Clear everything on screen up to the line with the cursor or the start of the current prompt (needs shell integration)
     map f1 clear_terminal to_cursor active
+    # Same as above except cleared lines are moved into scrollback
+    map f1 clear_terminal to_cursor_scroll active
 
 If you want to operate on all kitty windows instead of just the current one, use
 :italic:`all` instead of :italic:`active`.
@@ -4154,13 +4246,15 @@ the screen, instead of just clearing the screen. For ZSH, in :file:`~/.zshrc`, a
 .. code-block:: zsh
 
     ctrl_l() {
-        builtin print -rn -- $'\\r\e[0J\e[H\e[22J' >"$TTY"
+        builtin print -rn -- $'\r\e[0J\e[H\e[22J' >"$TTY"
         builtin zle .reset-prompt
         builtin zle -R
     }
     zle -N ctrl_l
     bindkey '^l' ctrl_l
 
+Alternatively, you can just add :code:`map ctrl+l clear_terminal to_cursor_scroll active` to :file:`kitty.conf` which
+works with no changes to the shell rc files, but only clears up to the prompt, it does not clear anytext at the prompt itself.
 '''
     )
 
@@ -4222,7 +4316,7 @@ This will send "Special text" when you press the :kbd:`Ctrl+Alt+A` key
 combination. The text to be sent decodes :link:`ANSI C escapes <https://www.gnu.org/software/bash/manual/html_node/ANSI_002dC-Quoting.html>`
 so you can use escapes like :code:`\\\\e` to send control codes or :code:`\\\\u21fb` to send
 Unicode characters (or you can just input the Unicode characters directly as
-UTF-8 text). You can use ``kitten show_key`` to get the key escape
+UTF-8 text). You can use ``kitten show-key`` to get the key escape
 codes you want to emulate.
 
 The first argument to :code:`send_text` is the keyboard modes in which to

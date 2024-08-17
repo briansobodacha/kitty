@@ -5,14 +5,13 @@ import os
 import sys
 import tempfile
 
-from kitty.config import build_ansi_color_table, defaults
 from kitty.fast_data_types import (
     Color,
-    ColorProfile,
     HistoryBuf,
     LineBuf,
     expand_ansi_c_escapes,
     parse_input_from_terminal,
+    replace_c0_codes_except_nl_space_tab,
     strip_csi,
     truncate_point_for_length,
     wcswidth,
@@ -36,6 +35,18 @@ def create_lbuf(*lines):
 
 
 class TestDataTypes(BaseTest):
+
+
+    def test_replace_c0_codes(self):
+        def t(x: str, expected: str):
+            q = replace_c0_codes_except_nl_space_tab(x)
+            self.ae(expected, q)
+            q = replace_c0_codes_except_nl_space_tab(x.encode('utf-8'))
+            self.ae(expected.encode('utf-8'), q)
+        t('abc', 'abc')
+        t('a\0\x01b\x03\x04\t\rc', 'a\u2400\u2401b\u2403\u2404\t\u240dc')
+        t('a\0\x01😸\x03\x04\t\rc', 'a\u2400\u2401😸\u2403\u2404\t\u240dc')
+        t('a\nb\tc d', 'a\nb\tc d')
 
     def test_to_color(self):
         for x in 'xxx #12 #1234 rgb:a/b'.split():
@@ -266,16 +277,17 @@ class TestDataTypes(BaseTest):
         l0 = create('file:///etc/test')
         self.ae(l0.url_start_at(0), 0)
 
-        for trail in '.,\\':
+        for trail in '.,\\}]>':
             lx = create("http://xyz.com" + trail)
             self.ae(lx.url_end_at(0), len(lx) - 2)
-        for trail in ')}]>':
-            lx = create("http://xyz.com" + trail)
-            self.ae(lx.url_end_at(0), len(lx) - 1)
+        for trail in ')':
+            turl = "http://xyz.com" + trail
+            lx = create(turl)
+            self.ae(len(lx) - 1, lx.url_end_at(0), repr(turl))
         l0 = create("ftp://abc/")
         self.ae(l0.url_end_at(0), len(l0) - 1)
         l2 = create("http://-abcd] ")
-        self.ae(l2.url_end_at(0), len(l2) - 2)
+        self.ae(l2.url_end_at(0), len(l2) - 3)
         l3 = create("http://ab.de           ")
         self.ae(l3.url_start_at(4), 0)
         self.ae(l3.url_start_at(5), 0)
@@ -462,14 +474,6 @@ class TestDataTypes(BaseTest):
         self.ae(sanitize_url_for_dispay_to_user(
             'h://a\u0430b.com/El%20Ni%C3%B1o/'), 'h://xn--ab-7kc.com/El Niño/')
 
-    def test_color_profile(self):
-        c = ColorProfile()
-        c.update_ansi_color_table(build_ansi_color_table())
-        for i in range(8):
-            col = getattr(defaults, f'color{i}')
-            self.ae(c.as_color(i << 8 | 1), col)
-        self.ae(c.as_color(255 << 8 | 1), Color(0xee, 0xee, 0xee))
-
     def test_historybuf(self):
         lb = filled_line_buf()
         hb = HistoryBuf(5, 5)
@@ -580,7 +584,7 @@ class TestDataTypes(BaseTest):
         self.assertNotEqual(SingleKey(key=1, mods=2), SingleKey(key=1))
 
     def test_notify_identifier_sanitization(self):
-        from kitty.notify import sanitize_identifier_pat
+        from kitty.notifications import sanitize_identifier_pat
         self.ae(sanitize_identifier_pat().sub('', '\x1b\nabc\n[*'), 'abc')
 
     def test_bracketed_paste_sanitizer(self):
@@ -588,7 +592,7 @@ class TestDataTypes(BaseTest):
         for x in ('\x1b[201~ab\x9b201~cd', '\x1b[201\x1b[201~~ab'):  # ]]]
             q = sanitize_for_bracketed_paste(x.encode('utf-8'))
             self.assertNotIn(b'\x1b[201~', q)
-            self.assertNotIn('\x9b201~'.encode('utf-8'), q)
+            self.assertNotIn('\x9b201~'.encode(), q)
             self.assertIn(b'ab', q)
 
     def test_expand_ansi_c_escapes(self):
@@ -615,7 +619,7 @@ class TestDataTypes(BaseTest):
 
     def test_shlex_split(self):
         for bad in (
-            'abc\\', '\\', "'abc", "'", '"', 'asd' + '\\',
+            'abc\\', '\\', "'abc", "'", '"', 'asd' + '\\', r'"a\"', '"a\\',
         ):
             with self.assertRaises(ValueError, msg=f'Failed to raise exception for {bad!r}'):
                 tuple(shlex_split_with_positions(bad))
@@ -626,6 +630,24 @@ class TestDataTypes(BaseTest):
             r'''x'y"\z'1''': ((0, 'xy"\\z1'),),
             r'\abc\ d': ((0, 'abc d'),),
             '': (), '   ': (), ' \tabc\n\t\r ': ((2, 'abc'),),
+            "$'ab'": ((0, '$ab'),),
         }.items():
             actual = tuple(shlex_split_with_positions(q))
+            self.ae(expected, actual, f'Failed for text: {q!r}')
+
+        for q, expected in {
+            "$'ab'": ((0, 'ab'),),
+            "1$'ab'": ((0, '1ab'),),
+            '''"1$'ab'"''': ((0, "1$'ab'"),),
+            r"$'a\123b'": ((0, 'a\123b'),),
+            r"$'a\1b'": ((0, 'a\001b'),),
+            r"$'a\12b'": ((0, 'a\012b'),),
+            r"$'a\db'": ((0, 'adb'),),
+            r"$'a\x1bb'": ((0, 'a\x1bb'),),
+            r"$'\u123z'": ((0, '\u0123z'),),
+            r"$'\U0001F1E8'": ((0, '\U0001F1E8'),),
+            r"$'\U1F1E8'": ((0, '\U0001F1E8'),),
+            r"$'a\U1F1E8'b": ((0, 'a\U0001F1E8b'),),
+        }.items():
+            actual = tuple(shlex_split_with_positions(q, True))
             self.ae(expected, actual, f'Failed for text: {q!r}')

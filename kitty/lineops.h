@@ -83,14 +83,14 @@ line_is_empty(const Line *line) {
 
 typedef Line*(get_line_func)(void *, int);
 void line_clear_text(Line *self, unsigned int at, unsigned int num, char_type ch);
-void line_apply_cursor(Line *self, Cursor *cursor, unsigned int at, unsigned int num, bool clear_char);
+void line_apply_cursor(Line *self, const Cursor *cursor, unsigned int at, unsigned int num, bool clear_char);
 char_type line_get_char(Line *self, index_type at);
 void line_set_char(Line *, unsigned int , uint32_t , unsigned int , Cursor *, hyperlink_id_type);
 void line_right_shift(Line *, unsigned int , unsigned int );
-void line_add_combining_char(Line *, uint32_t , unsigned int );
+void line_add_combining_char(CPUCell *, GPUCell *, uint32_t , unsigned int );
 index_type line_url_start_at(Line *self, index_type x);
-index_type line_url_end_at(Line *self, index_type x, bool, char_type, bool);
-bool line_startswith_url_chars(Line*);
+index_type line_url_end_at(Line *self, index_type x, bool, char_type, bool, bool, index_type);
+bool line_startswith_url_chars(Line*, bool);
 bool line_as_ansi(Line *self, ANSIBuf *output, const GPUCell**, index_type start_at, index_type stop_before, char_type prefix_char) __attribute__((nonnull));
 unsigned int line_length(Line *self);
 size_t cell_as_unicode(CPUCell *cell, bool include_cc, Py_UCS4 *buf, char_type);
@@ -101,7 +101,9 @@ PyObject* unicode_in_range(const Line *self, const index_type start, const index
 PyObject* line_as_unicode(Line *, bool);
 
 void linebuf_init_line(LineBuf *, index_type);
+void linebuf_init_cells(LineBuf *lb, index_type ynum, CPUCell **c, GPUCell **g);
 void linebuf_clear(LineBuf *, char_type ch);
+void linebuf_clear_lines(LineBuf *self, const Cursor *cursor, index_type start, index_type end);
 void linebuf_index(LineBuf* self, index_type top, index_type bottom);
 void linebuf_reverse_index(LineBuf *self, index_type top, index_type bottom);
 void linebuf_clear_line(LineBuf *self, index_type y, bool clear_attrs);
@@ -131,4 +133,4 @@ void historybuf_clear(HistoryBuf *self);
 void mark_text_in_line(PyObject *marker, Line *line);
 bool line_has_mark(Line *, uint16_t mark);
 PyObject* as_text_generic(PyObject *args, void *container, get_line_func get_line, index_type lines, ANSIBuf *ansibuf, bool add_trailing_newline);
-bool colors_for_cell(Line *self, ColorProfile *cp, index_type *x, color_type *fg, color_type *bg, bool *reversed);
+bool colors_for_cell(Line *self, const ColorProfile *cp, index_type *x, color_type *fg, color_type *bg, bool *reversed);

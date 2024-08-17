@@ -31,6 +31,7 @@ typedef struct {
 
 
 void gl_init(void);
+const char* gl_version_string(void);
 void update_surface_size(int w, int h, GLuint offscreen_texture_id);
 void free_texture(GLuint *tex_id);
 void free_framebuffer(GLuint *fb_id);
@@ -56,4 +57,3 @@ void bind_vao_uniform_buffer(ssize_t vao_idx, size_t bufnum, GLuint block_index)
 void unbind_vertex_array(void);
 void unbind_program(void);
 GLuint compile_shaders(GLenum shader_type, GLsizei count, const GLchar * const * string);
-bool is_nvidia_gpu_driver(void);

@@ -111,6 +111,13 @@ typedef void (* _GLFWdestroycontextfun)(_GLFWwindow*);
 #define GL_CONTEXT_RELEASE_BEHAVIOR_FLUSH 0x82fc
 #define GL_CONTEXT_FLAG_NO_ERROR_BIT_KHR 0x00000008
 
+#define MAX(x, y) __extension__ ({ \
+    __typeof__ (x) a = (x); __typeof__ (y) b = (y); \
+        a > b ? a : b;})
+#define MIN(x, y) __extension__ ({ \
+    __typeof__ (x) a = (x); __typeof__ (y) b = (y); \
+        a < b ? a : b;})
+
 typedef int GLint;
 typedef unsigned int GLuint;
 typedef unsigned int GLenum;
@@ -209,7 +216,7 @@ typedef void (APIENTRY * PFN_vkVoidFunction)(void);
 #define remove_i_from_array(array, i, count) { \
     (count)--; \
     if ((i) < (count)) { \
-        memmove((array) + (i), (array) + (i) + 1, sizeof((array)[0]) * ((count) - (i))); \
+        memmove((array) + (i), (array) + (i) + 1, sizeof((array)[0]) * ((count) - (i))); /* NOLINT(bugprone-sizeof-expression) */ \
     }}
 
 
@@ -286,6 +293,9 @@ struct _GLFWinitconfig
         bool      menubar;
         bool      chdir;
     } ns;
+    struct {
+        bool ime;
+    } wl;
 };
 
 // Window configuration
@@ -310,19 +320,19 @@ struct _GLFWwndconfig
     bool          focusOnShow;
     bool          mousePassthrough;
     bool          scaleToMonitor;
+    int           blur_radius;
     struct {
         bool      retina;
         int       color_space;
-        int       blur_radius;
         char      frameName[256];
     } ns;
     struct {
         char      className[256];
         char      instanceName[256];
-        int       enable_blur;
     } x11;
     struct {
         char      appId[256];
+        uint32_t  bgcolor;
     } wl;
 };
 
@@ -686,7 +696,7 @@ void _glfwPlatformGetMonitorContentScale(_GLFWmonitor* monitor,
                                          float* xscale, float* yscale);
 void _glfwPlatformGetMonitorWorkarea(_GLFWmonitor* monitor, int* xpos, int* ypos, int *width, int *height);
 GLFWvidmode* _glfwPlatformGetVideoModes(_GLFWmonitor* monitor, int* count);
-void _glfwPlatformGetVideoMode(_GLFWmonitor* monitor, GLFWvidmode* mode);
+bool _glfwPlatformGetVideoMode(_GLFWmonitor* monitor, GLFWvidmode* mode);
 bool _glfwPlatformGetGammaRamp(_GLFWmonitor* monitor, GLFWgammaramp* ramp);
 void _glfwPlatformSetGammaRamp(_GLFWmonitor* monitor, const GLFWgammaramp* ramp);
 
@@ -804,6 +814,8 @@ void _glfwInputMouseClick(_GLFWwindow* window, int button, int action, int mods)
 void _glfwInputCursorPos(_GLFWwindow* window, double xpos, double ypos);
 void _glfwInputCursorEnter(_GLFWwindow* window, bool entered);
 int _glfwInputDrop(_GLFWwindow* window, const char *mime, const char *text, size_t sz);
+void _glfwInputColorScheme(GLFWColorScheme);
+void _glfwPlatformInputColorScheme(GLFWColorScheme);
 void _glfwInputJoystick(_GLFWjoystick* js, int event);
 void _glfwInputJoystickAxis(_GLFWjoystick* js, int axis, float value);
 void _glfwInputJoystickButton(_GLFWjoystick* js, int button, char value);
@@ -865,7 +877,11 @@ void _glfwPlatformStopMainLoop(void);
 unsigned long long _glfwPlatformAddTimer(monotonic_t interval, bool repeats, GLFWuserdatafun callback, void *callback_data, GLFWuserdatafun free_callback);
 void _glfwPlatformUpdateTimer(unsigned long long timer_id, monotonic_t interval, bool enabled);
 void _glfwPlatformRemoveTimer(unsigned long long timer_id);
+int _glfwPlatformSetWindowBlur(_GLFWwindow* handle, int value);
 
 char* _glfw_strdup(const char* source);
 
 void _glfw_free_clipboard_data(_GLFWClipboardData *cd);
+
+#define debug_rendering(...) if (_glfw.hints.init.debugRendering) { timed_debug_print(__VA_ARGS__); }
+#define debug_input(...) if (_glfw.hints.init.debugKeyboard) { timed_debug_print(__VA_ARGS__); }

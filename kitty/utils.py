@@ -9,25 +9,17 @@ import os
 import re
 import string
 import sys
+from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from functools import lru_cache
-from time import monotonic
+from re import Match, Pattern
 from typing import (
     TYPE_CHECKING,
     Any,
+    BinaryIO,
     Callable,
-    Dict,
-    Generator,
-    Iterable,
-    Iterator,
-    List,
-    Mapping,
-    Match,
     NamedTuple,
     Optional,
-    Pattern,
-    Sequence,
-    Tuple,
     Union,
     cast,
 )
@@ -43,8 +35,8 @@ from .constants import (
     shell_path,
     ssh_control_master_template,
 )
-from .fast_data_types import WINDOW_FULLSCREEN, WINDOW_MAXIMIZED, WINDOW_MINIMIZED, WINDOW_NORMAL, Color, Shlex, get_options, open_tty
-from .rgb import to_color
+from .fast_data_types import WINDOW_FULLSCREEN, WINDOW_MAXIMIZED, WINDOW_MINIMIZED, WINDOW_NORMAL, Color, Shlex, get_options, monotonic, open_tty
+from .fast_data_types import timed_debug_print as _timed_debug_print
 from .types import run_once
 from .typing import AddressFamily, PopenType, Socket, StartupCtx
 
@@ -131,7 +123,7 @@ def log_error(*a: Any, **k: str) -> None:
     from .fast_data_types import log_error_string
     output = getattr(log_error, 'redirect', log_error_string)
     with suppress(Exception):
-        msg = k.get('sep', ' ').join(map(str, a)) + k.get('end', '').replace('\0', '')
+        msg = k.get('sep', ' ').join(map(str, a)) + k.get('end', '')
         output(msg)
 
 
@@ -162,26 +154,6 @@ def color_as_int(val: Color) -> int:
 
 def color_from_int(val: int) -> Color:
     return Color((val >> 16) & 0xFF, (val >> 8) & 0xFF, val & 0xFF)
-
-
-def parse_color_set(raw: str) -> Generator[Tuple[int, Optional[int]], None, None]:
-    parts = raw.split(';')
-    lp = len(parts)
-    if lp % 2 != 0:
-        return
-    for c_, spec in [parts[i:i + 2] for i in range(0, len(parts), 2)]:
-        try:
-            c = int(c_)
-            if c < 0 or c > 255:
-                continue
-            if spec == '?':
-                yield c, None
-            else:
-                q = to_color(spec)
-                if q is not None:
-                    yield c, int(q) & 0xffffff
-        except Exception:
-            continue
 
 
 class ScreenSize(NamedTuple):
@@ -228,7 +200,7 @@ def screen_size_function(fd: Optional[int] = None) -> ScreenSizeGetter:
     return ScreenSizeGetter(fd)
 
 
-def fit_image(width: int, height: int, pwidth: int, pheight: int) -> Tuple[int, int]:
+def fit_image(width: int, height: int, pwidth: int, pheight: int) -> tuple[int, int]:
     from math import floor
     if height > pheight:
         corrf = pheight / float(height)
@@ -257,7 +229,7 @@ def base64_encode(
     return ans
 
 
-def command_for_open(program: Union[str, List[str]] = 'default') -> List[str]:
+def command_for_open(program: Union[str, list[str]] = 'default') -> list[str]:
     if isinstance(program, str):
         from .conf.utils import to_cmdline
         program = to_cmdline(program)
@@ -268,8 +240,8 @@ def command_for_open(program: Union[str, List[str]] = 'default') -> List[str]:
     return cmd
 
 
-def open_cmd(cmd: Union[Iterable[str], List[str]], arg: Union[None, Iterable[str], str] = None,
-             cwd: Optional[str] = None, extra_env: Optional[Dict[str, str]] = None) -> 'PopenType[bytes]':
+def open_cmd(cmd: Union[Iterable[str], list[str]], arg: Union[None, Iterable[str], str] = None,
+             cwd: Optional[str] = None, extra_env: Optional[dict[str, str]] = None) -> 'PopenType[bytes]':
     import subprocess
     if arg is not None:
         cmd = list(cmd)
@@ -277,7 +249,7 @@ def open_cmd(cmd: Union[Iterable[str], List[str]], arg: Union[None, Iterable[str
             cmd.append(arg)
         else:
             cmd.extend(arg)
-    env: Optional[Dict[str, str]] = None
+    env: Optional[dict[str, str]] = None
     if extra_env:
         env = os.environ.copy()
         env.update(extra_env)
@@ -286,7 +258,7 @@ def open_cmd(cmd: Union[Iterable[str], List[str]], arg: Union[None, Iterable[str
         preexec_fn=clear_handled_signals, env=env)
 
 
-def open_url(url: str, program: Union[str, List[str]] = 'default', cwd: Optional[str] = None, extra_env: Optional[Dict[str, str]] = None) -> 'PopenType[bytes]':
+def open_url(url: str, program: Union[str, list[str]] = 'default', cwd: Optional[str] = None, extra_env: Optional[dict[str, str]] = None) -> 'PopenType[bytes]':
     return open_cmd(command_for_open(program), url, cwd=cwd, extra_env=extra_env)
 
 
@@ -394,6 +366,9 @@ def unix_socket_directories() -> Iterator[str]:
     if is_macos:
         from .fast_data_types import user_cache_dir
         candidates = [user_cache_dir(), '/Library/Caches']
+    else:
+        if os.environ.get('XDG_RUNTIME_DIR'):
+            candidates.insert(0, os.environ['XDG_RUNTIME_DIR'])
     for loc in candidates:
         if os.access(loc, os.W_OK | os.R_OK | os.X_OK):
             yield loc
@@ -496,14 +471,14 @@ class SingleInstance:
 single_instance = SingleInstance()
 
 
-def parse_address_spec(spec: str) -> Tuple[AddressFamily, Union[Tuple[str, int], str], Optional[str]]:
+def parse_address_spec(spec: str) -> tuple[AddressFamily, Union[tuple[str, int], str], Optional[str]]:
     import socket
     try:
         protocol, rest = spec.split(':', 1)
     except ValueError:
         raise ValueError(f'Invalid listen-on value: {spec} must be of the form protocol:address')
     socket_path = None
-    address: Union[str, Tuple[str, int]] = ''
+    address: Union[str, tuple[str, int]] = ''
     if protocol == 'unix':
         family = socket.AF_UNIX
         address = rest
@@ -584,7 +559,7 @@ class TTYIO:
                 break
 
 
-def set_echo(fd: int = -1, on: bool = False) -> Tuple[int, List[Union[int, List[Union[bytes, int]]]]]:
+def set_echo(fd: int = -1, on: bool = False) -> tuple[int, list[Union[int, list[Union[bytes, int]]]]]:
     import termios
     if fd < 0:
         fd = sys.stdin.fileno()
@@ -608,12 +583,12 @@ def no_echo(fd: int = -1) -> Iterator[None]:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-def natsort_ints(iterable: Iterable[str]) -> List[str]:
+def natsort_ints(iterable: Iterable[str]) -> list[str]:
 
     def convert(text: str) -> Union[int, str]:
         return int(text) if text.isdigit() else text
 
-    def alphanum_key(key: str) -> Tuple[Union[int, str], ...]:
+    def alphanum_key(key: str) -> tuple[Union[int, str], ...]:
         return tuple(map(convert, re.split(r'(\d+)', key)))
 
     return sorted(iterable, key=alphanum_key)
@@ -662,7 +637,7 @@ def get_editor_from_env(env: Mapping[str, str]) -> Optional[str]:
     return None
 
 
-def get_editor_from_env_vars(opts: Optional[Options] = None) -> List[str]:
+def get_editor_from_env_vars(opts: Optional[Options] = None) -> list[str]:
     editor = get_editor_from_env(os.environ)
     if not editor:
         shell_env = read_shell_environment(opts)
@@ -676,7 +651,7 @@ def get_editor_from_env_vars(opts: Optional[Options] = None) -> List[str]:
     return list(shlex_split(ans))
 
 
-def get_editor(opts: Optional[Options] = None, path_to_edit: str = '', line_number: int = 0) -> List[str]:
+def get_editor(opts: Optional[Options] = None, path_to_edit: str = '', line_number: int = 0) -> list[str]:
     if opts is None:
         try:
             opts = get_options()
@@ -762,7 +737,7 @@ def func_name(f: Any) -> str:
     return str(f)
 
 
-def resolved_shell(opts: Optional[Options] = None) -> List[str]:
+def resolved_shell(opts: Optional[Options] = None) -> list[str]:
     q: str = getattr(opts, 'shell', '.')
     if q == '.':
         ans = [shell_path]
@@ -784,7 +759,7 @@ def resolved_shell(opts: Optional[Options] = None) -> List[str]:
 
 
 @run_once
-def system_paths_on_macos() -> Tuple[str, ...]:
+def system_paths_on_macos() -> tuple[str, ...]:
     entries, seen = [], set()
 
     def add_from_file(x: str) -> None:
@@ -866,8 +841,8 @@ def which(name: str, only_system: bool = False) -> Optional[str]:
     return None
 
 
-def read_shell_environment(opts: Optional[Options] = None) -> Dict[str, str]:
-    ans: Optional[Dict[str, str]] = getattr(read_shell_environment, 'ans', None)
+def read_shell_environment(opts: Optional[Options] = None) -> dict[str, str]:
+    ans: Optional[dict[str, str]] = getattr(read_shell_environment, 'ans', None)
     if ans is None:
         from .child import openpty
         ans = {}
@@ -952,12 +927,12 @@ class SSHConnectionData(NamedTuple):
     hostname: str
     port: Optional[int] = None
     identity_file: str = ''
-    extra_args: Tuple[Tuple[str, str], ...] = ()
+    extra_args: tuple[tuple[str, str], ...] = ()
 
 
 def get_new_os_window_size(
     metrics: 'OSWindowSize', width: int, height: int, unit: str, incremental: bool = False, has_window_scaling: bool = True
-) -> Tuple[int, int]:
+) -> tuple[int, int]:
     if unit == 'cells':
         cw = metrics['cell_width']
         ch = metrics['cell_height']
@@ -1050,7 +1025,9 @@ def cleanup_ssh_control_masters() -> None:
             os.remove(x)
 
 
-def path_from_osc7_url(url: str) -> str:
+def path_from_osc7_url(url: Union[str, bytes]) -> str:
+    if isinstance(url, bytes):
+        url = url.decode('utf-8')
     if url.startswith('kitty-shell-cwd://'):
         return '/' + url.split('/', 3)[-1]
     if url.startswith('file://'):
@@ -1060,7 +1037,7 @@ def path_from_osc7_url(url: str) -> str:
 
 
 @run_once
-def macos_version() -> Tuple[int, ...]:
+def macos_version() -> tuple[int, ...]:
     # platform.mac_ver does not work thanks to Apple's stupid "hardening", so just use sw_vers
     import subprocess
     try:
@@ -1151,7 +1128,8 @@ def sanitize_url_for_dispay_to_user(url: str) -> str:
         if purl.path:
             purl = purl._replace(path=unquote(purl.path))
         url = urlunparse(purl)
-    except Exception:
+    except Exception as e:
+        log_error(e)
         url = 'Unparseable URL: ' + url
     return url
 
@@ -1183,7 +1161,7 @@ def is_png(path: str) -> bool:
     return False
 
 
-def cmdline_for_hold(cmd: Sequence[str] = (), opts: Optional['Options'] = None) -> List[str]:
+def cmdline_for_hold(cmd: Sequence[str] = (), opts: Optional['Options'] = None) -> list[str]:
     if opts is None:
         with suppress(RuntimeError):
             opts = get_options()
@@ -1203,7 +1181,7 @@ def safe_mtime(path: str) -> Optional[float]:
 
 
 @run_once
-def get_custom_window_icon() -> Union[Tuple[float, str], Tuple[None, None]]:
+def get_custom_window_icon() -> Union[tuple[float, str], tuple[None, None]]:
     filenames = ['kitty.app.png']
     if is_macos:
         # On macOS, prefer icns to png.
@@ -1216,7 +1194,7 @@ def get_custom_window_icon() -> Union[Tuple[float, str], Tuple[None, None]]:
     return None, None
 
 
-def key_val_matcher(items: Iterable[Tuple[str, str]], key_pat: 're.Pattern[str]', val_pat: Optional['re.Pattern[str]']) -> bool:
+def key_val_matcher(items: Iterable[tuple[str, str]], key_pat: 're.Pattern[str]', val_pat: Optional['re.Pattern[str]']) -> bool:
     for key, val in items:
         if key_pat.search(key) is not None and (
                 val_pat is None or val_pat.search(val) is not None):
@@ -1224,13 +1202,31 @@ def key_val_matcher(items: Iterable[Tuple[str, str]], key_pat: 're.Pattern[str]'
     return False
 
 
-def shlex_split(text: str) -> Iterator[str]:
-    s = Shlex(text)
+def shlex_split(text: str, allow_ansi_quoted_strings: bool = False) -> Iterator[str]:
+    s = Shlex(text, allow_ansi_quoted_strings)
     while (q := s.next_word())[0] > -1:
         yield q[1]
 
 
-def shlex_split_with_positions(text: str) -> Iterator[Tuple[int, str]]:
-    s = Shlex(text)
+def shlex_split_with_positions(text: str, allow_ansi_quoted_strings: bool = False) -> Iterator[tuple[int, str]]:
+    s = Shlex(text, allow_ansi_quoted_strings)
     while (q := s.next_word())[0] > -1:
         yield q
+
+
+def timed_debug_print(*a: Any, sep: str = ' ', end: str = '\n') -> None:
+    _timed_debug_print(sep.join(map(str, a)) + end)
+
+
+def lock_file(f: BinaryIO) -> None:
+    if not f.writable():
+        raise ValueError('Cannot lock files not opened in writable mode')
+    import fcntl
+    fcntl.lockf(f, fcntl.LOCK_EX)
+
+
+def unlock_file(f: BinaryIO) -> None:
+    if not f.writable():
+        raise ValueError('Cannot unlock files not opened in writable mode')
+    import fcntl
+    fcntl.lockf(f, fcntl.LOCK_UN)
